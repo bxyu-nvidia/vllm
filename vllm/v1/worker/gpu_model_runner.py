@@ -2181,11 +2181,17 @@ class GPUModelRunner(
             attn_gid = self.routed_experts_attn_gid
             slot_mapping_attn = slot_mappings[attn_gid]
             self.slot_mapping = slot_mapping_attn[:num_tokens].cpu().numpy()
+
+        seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
+        if self.use_async_spec_decode:
+            # GPU tensors are authoritative in async mode.
+            seq_lens_cpu = None
+
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
-            seq_lens=self.seq_lens.gpu[:num_reqs_padded],
-            _seq_lens_cpu=self.seq_lens.cpu[:num_reqs_padded],
+            seq_lens=self.seq_lens[:num_reqs_padded],
+            _seq_lens_cpu=seq_lens_cpu,
             _num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[
                 :num_reqs_padded
             ],
@@ -2247,8 +2253,6 @@ class GPUModelRunner(
                 else 0
             )
 
-            if isinstance(builder, Mamba2AttentionMetadataBuilder):
-                self.needs_prefill_as_decode_slots = True
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(
                 builder, (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder)
