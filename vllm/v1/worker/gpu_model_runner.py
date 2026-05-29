@@ -774,6 +774,19 @@ class GPUModelRunner(
 
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
+        # When spec decode is active, the mamba backend classifies requests
+        # with query_len <= reorder_batch_threshold as "decodes". Prefill
+        # chunks that fall under this threshold get processed via the decode
+        # path, which stores intermediate states at sequential slots. We must
+        # set num_accepted_tokens to the chunk's query_len for those requests
+        # so the next iteration reads from the correct final-state slot.
+        # Prefills that went through the actual prefill path should keep the
+        # default value of 1 (the prefill path stores state at slot 0 only).
+        self.needs_prefill_as_decode_slots: bool = False
+        self.prefill_as_decode_num_tokens = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int32
+        )
+
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
 
@@ -1434,7 +1447,34 @@ class GPUModelRunner(
         # Valid tokens are contiguous from position 0, so counting non-(-1)
         # tokens gives us the first -1 position (i.e., number of accepted).
         num_reqs = output_token_ids.size(0)
-        self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+        self.num_accepted_tokens.gpu[:num_reqs] = (
+            (
+                torch.cat(
+                    [
+                        output_token_ids,
+                        torch.full(
+                            (num_reqs, 1),
+                            -1,
+                            device=output_token_ids.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+                == -1
+            )
+            .int()
+            .argmax(-1)
+        )
+        spec_decode_active = bool(scheduler_output.scheduled_spec_decode_tokens)
+        if self.needs_prefill_as_decode_slots and spec_decode_active:
+            mamba_utils.update_accepted_tokens_for_prefill_as_decode(
+                self.input_batch,
+                self.prefill_as_decode_num_tokens,
+                self.num_accepted_tokens.gpu,
+                scheduler_output,
+                self.reorder_batch_threshold,
+                num_reqs,
+            )
 
         if self.cache_config.mamba_cache_mode == "align":
             for i, num_tokens in enumerate(
@@ -2150,32 +2190,21 @@ class GPUModelRunner(
             attn_gid = self.routed_experts_attn_gid
             slot_mapping_attn = slot_mappings[attn_gid]
             self.slot_mapping = slot_mapping_attn[:num_tokens].cpu().numpy()
-        num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
-            :num_reqs_padded
-        ]
-        num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor[
-            :num_reqs_padded
-        ]
-        seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
-        seq_lens_cpu_upper_bound = seq_lens_cpu
 
-        # is_prefilling: True if request is still in prefill phase.
-        # Used by mamba backends to distinguish actual decodes from
-        # short extends.
-        is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
+        seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
 
         if self.use_async_spec_decode:
             # GPU tensors are authoritative in async mode.
             seq_lens_cpu = None
-            num_computed_tokens_cpu = None
 
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
             _seq_lens_cpu=seq_lens_cpu,
-            _num_computed_tokens_cpu=num_computed_tokens_cpu,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            _num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[
+                :num_reqs_padded
+            ],
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens_padded,
             max_query_len=max_query_len,
@@ -2183,8 +2212,6 @@ class GPUModelRunner(
             block_table_tensor=block_table_gid_0,
             slot_mapping=slot_mapping_gid_0,
             causal=True,
-            is_prefilling=is_prefilling,
-            positions=self.positions[:num_tokens_padded],
         )
 
         if self.dcp_world_size > 1:
@@ -2236,6 +2263,8 @@ class GPUModelRunner(
                 else 0
             )
 
+            if isinstance(builder, Mamba2AttentionMetadataBuilder):
+                self.needs_prefill_as_decode_slots = True
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(
                 builder, (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder)
