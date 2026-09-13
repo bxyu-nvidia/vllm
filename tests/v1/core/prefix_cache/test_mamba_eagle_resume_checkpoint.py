@@ -207,16 +207,21 @@ def test_sibling_resumes_below_the_block_grid_when_the_prefix_ends_early():
     assert hit == resume, f"expected the resume point at {resume}, got {hit}"
 
 
-def test_annotated_eagle_group_publishes_first_prompt_resume_point():
+@pytest.mark.parametrize(
+    "num_prefill_lookahead,attention_block_size", [(1, 4352), (5, 128)]
+)
+def test_annotated_eagle_group_publishes_first_prompt_resume_point(
+    num_prefill_lookahead, attention_block_size
+):
     """Draft attention and non-EAGLE Mamba publish one finalized boundary."""
     block_size, hash_block_size = 4352, 16
     manager = _manager(
         block_size,
         hash_block_size,
         eagle_group=0,
-        num_prefill_lookahead=5,
+        num_prefill_lookahead=num_prefill_lookahead,
         num_blocks=20_000,
-        attention_block_size=128,
+        attention_block_size=attention_block_size,
     )
     stub = _stub(manager, block_size, hash_block_size)
 
@@ -228,6 +233,57 @@ def test_annotated_eagle_group_publishes_first_prompt_resume_point():
     resume = finalized // hash_block_size * hash_block_size - hash_block_size
     hit = _sibling_hit(manager, shared, [-1] * 128, hash_block_size)
     assert hit == resume, f"expected the first follower to hit {resume}, got {hit}"
+
+
+@pytest.mark.parametrize("prompt_len", [17408, 18000, 18001, 18016])
+@pytest.mark.parametrize("connector_lookup", [False, True])
+@pytest.mark.parametrize("suffix", [[], [-1] * 128], ids=["identical", "extended"])
+def test_nemotron_mtp_reuses_prompt_checkpoint_after_free(
+    prompt_len, connector_lookup, suffix
+):
+    """A prompt-aligned proof must remain visible before the EAGLE rewind."""
+    block_size, hash_block_size = 4352, 16
+    init_none_hash(sha256)
+    config = _make_hybrid_kv_cache_config(
+        block_size, 2048, ["full"] + ["mamba_align"] * 5
+    )
+    config = replace(
+        config,
+        prefix_cache_retention_interval=0,
+        kv_cache_groups=[
+            replace(group, is_eagle_group=True)
+            if i == 0
+            else replace(
+                group,
+                kv_cache_spec=replace(group.kv_cache_spec, num_speculative_blocks=5),
+            )
+            for i, group in enumerate(config.kv_cache_groups)
+        ],
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=262144,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+        num_prefill_lookahead=1,
+        enable_mamba_fine_grained_prefix_cache=True,
+    )
+    owner = make_request("owner", PREFIX[:prompt_len], hash_block_size, sha256)
+    _prefill(manager, _stub(manager, block_size, hash_block_size), owner)
+    manager.free(owner)
+    replay = make_request(
+        "replay", PREFIX[:prompt_len] + suffix, hash_block_size, sha256
+    )
+
+    if connector_lookup:
+        _, hit, _, diverged = manager.get_computed_blocks_for_connector(replay)
+        assert not diverged
+    else:
+        _, hit, _ = manager.get_computed_blocks(replay)
+
+    assert hit == prompt_len // hash_block_size * hash_block_size - hash_block_size
+    assert hit < replay.num_tokens
 
 
 # --------------------------------------------------------------------------
