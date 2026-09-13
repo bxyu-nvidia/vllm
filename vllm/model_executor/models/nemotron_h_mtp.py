@@ -60,6 +60,7 @@ class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
             parallel_config=parallel_config,
             prefix=prefix,
         )
+        self.mixer.attn.is_eagle_draft = True
         self.has_start_projections = has_start_projections
         self.has_end_norm = has_end_norm
 

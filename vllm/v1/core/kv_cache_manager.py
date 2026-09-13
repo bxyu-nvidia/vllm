@@ -15,7 +15,7 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -179,11 +179,27 @@ class KVCacheManager:
         )
         if self.mamba_fine_grained_prefix_cache:
             for manager in self.coordinator.single_type_managers:
-                if isinstance(manager, MambaManager):
+                if isinstance(manager, (FullAttentionManager, MambaManager)):
                     manager.fine_grained_prefix_cache = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        if enable_mamba_fine_grained_prefix_cache:
+            logger.info(
+                "Mamba fine-grained prefix cache: enabled=%s, hash_block_size=%d, "
+                "group_block_sizes=%s, eagle_group_ids=%s, prefill_lookahead=%d, "
+                "reprefillable_tokens=%d, retention_interval=%s",
+                self.mamba_fine_grained_prefix_cache,
+                hash_block_size,
+                [
+                    manager.block_size
+                    for manager in self.coordinator.single_type_managers
+                ],
+                sorted(self.coordinator.eagle_group_ids),
+                num_prefill_lookahead,
+                self.coordinator.num_reprefillable_tokens,
+                kv_cache_config.prefix_cache_retention_interval,
+            )
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -240,6 +256,15 @@ class KVCacheManager:
             num_tokens=request.num_tokens,
             num_hits=num_hits,
             preempted=request.num_preemptions > 0,
+        )
+        logger.debug(
+            "Prefix cache admission: request_id=%s, tokens=%d, local_hit=%d, "
+            "shared_prefix_boundary=%d, preemptions=%d",
+            request.request_id,
+            request.num_tokens,
+            num_hits,
+            request.shared_prefix_boundary,
+            request.num_preemptions,
         )
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
@@ -345,6 +370,14 @@ class KVCacheManager:
         fa_group_id = coordinator.full_attention_group_id
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
             request.block_hashes, request.num_tokens - 1
+        )
+        logger.debug(
+            "Prefix cache connector lookup: request_id=%s, tokens=%d, "
+            "per_group_hits=%s, full_attention_group_id=%d",
+            request.request_id,
+            request.num_tokens,
+            per_group_hits,
+            fa_group_id,
         )
         if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
             # A lagging group hit deeper than full attention means its

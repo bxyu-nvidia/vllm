@@ -36,11 +36,21 @@ def _manager(
     num_blocks=8192,
     eagle_group=None,
     num_prefill_lookahead=0,
+    attention_block_size=None,
 ):
     init_none_hash(sha256)
     config = _make_hybrid_kv_cache_config(
         block_size, num_blocks, ["full", "mamba_align"]
     )
+    if attention_block_size is not None:
+        groups = list(config.kv_cache_groups)
+        groups[0] = replace(
+            groups[0],
+            kv_cache_spec=replace(
+                groups[0].kv_cache_spec, block_size=attention_block_size
+            ),
+        )
+        config = replace(config, kv_cache_groups=groups)
     if eagle_group is not None:
         groups = list(config.kv_cache_groups)
         groups[eagle_group] = replace(groups[eagle_group], is_eagle_group=True)
@@ -73,6 +83,7 @@ def _stub(manager, block_size, hash_block_size, *, block_drop=True):
         # The EAGLE adjustments key on the block-drop bit, not plain use_eagle:
         # they exist only to compensate for the drop.
         use_eagle_block_drop=block_drop,
+        num_prefill_lookahead=manager.coordinator.num_reprefillable_tokens + 1,
         hash_block_size=hash_block_size,
         mamba_has_prefill_checkpoint_blocks=False,  # forced False under eagle
         mamba_partial_cache_hit=partial_hit,
@@ -146,6 +157,43 @@ def _sibling_hit(manager, shared, suffix, hash_block_size):
 # The two positions a sibling resumes at
 
 
+@pytest.mark.parametrize("shared", [4000, 8000, 8720])
+def test_shared_prefix_inside_attention_block_is_discovered(shared):
+    """Different suffixes must not hide an otherwise reusable fine prefix."""
+    manager = _nemotron_manager()
+    stub = _stub(manager, 4352, 16)
+    for i in range(3):
+        request = make_request(
+            str(i), PREFIX[:shared] + [-i - 1] * (8742 - shared), 16, sha256
+        )
+        if i == 2:
+            assert manager.get_computed_blocks(request)[1] == shared - 16
+        _prefill(manager, stub, request)
+        manager.free(request)
+
+
+def test_attention_interior_hashes_survive_promotion_and_follow_eviction():
+    """Fine entries remain valid only while their backing attention block exists."""
+    manager = _manager(16, 4, eagle_group=0, num_prefill_lookahead=1)
+    owner = make_request("owner", PREFIX[:25], 4, sha256)
+    _prefill(manager, _stub(manager, 16, 4), owner)
+    pool = manager.block_pool
+    tail = pool.get_cached_block(owner.block_hashes[4], [0])[0]
+
+    owner.append_output_token_ids([0] * 7)
+    assert manager.allocate_slots(owner, 7) is not None
+    owner.num_computed_tokens = 32
+    manager.free(owner)
+
+    for boundary in (20, 24, 32):
+        assert pool.get_cached_block(owner.block_hashes[boundary // 4 - 1], [0]) == [
+            tail
+        ]
+    pool.evict_blocks({tail.block_id})
+    for boundary in (20, 24, 32):
+        assert pool.get_cached_block(owner.block_hashes[boundary // 4 - 1], [0]) is None
+
+
 def test_sibling_resumes_from_the_observed_junction():
     """The scheduler splits at the junction; the manager must cache there."""
     block_size, hash_block_size = 512, 32
@@ -168,14 +216,8 @@ def test_sibling_resumes_from_the_observed_junction():
     )
 
 
-def test_sibling_resumes_below_the_block_grid_when_the_prefix_ends_early():
-    """A system prompt followed by a per-request suffix -- the deployed shape.
-
-    The owner's prompt tail sits over its own suffix, which no sibling shares, so
-    a check-point there is unreachable. The next request's full-attention match
-    stops at the last shared block boundary and EAGLE drops one hash unit below
-    it, so state has to exist just under the block grid too.
-    """
+def test_sibling_resumes_below_the_shared_hash_boundary():
+    """A unique suffix must not round the shared prefix down to the block grid."""
     block_size, hash_block_size = 16, 4
     manager = _manager(block_size, hash_block_size)
     stub = _stub(manager, block_size, hash_block_size)
@@ -184,16 +226,100 @@ def test_sibling_resumes_below_the_block_grid_when_the_prefix_ends_early():
     owner = make_request("owner", PREFIX[:shared] + [-1] * 16, hash_block_size, sha256)
     _prefill(manager, stub, owner)
 
-    # The first follower observes the junction (16 shared, dropped to 12) and
+    # The first follower observes the junction (24 shared, dropped to 20) and
     # registers state there; the second one gets to resume from it.
     follower = make_request(
         "follower", PREFIX[:shared] + [-2] * 16, hash_block_size, sha256
     )
     _prefill(manager, stub, follower)
 
-    resume = shared // block_size * block_size - hash_block_size
+    resume = shared // hash_block_size * hash_block_size - hash_block_size
     hit = _sibling_hit(manager, shared, [-3] * 16, hash_block_size)
     assert hit == resume, f"expected the resume point at {resume}, got {hit}"
+
+
+@pytest.mark.parametrize(
+    "num_prefill_lookahead,attention_block_size", [(1, 4352), (5, 128)]
+)
+def test_annotated_eagle_group_publishes_first_prompt_resume_point(
+    num_prefill_lookahead, attention_block_size
+):
+    """Draft attention and non-EAGLE Mamba publish one finalized boundary."""
+    block_size, hash_block_size = 4352, 16
+    manager = _manager(
+        block_size,
+        hash_block_size,
+        eagle_group=0,
+        num_prefill_lookahead=num_prefill_lookahead,
+        num_blocks=20_000,
+        attention_block_size=attention_block_size,
+    )
+    stub = _stub(manager, block_size, hash_block_size)
+
+    owner = make_request("owner", PREFIX[:18_003], hash_block_size, sha256)
+    _prefill(manager, stub, owner)
+
+    shared = 18_003
+    finalized = shared - manager.coordinator.num_reprefillable_tokens
+    resume = finalized // hash_block_size * hash_block_size - hash_block_size
+    hit = _sibling_hit(manager, shared, [-1] * 128, hash_block_size)
+    assert hit == resume, f"expected the first follower to hit {resume}, got {hit}"
+
+
+def _nemotron_manager():
+    block_size, hash_block_size = 4352, 16
+    init_none_hash(sha256)
+    config = _make_hybrid_kv_cache_config(
+        block_size, 2048, ["full"] + ["mamba_align"] * 5
+    )
+    config = replace(
+        config,
+        prefix_cache_retention_interval=0,
+        kv_cache_groups=[
+            replace(group, is_eagle_group=True)
+            if i == 0
+            else replace(
+                group,
+                kv_cache_spec=replace(group.kv_cache_spec, num_speculative_blocks=5),
+            )
+            for i, group in enumerate(config.kv_cache_groups)
+        ],
+    )
+    return make_kv_cache_manager(
+        config,
+        max_model_len=262144,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        use_eagle=True,
+        num_prefill_lookahead=1,
+        enable_mamba_fine_grained_prefix_cache=True,
+    )
+
+
+@pytest.mark.parametrize("prompt_len", [17408, 18000, 18001, 18016])
+@pytest.mark.parametrize("connector_lookup", [False, True])
+@pytest.mark.parametrize("suffix", [[], [-1] * 128], ids=["identical", "extended"])
+def test_nemotron_mtp_reuses_prompt_checkpoint_after_free(
+    prompt_len, connector_lookup, suffix
+):
+    """A prompt-aligned proof must remain visible before the EAGLE rewind."""
+    block_size, hash_block_size = 4352, 16
+    manager = _nemotron_manager()
+    owner = make_request("owner", PREFIX[:prompt_len], hash_block_size, sha256)
+    _prefill(manager, _stub(manager, block_size, hash_block_size), owner)
+    manager.free(owner)
+    replay = make_request(
+        "replay", PREFIX[:prompt_len] + suffix, hash_block_size, sha256
+    )
+
+    if connector_lookup:
+        _, hit, _, diverged = manager.get_computed_blocks_for_connector(replay)
+        assert not diverged
+    else:
+        _, hit, _ = manager.get_computed_blocks(replay)
+
+    assert hit == prompt_len // hash_block_size * hash_block_size - hash_block_size
+    assert hit < replay.num_tokens
 
 
 # --------------------------------------------------------------------------

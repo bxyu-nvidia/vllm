@@ -481,8 +481,12 @@ class Scheduler(SchedulerInterface):
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
+        num_reprefillable_tokens = max(getattr(self, "num_prefill_lookahead", 0) - 1, 0)
+        finalized_prompt_tokens = max(
+            request.num_prompt_tokens - num_reprefillable_tokens, 0
+        )
         tail_boundary = (
-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+            finalized_prompt_tokens // self.hash_block_size * self.hash_block_size
             if self.mamba_partial_cache_hit and not use_internal_checkpoint
             else 0
         )

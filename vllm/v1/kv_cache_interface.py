@@ -469,6 +469,9 @@ class FullAttentionSpec(AttentionSpec):
     cache layout itself.
     """
 
+    is_eagle_draft: bool = False
+    """Whether this layer holds EAGLE-family draft-model KV state."""
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
@@ -525,6 +528,7 @@ class FullAttentionSpec(AttentionSpec):
             # If any layer in the group is non-causal, treat the group as
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
+            is_eagle_draft=any(spec.is_eagle_draft for spec in specs),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -604,6 +608,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             non_causal_multi_token_decode=any(
                 spec.non_causal_multi_token_decode for spec in specs
             ),
+            is_eagle_draft=any(spec.is_eagle_draft for spec in specs),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -659,6 +664,7 @@ class RSWASpec(FullAttentionSpec):
             sliding_window=base.sliding_window,
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
+            is_eagle_draft=base.is_eagle_draft,
             rswa_window=rswa_windows.pop(),
         )
 
@@ -1053,6 +1059,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             non_causal=any(spec.non_causal for spec in specs),
+            is_eagle_draft=any(spec.is_eagle_draft for spec in specs),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
