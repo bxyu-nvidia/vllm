@@ -481,8 +481,12 @@ class Scheduler(SchedulerInterface):
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
+        num_reprefillable_tokens = max(getattr(self, "num_prefill_lookahead", 0) - 1, 0)
+        finalized_prompt_tokens = max(
+            request.num_prompt_tokens - num_reprefillable_tokens, 0
+        )
         tail_boundary = (
-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+            finalized_prompt_tokens // self.hash_block_size * self.hash_block_size
             if self.mamba_partial_cache_hit and not use_internal_checkpoint
             else 0
         )
@@ -2589,6 +2593,16 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
+        elif (
+            self.connector is not None
+            and self.connector.supports_releasing_finished_speculative_blocks
+            and self.ec_connector is None
+            and request.status
+            in (RequestStatus.FINISHED_LENGTH_CAPPED, RequestStatus.FINISHED_STOPPED)
+            and request.num_in_flight_tokens == 0
+            and request.last_sched_seq <= self.processed_step_seq
+        ):
+            self.kv_cache_manager.free_finished_speculative_blocks(request)
 
         return kv_xfer_params, ec_xfer_params
 

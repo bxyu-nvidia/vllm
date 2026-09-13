@@ -335,6 +335,7 @@ class Attention(nn.Module, AttentionLayerBase):
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
         self.has_sink = extra_impl_args.get("sinks") is not None
+        self.is_eagle_draft = False
 
         # NOTE: model_config may be None during certain tests
         model_config = vllm_config.model_config
@@ -667,6 +668,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                is_eagle_draft=self.is_eagle_draft,
             )
 
 

@@ -150,11 +150,12 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
-        # Match Mamba checkpoints to Eagle's attention replay boundary.
-        if use_eagle:
-            for manager in self.single_type_managers:
-                if isinstance(manager, MambaManager):
-                    manager.drop_eagle_checkpoint_block = True
+        # Share the model-wide MTP replay window with each group. Mamba
+        # checkpoints also follow Eagle's attention replay boundary.
+        for manager in self.single_type_managers:
+            manager.num_reprefillable_tokens = self.num_reprefillable_tokens
+            if isinstance(manager, MambaManager) and use_eagle:
+                manager.drop_eagle_checkpoint_block = True
 
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
@@ -876,16 +877,19 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 # mamba: its finder never drops (draft models have no mamba
                 # layers), so the hit would grow past the candidate.
                 if drop_eagle_block and not isinstance(spec, MambaSpec):
-                    eagle_margin = (
-                        self.hash_block_size
-                        if self.enable_partial_hash_hits
+                    if (
+                        self.enable_partial_hash_hits
                         and manager_cls.supports_fine_grained_hash_lookup
                         and group_block_size > self.hash_block_size
-                        else group_block_size
-                    )
-                    _max_length = min(
-                        curr_hit_length + eagle_margin, max_cache_hit_length
-                    )
+                    ):
+                        # The limit applies after the rewind. The proof hash
+                        # can include the prompt's last token even though that
+                        # token must be recomputed for logits.
+                        _max_length = curr_hit_length + self.hash_block_size
+                    else:
+                        _max_length = min(
+                            curr_hit_length + group_block_size, max_cache_hit_length
+                        )
                 hit_blocks, _new_hit_length = manager_cls.find_longest_cache_hit(
                     block_hashes=block_hashes,
                     max_length=_max_length,
@@ -957,9 +961,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
             manager = self.single_type_managers[group_ids[0]]
+            lookup_length = max_cache_hit_length
+            if (
+                use_eagle
+                and not isinstance(spec, MambaSpec)
+                and self.enable_partial_hash_hits
+                and manager_cls.supports_fine_grained_hash_lookup
+                and manager.block_size > self.hash_block_size
+            ):
+                lookup_length += self.hash_block_size
             blocks, group_hit = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,
-                max_length=max_cache_hit_length,
+                max_length=lookup_length,
                 kv_cache_group_ids=group_ids,
                 block_pool=self.block_pool,
                 kv_cache_spec=spec,
