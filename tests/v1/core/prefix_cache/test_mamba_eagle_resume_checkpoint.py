@@ -196,6 +196,25 @@ def test_sibling_resumes_below_the_block_grid_when_the_prefix_ends_early():
     assert hit == resume, f"expected the resume point at {resume}, got {hit}"
 
 
+def test_annotated_eagle_group_publishes_first_prompt_resume_point():
+    """A non-EAGLE Mamba sibling follows the model-wide replay boundary."""
+    block_size, hash_block_size = 512, 32
+    manager = _manager(
+        block_size,
+        hash_block_size,
+        eagle_group=0,
+    )
+    stub = _stub(manager, block_size, hash_block_size)
+
+    owner = make_request("owner", PREFIX[:2020], hash_block_size, sha256)
+    _prefill(manager, stub, owner)
+
+    shared = 2016
+    resume = shared - hash_block_size
+    hit = _sibling_hit(manager, shared, [-1] * 128, hash_block_size)
+    assert hit == resume, f"expected the first follower to hit {resume}, got {hit}"
+
+
 # --------------------------------------------------------------------------
 # Invariants the two clauses have to keep
 
