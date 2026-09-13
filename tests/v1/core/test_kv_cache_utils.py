@@ -3951,6 +3951,46 @@ def test_no_warning_when_draft_group_is_identified(caplog_vllm):
     assert "could be identified as the draft model's" not in caplog_vllm.text
 
 
+def test_nemotron_h_mtp_draft_group_annotated_from_model_marker(caplog_vllm):
+    target_attention = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+    )
+    draft_attention = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=64,
+        dtype=torch.bfloat16,
+        is_eagle_draft=True,
+    )
+    specs = {
+        "model.layers.0.mixer.attn": target_attention,
+        "model.layers.1.mixer": new_mamba_spec(block_size=64, mamba_cache_mode="align"),
+        "mtp.mtp.layers.0.mixer.attn": draft_attention,
+    }
+    assert FullAttentionSpec.merge([target_attention, draft_attention]).is_eagle_draft
+
+    groups = get_kv_cache_groups(
+        _spec_decode_grouping_config(method="mtp", model_type="nemotron_h_mtp"),
+        specs,
+    )
+
+    flagged = [group for group in groups if group.is_eagle_group]
+    assert len(flagged) == 1
+    assert "mtp.mtp.layers.0.mixer.attn" in flagged[0].layer_names
+    assert all(
+        not group.is_eagle_group
+        for group in groups
+        if any(
+            isinstance(spec, MambaSpec)
+            for spec in iter_layer_specs(group.kv_cache_spec)
+        )
+    )
+    assert "could be identified as the draft model's" not in caplog_vllm.text
+
+
 def _deepseek_v4_specs(model_version="deepseek_v4"):
     """DeepseekV4-shaped specs: full MLA layers plus sliding-window MLA layers
     at differing page sizes, with the MTP draft layer registered last."""
