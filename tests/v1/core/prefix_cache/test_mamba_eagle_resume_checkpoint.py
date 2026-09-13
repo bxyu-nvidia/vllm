@@ -36,11 +36,21 @@ def _manager(
     num_blocks=8192,
     eagle_group=None,
     num_prefill_lookahead=0,
+    attention_block_size=None,
 ):
     init_none_hash(sha256)
     config = _make_hybrid_kv_cache_config(
         block_size, num_blocks, ["full", "mamba_align"]
     )
+    if attention_block_size is not None:
+        groups = list(config.kv_cache_groups)
+        groups[0] = replace(
+            groups[0],
+            kv_cache_spec=replace(
+                groups[0].kv_cache_spec, block_size=attention_block_size
+            ),
+        )
+        config = replace(config, kv_cache_groups=groups)
     if eagle_group is not None:
         groups = list(config.kv_cache_groups)
         groups[eagle_group] = replace(groups[eagle_group], is_eagle_group=True)
@@ -73,6 +83,7 @@ def _stub(manager, block_size, hash_block_size, *, block_drop=True):
         # The EAGLE adjustments key on the block-drop bit, not plain use_eagle:
         # they exist only to compensate for the drop.
         use_eagle_block_drop=block_drop,
+        num_prefill_lookahead=manager.coordinator.num_reprefillable_tokens + 1,
         hash_block_size=hash_block_size,
         mamba_has_prefill_checkpoint_blocks=False,  # forced False under eagle
         mamba_partial_cache_hit=partial_hit,
@@ -197,20 +208,24 @@ def test_sibling_resumes_below_the_block_grid_when_the_prefix_ends_early():
 
 
 def test_annotated_eagle_group_publishes_first_prompt_resume_point():
-    """A non-EAGLE Mamba sibling follows the model-wide replay boundary."""
-    block_size, hash_block_size = 512, 32
+    """Draft attention and non-EAGLE Mamba publish one finalized boundary."""
+    block_size, hash_block_size = 4352, 16
     manager = _manager(
         block_size,
         hash_block_size,
         eagle_group=0,
+        num_prefill_lookahead=5,
+        num_blocks=20_000,
+        attention_block_size=128,
     )
     stub = _stub(manager, block_size, hash_block_size)
 
-    owner = make_request("owner", PREFIX[:2020], hash_block_size, sha256)
+    owner = make_request("owner", PREFIX[:18_003], hash_block_size, sha256)
     _prefill(manager, stub, owner)
 
-    shared = 2016
-    resume = shared - hash_block_size
+    shared = 18_003
+    finalized = shared - manager.coordinator.num_reprefillable_tokens
+    resume = finalized // hash_block_size * hash_block_size - hash_block_size
     hit = _sibling_hit(manager, shared, [-1] * 128, hash_block_size)
     assert hit == resume, f"expected the first follower to hit {resume}, got {hit}"
 

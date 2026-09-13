@@ -119,6 +119,9 @@ class SingleTypeKVCacheManager(ABC):
         # aligned segment (SWA). Initialized lazily by the coordinator after
         # determining the attention groups.
         self.use_eagle = False
+        # Multi-module MTP may re-prefill this many trailing tokens. The
+        # coordinator sets the model-wide value after constructing managers.
+        self.num_reprefillable_tokens = 0
         # ``CacheConfig.enable_mamba_fine_grained_prefix_cache``, narrowed and set
         # by ``KVCacheManager``; only an EAGLE Mamba "align" group ever gets it.
         self.fine_grained_prefix_cache = False
@@ -843,7 +846,12 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         block are intentionally skipped.
         """
         hash_block_size = self.block_pool.hash_block_size
-        boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
+        cacheable_prompt_tokens = request.num_prompt_tokens
+        if self.use_eagle:
+            cacheable_prompt_tokens = max(
+                cacheable_prompt_tokens - self.num_reprefillable_tokens, 0
+            )
+        boundary_tokens = cacheable_prompt_tokens // hash_block_size * hash_block_size
         if boundary_tokens == 0 or boundary_tokens > num_tokens:
             return
         if boundary_tokens % self.block_size == 0:
@@ -2011,8 +2019,11 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         if num_tokens % hash_block_size != 0:
             return None
+        finalized_prompt_tokens = max(
+            request.num_prompt_tokens - self.num_reprefillable_tokens, 0
+        )
         latest_prompt_hash_boundary = (
-            request.num_prompt_tokens // hash_block_size
+            finalized_prompt_tokens // hash_block_size
         ) * hash_block_size
         if self.drop_eagle_checkpoint_block:
             # EAGLE attention siblings match one hash unit past the candidate
