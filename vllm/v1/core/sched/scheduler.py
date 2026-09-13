@@ -2593,6 +2593,16 @@ class Scheduler(SchedulerInterface):
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
+        elif (
+            self.connector is not None
+            and self.connector.supports_releasing_finished_speculative_blocks
+            and self.ec_connector is None
+            and request.status
+            in (RequestStatus.FINISHED_LENGTH_CAPPED, RequestStatus.FINISHED_STOPPED)
+            and request.num_in_flight_tokens == 0
+            and request.last_sched_seq <= self.processed_step_seq
+        ):
+            self.kv_cache_manager.free_finished_speculative_blocks(request)
 
         return kv_xfer_params, ec_xfer_params
 

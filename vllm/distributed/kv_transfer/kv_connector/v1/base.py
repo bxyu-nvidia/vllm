@@ -574,6 +574,15 @@ class KVConnectorBase_V1(ABC):
         """
         return False
 
+    @property
+    def supports_releasing_finished_speculative_blocks(self) -> bool:
+        """Whether finished Mamba align scratch slots can be released early.
+
+        Opt in only when no connector operation accesses those slots after
+        request_finished. The scheduler separately fences in-flight GPU work.
+        """
+        return False
+
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """
         Take the KV cache events from the connector.

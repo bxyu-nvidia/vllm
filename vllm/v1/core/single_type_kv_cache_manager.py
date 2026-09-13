@@ -1936,6 +1936,20 @@ class MambaManager(SingleTypeKVCacheManager):
         req_blocks.append(block)
         req_blocks[block_idx] = self._null_block
 
+    def pop_finished_speculative_blocks(self, request_id: str) -> list[KVCacheBlock]:
+        """Detach scratch slots without changing the transferable block table."""
+        if (
+            self.mamba_cache_mode != "align"
+            or self.num_speculative_blocks == 0
+            or request_id not in self._allocated_block_reqs
+        ):
+            return []
+        blocks = self.req_to_blocks[request_id]
+        start = len(blocks) - self.num_speculative_blocks
+        scratch = blocks[start:]
+        blocks[start:] = [self._null_block] * self.num_speculative_blocks
+        return scratch
+
     def finalize_partial_tail_offload(
         self,
         request_id: str,

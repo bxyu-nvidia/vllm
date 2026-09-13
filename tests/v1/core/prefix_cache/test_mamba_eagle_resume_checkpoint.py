@@ -13,6 +13,7 @@ drives the real ``Scheduler._mamba_block_aligned_split`` and the real
 
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -24,6 +25,7 @@ from tests.v1.core.test_prefix_caching import (
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import init_none_hash
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.request import RequestStatus
 
 PREFIX = list(range(1, 20_001))
 
@@ -294,6 +296,73 @@ def _nemotron_manager():
         num_prefill_lookahead=1,
         enable_mamba_fine_grained_prefix_cache=True,
     )
+
+
+@pytest.mark.parametrize(
+    "use_host_buffer,in_flight,last_sched_seq,status,expected_freed",
+    [
+        (False, 0, 1, RequestStatus.FINISHED_LENGTH_CAPPED, 25),
+        (True, 0, 1, RequestStatus.FINISHED_LENGTH_CAPPED, 0),
+        (False, 1, 1, RequestStatus.FINISHED_LENGTH_CAPPED, 0),
+        (False, 0, 2, RequestStatus.FINISHED_LENGTH_CAPPED, 0),
+        (False, 0, 1, RequestStatus.FINISHED_ABORTED, 0),
+    ],
+)
+def test_transfer_wait_releases_only_safe_mtp_scratch(
+    use_host_buffer, in_flight, last_sched_seq, status, expected_freed
+):
+    """Transfer waits must not pin unused scratch or recycle in-flight state."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
+        NixlBaseConnectorScheduler,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+        NixlPullConnector,
+    )
+
+    manager = _nemotron_manager()
+    request = make_request("owner", PREFIX[:18000], 16, sha256)
+    _prefill(manager, _stub(manager, 4352, 16), request)
+    request.status = status
+    request.num_in_flight_tokens = in_flight
+    request.last_sched_seq = last_sched_seq
+    before = manager.get_block_ids(request.request_id)
+    free_before = manager.block_pool.get_num_free_blocks()
+    scheduler = object.__new__(Scheduler)
+    scheduler.kv_cache_manager = manager
+    scheduler.connector = object.__new__(NixlPullConnector)
+    scheduler.connector.connector_scheduler = SimpleNamespace(
+        _is_hma_required=True, use_host_buffer=use_host_buffer
+    )
+    scheduler._connector_finished = Mock(return_value=(True, None))
+    scheduler.ec_connector = None
+    scheduler.encoder_cache_manager = Mock()
+    scheduler._inflight_prefills = set()
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = None
+    scheduler.processed_step_seq = 1
+    scheduler.requests = {request.request_id: request}
+
+    scheduler._free_request(request)
+
+    assert manager.block_pool.get_num_free_blocks() == free_before + expected_freed
+    after = manager.get_block_ids(request.request_id)
+    assert after[0] == before[0]  # Full-attention KV remains pinned.
+    for old, new in zip(before[1:], after[1:]):
+        assert new[:-5] == old[:-5]  # Running and checkpoint states stay intact.
+    nixl = SimpleNamespace(
+        kv_cache_config=manager.kv_cache_config,
+        _is_hma_required=True,
+        blocks_per_sw=[0] * 6,
+        _ssm_spec_blocks=[None] + [5] * 5,
+        _ssm_state_slots_are_positional=False,
+    )
+    clip = NixlBaseConnectorScheduler.get_exchange_clipped_blocks
+    assert clip(nixl, before) == clip(nixl, after)
+    assert request.request_id in scheduler.requests
+    replay = make_request("replay", PREFIX[:18000], 16, sha256)
+    assert manager.get_computed_blocks(replay)[1] == 17984
+    manager.free(request)
+    assert manager.block_pool.get_num_free_blocks() == 2047
 
 
 @pytest.mark.parametrize("prompt_len", [17408, 18000, 18001, 18016])

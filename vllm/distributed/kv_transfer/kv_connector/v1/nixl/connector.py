@@ -80,6 +80,15 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     def supports_divergent_local_hybrid_hits(self) -> bool:
         return True
 
+    @property
+    def supports_releasing_finished_speculative_blocks(self) -> bool:
+        assert self.connector_scheduler is not None
+        # Host-buffer saves also read per-step, unclipped block lists.
+        return (
+            self.connector_scheduler._is_hma_required
+            and not self.connector_scheduler.use_host_buffer
+        )
+
     def __init__(
         self,
         vllm_config: VllmConfig,

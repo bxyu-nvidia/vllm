@@ -623,6 +623,23 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def free_finished_speculative_blocks(self, request: Request) -> None:
+        """Release scratch after GPU completion when the connector permits it."""
+        assert request.is_finished()
+        assert request.num_in_flight_tokens == 0
+        num_released = 0
+        for manager in self.coordinator.single_type_managers:
+            if isinstance(manager, MambaManager):
+                blocks = manager.pop_finished_speculative_blocks(request.request_id)
+                num_released += sum(not block.is_null for block in blocks)
+                self.block_pool.free_blocks(reversed(blocks))
+        if num_released:
+            logger.debug(
+                "Released %d finished MTP scratch blocks: request_id=%s",
+                num_released,
+                request.request_id,
+            )
+
     def remove_skipped_blocks(
         self,
         request_id: str,
