@@ -36,10 +36,15 @@ def _manager(
     num_blocks=8192,
     eagle_group=None,
     num_prefill_lookahead=0,
+    num_speculative_blocks=0,
 ):
     init_none_hash(sha256)
     config = _make_hybrid_kv_cache_config(
         block_size, num_blocks, ["full", "mamba_align"]
+    )
+    config.kv_cache_groups[1].kv_cache_spec = replace(
+        config.kv_cache_groups[1].kv_cache_spec,
+        num_speculative_blocks=num_speculative_blocks,
     )
     if eagle_group is not None:
         groups = list(config.kv_cache_groups)
@@ -166,6 +171,55 @@ def test_sibling_resumes_from_the_observed_junction():
         f"the chunk stopped at {junction} but nothing was cached there: "
         f"sibling resumes at {hit}"
     )
+
+
+@pytest.mark.parametrize("eagle_group", [None, 0])
+@pytest.mark.parametrize(
+    "hash_block_size,prompt_len", [(16, 16000), (16, 16001), (4352, 17408)]
+)
+@pytest.mark.parametrize("suffix_len", [0, 17])
+def test_repeated_prompt_reuses_mtp_tail(
+    eagle_group, hash_block_size, prompt_len, suffix_len
+):
+    """Replay at the saved Mamba tail, including hash-aligned prompts."""
+    block_size = 4352
+    manager = _manager(
+        block_size,
+        hash_block_size,
+        eagle_group=eagle_group,
+        num_prefill_lookahead=1,
+        num_speculative_blocks=5,
+    )
+    stub = _stub(manager, block_size, hash_block_size)
+    owner = make_request("owner", PREFIX[:prompt_len], hash_block_size, sha256)
+    tail = prompt_len // hash_block_size * hash_block_size - hash_block_size
+    assert tail in _prefill(manager, stub, owner)
+    manager.free(owner)
+
+    sibling = make_request(
+        "sibling", PREFIX[:prompt_len] + [-1] * suffix_len, hash_block_size, sha256
+    )
+    blocks, hit, _ = manager.get_computed_blocks(sibling)
+    assert hit == tail
+    assert hit < sibling.num_tokens
+    assert blocks.blocks[1][-1].block_hash_num_tokens == tail
+    _, connector_hit, _, diverged = manager.get_computed_blocks_for_connector(sibling)
+    assert connector_hit == tail
+    assert not diverged
+
+
+def test_mtp_tail_requires_matching_tokens_after_the_checkpoint():
+    """A saved Mamba state alone cannot validate the drafter's lookahead KV."""
+    block_size, hash_block_size = 4352, 16
+    manager = _manager(block_size, hash_block_size)
+    stub = _stub(manager, block_size, hash_block_size)
+    owner = make_request("owner", PREFIX[:16000], hash_block_size, sha256)
+    _prefill(manager, stub, owner)
+    manager.free(owner)
+
+    sibling = make_request("sibling", PREFIX[:15999] + [-1], hash_block_size, sha256)
+    assert manager.get_computed_blocks(sibling)[1] < 15984
+    assert manager.get_computed_blocks_for_connector(sibling)[1] < 15984
 
 
 def test_sibling_resumes_below_the_block_grid_when_the_prefix_ends_early():
