@@ -122,8 +122,7 @@ class SingleTypeKVCacheManager(ABC):
         # Multi-module MTP may re-prefill this many trailing tokens. The
         # coordinator sets the model-wide value after constructing managers.
         self.num_reprefillable_tokens = 0
-        # ``CacheConfig.enable_mamba_fine_grained_prefix_cache``, narrowed and set
-        # by ``KVCacheManager``; only an EAGLE Mamba "align" group ever gets it.
+        # Enables attention proof hashes and Mamba checkpoints at fine boundaries.
         self.fine_grained_prefix_cache = False
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
@@ -823,6 +822,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         *,
         replay_boundary: int,
     ) -> None:
+        num_cached_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(
             request,
             num_tokens,
@@ -832,6 +832,28 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
+        if self.fine_grained_prefix_cache:
+            blocks = self.req_to_blocks[request.request_id]
+            num_prompt_blocks = min(
+                num_tokens // self.block_size,
+                cdiv(request.num_prompt_tokens, self.block_size),
+            )
+            for block_idx in range(num_cached_before, num_prompt_blocks):
+                for boundary in range(
+                    block_idx * self.block_size + hash_block_size,
+                    min(
+                        (block_idx + 1) * self.block_size,
+                        request.num_prompt_tokens + 1,
+                    ),
+                    hash_block_size,
+                ):
+                    self.block_pool.cache_partial_block(
+                        request=request,
+                        block=blocks[block_idx],
+                        num_tokens=boundary,
+                        kv_cache_group_id=self.kv_cache_group_id,
+                        block_size=self.block_size,
+                    )
         self._cache_partial_tail_block(request, num_tokens)
 
     def _cache_partial_tail_block(
@@ -841,9 +863,8 @@ class FullAttentionManager(SingleTypeKVCacheManager):
     ) -> None:
         """Cache the prompt tail when it ends inside a cache block.
 
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
+        Fine-grained mode also indexes interior boundaries so a changed suffix
+        does not hide the shared prefix. Otherwise only the prompt tail is indexed.
         """
         hash_block_size = self.block_pool.hash_block_size
         cacheable_prompt_tokens = request.num_prompt_tokens
@@ -868,6 +889,21 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
         )
+        if self.fine_grained_prefix_cache and num_tokens <= request.num_prompt_tokens:
+            # Register the longest prefix first: shorter aliases must not
+            # replace the primary hash of this append-only attention block.
+            for boundary in range(
+                boundary_tokens - hash_block_size,
+                block_idx * self.block_size,
+                -hash_block_size,
+            ):
+                self.block_pool.cache_partial_block(
+                    request=request,
+                    block=blocks[block_idx],
+                    num_tokens=boundary,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_size=self.block_size,
+                )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
