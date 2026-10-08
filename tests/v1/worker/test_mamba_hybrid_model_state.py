@@ -16,6 +16,10 @@ from tests.v1.attention.test_gdn_metadata_builder import (
 )
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+    ReplaySSMModelContext,
+    _ReplaySSMGroupContext,
+)
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
@@ -29,7 +33,7 @@ from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 
 
 @pytest.mark.parametrize(
-    ("use_flashinfer_replayssm", "expected_state_idx"), [(False, 2), (True, 2)]
+    ("use_flashinfer_replayssm", "expected_state_idx"), [(False, 2), (True, -1)]
 )
 def test_add_request_seeds_state_with_scoped_block_size(
     use_flashinfer_replayssm: bool, expected_state_idx: int
@@ -53,6 +57,53 @@ def test_add_request_seeds_state_with_scoped_block_size(
     assert state._mamba_state_idx_gpu.tolist() == [-1, expected_state_idx]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("computed", [15, 16, 17])
+def test_replayssm_import_clears_stale_cursors_with_reordered_request_slots(computed):
+    """A new/resumed owner resets only its destination; paused owners keep replay."""
+    state = object.__new__(MambaHybridModelState)
+    state.rope_state = state.prompt_embeds_state = None
+    state.cache_config = SimpleNamespace(mamba_block_size=16)
+    state._align_mode = state._use_flashinfer_replayssm = True
+    state.num_accepted_tokens_gpu = torch.full(
+        (4,), 3, device="cuda", dtype=torch.int32
+    )
+    state._mamba_state_idx_gpu = torch.tensor(
+        [0, 7, computed // 16, 9], device="cuda", dtype=torch.int32
+    )
+    state._mamba_src_col_gpu = torch.full_like(state._mamba_state_idx_gpu, -1)
+    state._mamba_src_off_gpu = torch.zeros_like(state._mamba_state_idx_gpu)
+    group = object.__new__(_ReplaySSMGroupContext)
+    group.block_table = torch.tensor([[4, 4], [1, 3]], device="cuda", dtype=torch.int32)
+    group.ring_start = torch.full((5,), 9, device="cuda", dtype=torch.int32)
+    group.num_committed = torch.full_like(group.ring_start, 5)
+    state._mamba_ctx = SimpleNamespace(replayssm=ReplaySSMModelContext([group]))
+    state._get_mamba_group_info = Mock(
+        return_value=([0], SimpleNamespace(block_size=16))
+    )
+    state.add_request(1, Mock(num_computed_tokens=computed))
+
+    state.preprocess_state(
+        SimpleNamespace(
+            num_reqs=2,
+            idx_mapping=torch.tensor([2, 1], device="cuda", dtype=torch.int32),
+            query_start_loc=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+        ),
+        (),
+        Mock(),
+        torch.full((4,), computed, device="cuda", dtype=torch.int32),
+    )
+
+    destination = 1 if computed == 15 else 3
+    expected_start = [9] * 5
+    expected_committed = [5] * 5
+    expected_start[destination] = expected_committed[destination] = 0
+    assert group.ring_start.tolist() == expected_start
+    assert group.num_committed.tolist() == expected_committed
+    assert state._mamba_state_idx_gpu.tolist() == [0, computed // 16, computed // 16, 9]
+    assert state.num_accepted_tokens_gpu.tolist() == [3, 1, 3, 3]
+
+
 @pytest.mark.parametrize(
     (
         "computed",
@@ -61,14 +112,17 @@ def test_add_request_seeds_state_with_scoped_block_size(
         "prefilling",
         "expected_prefilling",
         "staging_device",
+        "num_speculative_tokens",
     ),
     [
-        pytest.param(256, 4, 3, True, False, "cpu", id="cpu-cached-tail"),
-        pytest.param(1, 4, 3, True, False, "cpu", id="cpu-short-prefix"),
-        pytest.param(256, 1, 0, True, False, "cpu", id="cpu-one-token-tail"),
-        pytest.param(0, 4, 3, True, True, "cpu", id="cpu-fresh-prefill"),
-        pytest.param(256, 4, 0, True, True, "cpu", id="cpu-chunked-prefill"),
-        pytest.param(256, 4, 3, False, False, "cpu", id="cpu-ordinary-decode"),
+        pytest.param(256, 4, 3, True, False, "cpu", 3, id="cpu-cached-tail"),
+        pytest.param(1, 4, 3, True, False, "cpu", 3, id="cpu-short-prefix"),
+        pytest.param(256, 1, 0, True, False, "cpu", 3, id="cpu-one-token-tail"),
+        pytest.param(0, 4, 3, True, True, "cpu", 3, id="cpu-fresh-prefill"),
+        pytest.param(256, 4, 0, True, True, "cpu", 3, id="cpu-chunked-prefill"),
+        pytest.param(256, 4, 3, False, False, "cpu", 3, id="cpu-ordinary-decode"),
+        pytest.param(256, 1, 0, True, False, "cpu", 0, id="cpu-stp-tail"),
+        pytest.param(256, 1, 0, False, False, "cpu", 0, id="cpu-stp-decode"),
         pytest.param(
             256,
             4,
@@ -76,6 +130,7 @@ def test_add_request_seeds_state_with_scoped_block_size(
             True,
             False,
             "cuda",
+            3,
             id="cuda-cached-tail",
             marks=pytest.mark.skipif(
                 not torch.cuda.is_available(), reason="requires CUDA"
@@ -91,15 +146,17 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
     prefilling,
     expected_prefilling,
     staging_device,
+    num_speculative_tokens,
 ) -> None:
     state = object.__new__(MambaHybridModelState)
-    state.vllm_config = SimpleNamespace(num_speculative_tokens=3)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
     state._use_flashinfer_replayssm = True
     if staging_device == "cpu":
         monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
     state._is_prefilling_gpu = torch.zeros(1, dtype=torch.bool, device=staging_device)
+    state._is_prefill_tail_gpu = torch.zeros_like(state._is_prefilling_gpu)
     state._mamba_ctx = None
     state.num_accepted_tokens_gpu = torch.ones(1, dtype=torch.int32)
     state._get_mamba_group_info = Mock(return_value=([], None))
@@ -150,6 +207,7 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
     assert metadata is expected_metadata
     assert build_attn_metadata.call_args.kwargs["positions"] is positions
     assert state._is_prefilling_gpu.item() == expected_prefilling
+    assert state._is_prefill_tail_gpu.item() == (prefilling and not expected_prefilling)
 
 
 def test_add_request_seeds_state_idx_in_mamba_blocks() -> None:
@@ -158,6 +216,7 @@ def test_add_request_seeds_state_idx_in_mamba_blocks() -> None:
     state = object.__new__(MambaHybridModelState)
     state.cache_config = SimpleNamespace(block_size=16, mamba_block_size=880)
     state._align_mode = True
+    state._use_flashinfer_replayssm = False
     state.rope_state = None
     state.prompt_embeds_state = None
     state.num_accepted_tokens_gpu = torch.ones(2, dtype=torch.int32)
@@ -457,6 +516,9 @@ def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
     state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32, device="cuda")
     state._mamba_state_idx_gpu = torch.zeros(4, dtype=torch.int32, device="cuda")
     state._is_prefilling_gpu = torch.zeros(4, dtype=torch.bool, device="cuda")
+    state._is_prefill_tail_gpu = torch.tensor(
+        [True, False, False, False], device="cuda"
+    )
     state._replayssm_query_start_loc = torch.tensor(
         [0, 4], dtype=torch.int32, device="cuda"
     )
@@ -485,6 +547,7 @@ def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
     assert kwargs["num_accepted_tokens"] is accepted_snapshot
     assert accepted_snapshot[2].item() == 3
     assert state.num_accepted_tokens_gpu[2].item() == 1
+    assert kwargs["is_prefill_tail"].tolist() == [True]
     assert state._replayssm_query_start_loc is None
 
 

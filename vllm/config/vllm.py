@@ -3421,12 +3421,10 @@ class VllmConfig:
             if (
                 self.mamba_config.backend != MambaBackendEnum.FLASHINFER
                 or self.cache_config.mamba_cache_mode != "align"
-                or self.use_v2_model_runner
             ):
                 raise ValueError(
                     "ReplaySSM with KV connectors requires --mamba-backend "
-                    "flashinfer, --mamba-cache-mode align and "
-                    "VLLM_USE_V2_MODEL_RUNNER=0"
+                    "flashinfer and --mamba-cache-mode align"
                 )
             transfer = self.kv_transfer_config
             connectors = (

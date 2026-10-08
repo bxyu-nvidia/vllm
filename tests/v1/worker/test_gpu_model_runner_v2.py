@@ -64,6 +64,74 @@ def test_non_last_pp_rank_uses_global_batch_for_sample_feedback():
     runner.pcp_manager.restore_for_sampling.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("replayssm", "has_connector"), [(True, True), (True, False), (False, True)]
+)
+@pytest.mark.parametrize("speculative_steps", [0, 5])
+def test_replayssm_pd_output_waits_for_canonical_state(
+    monkeypatch, replayssm, has_connector, speculative_steps
+):
+    """PD cannot observe completion using only the early token-copy event."""
+    events = []
+    runner = Mock()
+    runner.vllm_config = SimpleNamespace(use_flashinfer_replayssm=replayssm)
+    runner.is_last_pp_rank = True
+    runner.pp_handler = runner.pcp_manager = None
+    runner.speculator = runner.aux_output_connector = runner.adaptive_verification = (
+        None
+    )
+    runner.model = Mock(spec=["compute_logits"])
+    runner.num_speculative_steps = speculative_steps
+    runner.execute_model_state = Mock(
+        input_batch=Mock(req_ids=["request"], idx_mapping=torch.tensor([0])),
+        finished_req_ids=set(),
+    )
+    if speculative_steps:
+        runner.req_states.draft_tokens = torch.zeros((1, speculative_steps))
+        runner.speculator = Mock(supports_mm_inputs=False)
+
+        def draft(*_args, **_kwargs):
+            events.append("draft")
+            return torch.ones((1, speculative_steps))
+
+        runner.speculator.propose.side_effect = draft
+        monkeypatch.setattr(
+            model_runner_module, "use_workspace_lane", contextlib.nullcontext
+        )
+    runner.sample.return_value = (Mock(), torch.tensor([1]), torch.tensor([0]))
+    runner.postprocess_sampled.side_effect = lambda *_: events.append("materialize")
+    runner.output_copy_stream.wait_stream.side_effect = lambda _: events.append("wait")
+    output = Mock()
+    output.copy_event.record.side_effect = lambda _: events.append("ready")
+
+    def start_output_copy(**_kwargs):
+        events.append("copy")
+        return output
+
+    monkeypatch.setattr(model_runner_module, "AsyncOutput", start_output_copy)
+    if has_connector:
+        runner.kv_connector.post_forward.side_effect = lambda _: events.append("save")
+    else:
+        runner.kv_connector = model_runner_module.NO_OP_KV_CONNECTOR
+
+    assert GPUModelRunner.sample_tokens(runner, None) is output
+
+    expected = ["copy", "materialize"]
+    if speculative_steps:
+        expected += ["draft"]
+    if has_connector:
+        expected += ["save"]
+    if replayssm and has_connector:
+        expected += ["wait", "ready"]
+        runner.output_copy_stream.wait_stream.assert_called_once_with(
+            runner.main_stream
+        )
+        output.copy_event.record.assert_called_once_with(runner.output_copy_stream)
+    else:
+        output.copy_event.record.assert_not_called()
+    assert events == expected
+
+
 def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.max_model_len = 262144

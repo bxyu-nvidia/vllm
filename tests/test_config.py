@@ -194,10 +194,7 @@ def test_replayssm_kv_transfer_requires_canonical_state_connectors(
         kv_transfer_config=transfer,
         use_v2_model_runner=runner_v2,
     )
-    if runner_v2:
-        with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER=0"):
-            VllmConfig.validate_mamba_cached_kernel(config)
-    elif set(connectors) <= {"NixlConnector", "MooncakeStoreConnector"}:
+    if set(connectors) <= {"NixlConnector", "MooncakeStoreConnector"}:
         assert VllmConfig.validate_mamba_cached_kernel(config) is config
     else:
         with pytest.raises(ValueError, match="supports only NixlConnector"):

@@ -2284,6 +2284,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
 
+        if (
+            self.vllm_config.use_flashinfer_replayssm
+            and self.kv_connector is not NO_OP_KV_CONNECTOR
+        ):
+            # NIXL can read the caches once the scheduler publishes prefill
+            # completion. Include canonicalization and draft KV writes in
+            # output readiness, retaining the early sampled-token copy above.
+            self.output_copy_stream.wait_stream(self.main_stream)
+            async_output.copy_event.record(self.output_copy_stream)
+
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
