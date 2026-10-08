@@ -118,6 +118,8 @@ def _postprocess_replayssm_kernel(
     HAS_IDX_MAPPING: tl.constexpr,
     MATERIALIZE_PREFIXES: tl.constexpr,
     LIVE_COL_IS_ZERO: tl.constexpr,
+    is_prefill_tail=None,
+    HAS_PREFILL_TAIL: tl.constexpr = False,
 ) -> None:
     """Commit a completed step and prepare an optional prefix snapshot."""
     batch_idx = tl.program_id(0)
@@ -169,6 +171,13 @@ def _postprocess_replayssm_kernel(
         other=PAD_SLOT_ID,
     )
     valid_live = valid_live_col & (live_slot != PAD_SLOT_ID)
+    # A one-token prompt tail uses SSU, but its state may be exported at a
+    # sub-block boundary. Publish the prompt checkpoint even without crossing
+    # a full Mamba block. Padded speculative positions are not part of it.
+    prefill_tail = False
+    if HAS_PREFILL_TAIL:
+        prefill_tail = tl.load(is_prefill_tail + batch_idx)
+    tail_checkpoint = MATERIALIZE_PREFIXES & valid_live & prefill_tail & ~boundary
     wants_materialize = MATERIALIZE_PREFIXES & valid_live & boundary & (dst_col >= 0)
     dst_slot = tl.load(
         block_table + batch_idx * block_table_stride_req + dst_col,
@@ -176,7 +185,8 @@ def _postprocess_replayssm_kernel(
         other=PAD_SLOT_ID,
     )
     # Block-table writers emit either the null sentinel or an in-capacity ID.
-    materialize = wants_materialize & (dst_slot != PAD_SLOT_ID)
+    dst_slot = tl.where(tail_checkpoint, live_slot, dst_slot)
+    materialize = tail_checkpoint | (wants_materialize & (dst_slot != PAD_SLOT_ID))
     if MATERIALIZE_PREFIXES:
         # FlashInfer's ABI requires packed [layer, batch] tables even though all
         # layers in this cache group share the same physical slot namespace.
@@ -230,7 +240,8 @@ def _postprocess_replayssm_kernel(
             tl.store(plan_ring_start + batch_idx, next_start)
             tl.store(
                 plan_flush_count + batch_idx,
-                accept_token_bias + 1 + tl.where(checkpointed, 0, old_committed),
+                tl.where(tail_checkpoint, accepted, accept_token_bias + 1)
+                + tl.where(checkpointed, 0, old_committed),
             )
 
     # The published destination is canonical and therefore has no live replay.
@@ -405,6 +416,7 @@ class _ReplaySSMGroupContext:
         is_prefilling: torch.Tensor,
         live_cols: torch.Tensor | None,
         num_reqs: int,
+        is_prefill_tail: torch.Tensor | None = None,
     ) -> None:
         """Commit a completed step and prepare an optional prefix snapshot."""
         if num_reqs == 0:
@@ -435,6 +447,8 @@ class _ReplaySSMGroupContext:
             HAS_IDX_MAPPING=idx_mapping is not None,
             MATERIALIZE_PREFIXES=self.materialize_prefixes,
             LIVE_COL_IS_ZERO=live_cols is None,
+            is_prefill_tail=is_prefill_tail,
+            HAS_PREFILL_TAIL=is_prefill_tail is not None,
         )
         if self.materialize_prefixes:
             _compact_replayssm_requests_kernel[(1,)](
