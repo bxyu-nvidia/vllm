@@ -2101,8 +2101,8 @@ class MambaManager(SingleTypeKVCacheManager):
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
         if self.drop_eagle_checkpoint_block:
-            # Eagle groups match one hash unit past the candidate and drop it,
-            # so register the tail one unit lower.
+            # Match the scheduler's replay boundary even when only attention
+            # groups are marked as draft groups.
             latest_prompt_hash_boundary = max(
                 latest_prompt_hash_boundary - hash_block_size, 0
             )
