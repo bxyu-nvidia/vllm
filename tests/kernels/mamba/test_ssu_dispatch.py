@@ -70,7 +70,10 @@ def _cuda_ints(values):
 
 
 @pytest.mark.parametrize("post_step", [False, True], ids=["v1", "v2"])
-def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(post_step):
+@pytest.mark.parametrize("prefill_tail", [False, True])
+def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
+    post_step, prefill_tail
+):
     """Publish a boundary without modifying its live or cached-prefix sources."""
     try:
         from flashinfer.mamba.replayssm_materialize import (
@@ -167,9 +170,17 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(post_
         is_prefilling=torch.zeros(4, dtype=torch.bool, device="cuda"),
         live_cols=_cuda_ints([1, 1, 1]),
         num_reqs=4,
+        is_prefill_tail=torch.tensor(
+            [False, prefill_tail, False, False], device="cuda"
+        ),
     )
-    assert group.active_request_indices.tolist() == [0, -1, -1, -1]
-    assert group.plan_flush_count.tolist() == [4, -1, -1, -1]
+    assert group.active_request_indices.tolist() == [
+        0,
+        1 if prefill_tail else -1,
+        -1,
+        -1,
+    ]
+    assert group.plan_flush_count.tolist() == [4, 2 if prefill_tail else -1, -1, -1]
     group.materialize()
 
     expected = original[3].clone()
@@ -184,8 +195,23 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(post_
         )
     torch.testing.assert_close(state[2], expected, atol=2e-3, rtol=2e-3)
     # The snapshot excludes the accepted tail past 16 and all rejected drafts.
-    for slot in (0, 1, 3, 4, 5):
+    for slot in (0, 1, 3, 4):
         torch.testing.assert_close(state[slot], original[slot], atol=0, rtol=0)
+    expected_tail = original[5].clone()
+    if prefill_tail:
+        # One previous committed token and one prompt token; exclude the three
+        # speculative padding positions, which must never reach remote state.
+        for pos in (2, 3):
+            delta = dt[5, :, pos]
+            expected_tail *= torch.exp(delta * A)[:, None, None]
+            expected_tail += (
+                delta[:, None, None]
+                * x[5, :, pos].float()[:, :, None]
+                * B[5, 0, pos].float()[None, None, :]
+            )
+        assert mixer._replayssm_ring_start[5].item() == 0
+        assert mixer._replayssm_prev_num_accepted[5].item() == 0
+    torch.testing.assert_close(state[5], expected_tail, atol=2e-3, rtol=2e-3)
     assert mixer._replayssm_prev_num_accepted[3].item() == 5
     assert mixer._replayssm_prev_num_accepted[2].item() == 0
     for tensor, before in zip(rings["neighbor"], neighbor_before, strict=True):

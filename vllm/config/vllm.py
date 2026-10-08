@@ -3418,10 +3418,41 @@ class VllmConfig:
             self.kv_transfer_config is not None
             and self.kv_transfer_config.is_kv_transfer_instance
         ):
-            raise ValueError(
-                "--use-replayssm is incompatible with KV connectors "
-                "(P/D disaggregation, KV cache offload)"
+            if (
+                self.mamba_config.backend != MambaBackendEnum.FLASHINFER
+                or self.cache_config.mamba_cache_mode != "align"
+                or self.use_v2_model_runner
+            ):
+                raise ValueError(
+                    "ReplaySSM with KV connectors requires --mamba-backend "
+                    "flashinfer, --mamba-cache-mode align and "
+                    "VLLM_USE_V2_MODEL_RUNNER=0"
+                )
+            transfer = self.kv_transfer_config
+            connectors = (
+                transfer.kv_connector_extra_config.get("connectors", [])
+                if transfer.kv_connector == "MultiConnector"
+                else [
+                    {
+                        "kv_connector": transfer.kv_connector,
+                        "kv_connector_module_path": transfer.kv_connector_module_path,
+                    }
+                ]
             )
+            if (
+                transfer.kv_connector_module_path is not None
+                or not connectors
+                or any(
+                    c.get("kv_connector")
+                    not in ("NixlConnector", "MooncakeStoreConnector")
+                    or c.get("kv_connector_module_path") is not None
+                    for c in connectors
+                )
+            ):
+                raise ValueError(
+                    "ReplaySSM supports only NixlConnector and "
+                    "MooncakeStoreConnector, individually or in MultiConnector"
+                )
         return self
 
 

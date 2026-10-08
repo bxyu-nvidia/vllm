@@ -67,7 +67,7 @@ from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu_input_batch import InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+from vllm.v1.worker.gpu_model_runner import ExecuteModelState, GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 from vllm.v1.worker.utils import select_common_block_size
 
@@ -421,6 +421,42 @@ def test_sample_tokens_skips_pp_group_lookup_without_async_scheduling(
 
     output = GPUModelRunner.sample_tokens(runner, None)
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("replayssm", [False, True])
+def test_sample_tokens_saves_replayssm_after_canonicalization_without_spec(replayssm):
+    """STP must export the postprocessed state just as speculative decode does."""
+    runner = Mock()
+    runner.execute_model_state = ExecuteModelState(
+        SimpleNamespace(total_num_scheduled_tokens=1),
+        *([None] * 9),
+    )
+    runner.use_async_scheduling = False
+    runner.speculative_config = None
+    runner._use_flashinfer_replayssm = replayssm
+    runner.supports_mm_inputs = False
+    runner.kv_connector_output = None
+    runner._sample.return_value.sampled_token_ids = torch.tensor([[7]])
+    runner._bookkeeping_sync.return_value = (
+        None,
+        None,
+        None,
+        [[7]],
+        {},
+        ["req"],
+        {"req": 0},
+        [],
+    )
+    state = torch.tensor([0])
+    saved = []
+    runner._update_states_after_model_execute.side_effect = lambda *_: state.fill_(1)
+    runner.finalize_kv_connector.side_effect = lambda: saved.append(state.item())
+
+    output = GPUModelRunner.sample_tokens(runner, None)
+
+    assert output.sampled_token_ids == [[7]]
+    assert saved == ([1] if replayssm else [])
 
 
 def test_select_common_block_size_no_valid_option():

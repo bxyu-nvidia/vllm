@@ -730,13 +730,14 @@ def test_replayssm_context_binds_batch_tables_for_planners(separate_batch_tables
 
 
 def _make_staging_ctx(max_num_reqs: int, device: torch.device) -> MagicMock:
-    """Build a MambaSpecDecodeGPUContext stand-in exposing only the four
+    """Build a MambaSpecDecodeGPUContext stand-in exposing only the
     per-request staging buffers touched by stage_postprocess_inputs_to_gpu."""
     ctx = MagicMock()
     ctx.num_scheduled_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
     ctx.num_computed_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
     ctx.num_draft_tokens_buf = _MockCpuGpuBuffer(max_num_reqs, torch.int32, device)
     ctx.is_prefilling_buf = _MockCpuGpuBuffer(max_num_reqs, torch.bool, device)
+    ctx.is_prefill_tail_buf = _MockCpuGpuBuffer(max_num_reqs, torch.bool, device)
     return ctx
 
 
@@ -835,6 +836,51 @@ def test_stage_replayssm_prefill_classification(
         ),
     )
     assert ctx.is_prefilling_buf.gpu.item() == expected_prefilling
+    assert ctx.is_prefill_tail_buf.gpu.item() == (
+        computed < prompt_len and not expected_prefilling
+    )
+
+
+@pytest.mark.parametrize("ownership", ["new", "resumed", "continuing", "paused"])
+@pytest.mark.parametrize("computed", [15, 16])
+def test_replayssm_import_resets_cursors_but_preserves_live_owners(ownership, computed):
+    """A canonical cache hit has no replay history, even in a recycled slot."""
+    device = torch.device("cpu")
+    ctx = _make_staging_ctx(1, device)
+    ctx.mamba_state_idx_buf = _MockCpuGpuBuffer(1, torch.int32, device)
+    ctx.precopy_src_col_buf = _MockCpuGpuBuffer(1, torch.int32, device)
+    ctx.precopy_token_bias_buf = _MockCpuGpuBuffer(1, torch.int32, device)
+    ctx.is_initialized = True
+    state_idx = {} if ownership == "new" else {"req": (computed - 1) // 16}
+    sched = _make_postprocess_scheduler_output(
+        req_ids=["req"],
+        num_scheduled_tokens={"req": 1},
+        scheduled_spec_decode_tokens={},
+    )
+    if ownership == "resumed":
+        sched.scheduled_cached_reqs.resumed_req_ids = {"req"}
+    # Paused requests leave the persistent batch but retain mamba_state_idx.
+    preprocess_mamba(
+        sched,
+        MagicMock(),
+        MagicMock(enable_prefix_caching=True),
+        state_idx,
+        MagicMock(req_ids=["req"]),
+        _make_requests(["req"], [computed], [[1, 2]], [computed + 1]),
+        {},
+        {},
+        MagicMock(
+            mamba_group_ids=[0],
+            mamba_spec=MagicMock(block_size=16, num_speculative_blocks=0),
+        ),
+        align_ctx=ctx,
+    )
+    call = ctx.replayssm.reset_new_slots.call_args.kwargs
+    expected_source = (
+        (computed - 1) // 16 if ownership in ("continuing", "paused") else -1
+    )
+    assert call["src_cols"].item() == expected_source
+    assert call["dst_cols"].item() == computed // 16
 
 
 def test_gpu_context_ignores_auxiliary_cache_tensors() -> None:
