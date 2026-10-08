@@ -71,8 +71,9 @@ def _cuda_ints(values):
 
 @pytest.mark.parametrize("post_step", [False, True], ids=["v1", "v2"])
 @pytest.mark.parametrize("prefill_tail", [False, True])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
 def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
-    post_step, prefill_tail
+    post_step, prefill_tail, state_dtype
 ):
     """Publish a boundary without modifying its live or cached-prefix sources."""
     try:
@@ -91,14 +92,16 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
 
     set_random_seed(42)
     slots, heads, dim, dstate, ring_len = 6, 8, 64, 128, 20
-    state = torch.randn(slots, heads, dim, dstate, device="cuda") * 0.1
+    state = (
+        torch.randn(slots, heads, dim, dstate, device="cuda", dtype=state_dtype) * 0.1
+    )
     # Slot 1 is an immutable cached prefix, copied to private live slot 3.
     state[3].copy_(state[1])
     original = state.clone()
     spec = MambaSpec(
         block_size=16,
         shapes=((heads, dim, dstate),),
-        dtypes=(torch.float32,),
+        dtypes=(state_dtype,),
         replayssm_shapes=(
             (heads, ring_len, dim),
             (heads, ring_len),
@@ -183,7 +186,7 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
     assert group.plan_flush_count.tolist() == [4, 2 if prefill_tail else -1, -1, -1]
     group.materialize()
 
-    expected = original[3].clone()
+    expected = original[3].float().clone()
     for offset in range(4):
         pos = (7 + offset) % ring_len
         delta = dt[3, :, pos]
@@ -193,11 +196,11 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
             * x[3, :, pos].float()[:, :, None]
             * B[3, 0, pos].float()[None, None, :]
         )
-    torch.testing.assert_close(state[2], expected, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(state[2], expected.to(state_dtype), atol=2e-3, rtol=2e-3)
     # The snapshot excludes the accepted tail past 16 and all rejected drafts.
     for slot in (0, 1, 3, 4):
         torch.testing.assert_close(state[slot], original[slot], atol=0, rtol=0)
-    expected_tail = original[5].clone()
+    expected_tail = original[5].float().clone()
     if prefill_tail:
         # One previous committed token and one prompt token; exclude the three
         # speculative padding positions, which must never reach remote state.
@@ -211,7 +214,9 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
             )
         assert mixer._replayssm_ring_start[5].item() == 0
         assert mixer._replayssm_prev_num_accepted[5].item() == 0
-    torch.testing.assert_close(state[5], expected_tail, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(
+        state[5], expected_tail.to(state_dtype), atol=2e-3, rtol=2e-3
+    )
     assert mixer._replayssm_prev_num_accepted[3].item() == 5
     assert mixer._replayssm_prev_num_accepted[2].item() == 0
     for tensor, before in zip(rings["neighbor"], neighbor_before, strict=True):
