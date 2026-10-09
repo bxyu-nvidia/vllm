@@ -8,6 +8,8 @@ Run on one CUDA GPU with FlashInfer 0.7.0.post1; no model weights are needed:
 The default verify length is six (one token plus five drafts). Use --tokens 1
 for ordinary decode and --reference-only for the CPU arithmetic example. This
 is a deliberately sensitive input, not a model accuracy evaluation or timing.
+The main reference is the unrounded FP32 recurrence. Prefix resume also reports
+agreement with the actual stored state: FP16 quantization alone is not a bad read.
 """
 
 import argparse
@@ -80,6 +82,9 @@ def run_case(state_dtype, philox_rounds, mode, algorithm, tokens):
     if mode == "prefix-resume":
         materialize(state, x_cache, b_cache, dt_cache, a, rand_seed, philox_rounds)
         slot = 1
+    stored_prefix = (
+        state[slot, :, :, 0].float().clone() if mode == "prefix-resume" else None
+    )
 
     # A=0 gives unit decay; the new token contributes zero. C reads only the
     # state coordinate whose exact value is 1 + 17/4096, for every output row.
@@ -118,7 +123,7 @@ def run_case(state_dtype, philox_rounds, mode, algorithm, tokens):
     )
     expected = torch.full_like(out, 1 + 17 / 4096)
     torch.accelerator.synchronize()
-    return {
+    result = {
         "dtype": str(state_dtype),
         "philox_rounds": philox_rounds,
         "algorithm": algorithm,
@@ -130,6 +135,16 @@ def run_case(state_dtype, philox_rounds, mode, algorithm, tokens):
         "max_abs_error": (out.float() - expected.float()).abs().max().item(),
         "finite": out.isfinite().all().item(),
     }
+    if stored_prefix is not None:
+        stored_readout = stored_prefix.to(out.dtype)[None, None].expand_as(out)
+        result.update(
+            stored_prefix_values=stored_prefix.unique().tolist(),
+            stored_readout_matching_fraction=(out == stored_readout)
+            .float()
+            .mean()
+            .item(),
+        )
+    return result
 
 
 def main():
@@ -150,6 +165,7 @@ def main():
                 "direct_bf16": exact.bfloat16().item(),
                 "fp16_intermediate": exact.half().item(),
                 "via_fp16_bf16": exact.half().bfloat16().item(),
+                "reference": "unrounded FP32 recurrence, before cache quantization",
             }
         ),
         flush=True,
