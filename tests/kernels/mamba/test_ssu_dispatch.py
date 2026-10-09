@@ -71,9 +71,13 @@ def _cuda_ints(values):
 
 @pytest.mark.parametrize("post_step", [False, True], ids=["v1", "v2"])
 @pytest.mark.parametrize("prefill_tail", [False, True])
-@pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize(
+    ("state_dtype", "philox_rounds"),
+    [(torch.float32, 0), (torch.float16, 0), (torch.float16, 5)],
+    ids=["fp32", "fp16", "fp16-sr5"],
+)
 def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
-    post_step, prefill_tail, state_dtype
+    post_step, prefill_tail, state_dtype, philox_rounds
 ):
     """Publish a boundary without modifying its live or cached-prefix sources."""
     try:
@@ -140,7 +144,11 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
         _replayssm_prev_num_accepted=_cuda_ints([0, 0, 0, 2, 0, 1]),
         replayssm_buffer_len=16,
         A=A,
-        mamba_config=MambaConfig(backend=MambaBackendEnum.FLASHINFER),
+        mamba_config=MambaConfig(
+            backend=MambaBackendEnum.FLASHINFER,
+            enable_stochastic_rounding=bool(philox_rounds),
+            stochastic_rounding_philox_rounds=philox_rounds,
+        ),
     )
     group = _ReplaySSMGroupContext.create(
         [mixer],

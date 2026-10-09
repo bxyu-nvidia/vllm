@@ -298,6 +298,7 @@ def _check_replayssm_prefix_caching(
     use_v2: bool,
     speculative_method: str | None = None,
     mamba_backend: str = "flashinfer",
+    fp16_stochastic_cache: bool = True,
 ):
     common = dict(
         max_model_len=8192,
@@ -324,9 +325,9 @@ def _check_replayssm_prefix_caching(
             max_model_len=12288,
             max_num_seqs=4,
             dtype="bfloat16",
-            mamba_ssm_cache_dtype="float16",
-            enable_mamba_cache_stochastic_rounding=True,
-            mamba_cache_philox_rounds=5,
+            mamba_ssm_cache_dtype="float16" if fp16_stochastic_cache else "float32",
+            enable_mamba_cache_stochastic_rounding=fp16_stochastic_cache,
+            mamba_cache_philox_rounds=5 if fp16_stochastic_cache else 0,
         )
     outputs = []
     block_sizes = []
@@ -439,11 +440,17 @@ def test_triton_replayssm_align_prefix_cache_matches_baseline_v1(
     [False, True],
     ids=["v1-align", "v2-align"],
 )
-def test_flashinfer_replayssm_prefix_cache_mtp(vllm_runner, monkeypatch, use_v2):
+@pytest.mark.parametrize(
+    "fp16_stochastic_cache", [False, True], ids=["fp32", "fp16-sr5"]
+)
+def test_flashinfer_replayssm_prefix_cache_mtp(
+    vllm_runner, monkeypatch, use_v2, fp16_stochastic_cache
+):
     _check_replayssm_prefix_caching(
         vllm_runner,
         MAMBA2_MTP_MODEL,
         monkeypatch,
         use_v2=use_v2,
         speculative_method="mtp",
+        fp16_stochastic_cache=fp16_stochastic_cache,
     )
