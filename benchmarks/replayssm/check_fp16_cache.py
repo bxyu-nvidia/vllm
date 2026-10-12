@@ -28,17 +28,36 @@ uses the real kernel's pre-call cache/history; these are local counterfactuals,
 not independent trajectories or replacement serving kernels. Native-emulation
 residuals against the real kernel must be checked before attributing its error.
 Use --ablate-dump FILE.pt to run the same analysis on a saved call without CUDA.
+
+With the CUDA precision patch installed, --kernel-precision bf16 selects the
+SIMT control; readout-reconstruction retains FP32 in those two operations, and
+all also retains scaled CB in FP32. Run each mode in a separate process. These
+change actual kernel outputs and subsequent caches, including prefix materialization.
+Use selected_emulation_vs_kernel to check the selected mode's arithmetic.
 """
 
 import argparse
 import hashlib
 import itertools
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 import torch
+
+KERNEL_PRECISION_MODES = {
+    "native": -1,
+    "bf16": 0,
+    "readout": 1,
+    "reconstruction": 2,
+    "readout-reconstruction": 3,
+    "cb": 4,
+    "readout-cb": 5,
+    "reconstruction-cb": 6,
+    "all": 7,
+}
 
 
 def materialize(
@@ -540,8 +559,14 @@ def replay_history(snapshot, start, count):
 class PrecisionAblationStats:
     """Condition every ablation on the same actual pre-call cache and history."""
 
-    def __init__(self):
+    def __init__(self, kernel_mask=-1):
         self.stats = {}
+        removed = [
+            name
+            for name, bit in (("readout", 1), ("cb", 4), ("reconstruction", 2))
+            if kernel_mask >= 0 and kernel_mask & bit
+        ]
+        self.kernel_variant = "without_" + "_".join(removed) if removed else "native"
 
     def update(self, snapshot, actual, *, start, count, checkpoint, accepted, step):
         history = replay_history(snapshot, start, count)
@@ -598,6 +623,8 @@ class PrecisionAblationStats:
                 )
             if name == "native":
                 record("native_emulation_vs_kernel", out, actual[:accepted])
+            if name == self.kernel_variant:
+                record("selected_emulation_vs_kernel", out, actual[:accepted])
 
     def result(self):
         return {
@@ -611,7 +638,7 @@ def ablate_saved_call(path):
     dump = torch.load(path, map_location="cpu", weights_only=True)
     if dump.get("format_version") != 1:
         raise ValueError("Expected a format_version=1 --compare-standard dump")
-    stats = PrecisionAblationStats()
+    stats = PrecisionAblationStats(dump["case"].get("kernel_precision_mask", -1))
     stats.update(
         dump["tensors"],
         dump["tensors"]["replay_out"][0],
@@ -678,7 +705,8 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
         1, heads, tokens, window, torch.bfloat16, device
     )
     stats = {}
-    ablation = PrecisionAblationStats() if args.precision_ablation else None
+    kernel_mask = KERNEL_PRECISION_MODES[getattr(args, "kernel_precision", "native")]
+    ablation = PrecisionAblationStats(kernel_mask) if args.precision_ablation else None
     start = committed = accepted_total = checkpoints = prefixes = 0
     previous_accepted = 1
     worst_dump = None
@@ -688,6 +716,7 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
         "philox_rounds": rounds,
         "algorithm": algorithm,
         "reference_dtype": args.reference_dtype,
+        "kernel_precision_mask": kernel_mask,
     }
 
     def record(name, actual, reference, step):
@@ -974,6 +1003,8 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
         "philox_rounds": rounds,
         "algorithm": algorithm,
         "standard_algorithm": args.standard_algorithm,
+        "kernel_precision_mask": kernel_mask,
+        "effective_replay_backend": "precision-simt" if kernel_mask >= 0 else algorithm,
         "independent_reference": f"PyTorch sequential {args.reference_dtype}",
         "seed": args.seed,
         "shape": {
@@ -1035,6 +1066,11 @@ def replay_source_info():
             "return smem.checkpoint_state",
         ),
     }
+    if os.environ.get("FLASHINFER_REPLAYSSM_PRECISION", "native") != "native":
+        markers["kernel_replayssm_precision.cuh"] = (
+            "checkpointing_precision_kernel",
+            "precision_replay_row",
+        )
     headers = []
     for name, required in markers.items():
         path = root / name
@@ -1064,6 +1100,12 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--reference-only", action="store_true")
+    parser.add_argument(
+        "--kernel-precision",
+        choices=list(KERNEL_PRECISION_MODES),
+        default=None,
+        help="CUDA precision mode; defaults to the environment or native",
+    )
     parser.add_argument(
         "--precision-ablation",
         action="store_true",
@@ -1127,6 +1169,12 @@ def main():
         "--algorithm", choices=["monolith", "two-kernel", "both"], default="both"
     )
     args = parser.parse_args()
+    args.kernel_precision = args.kernel_precision or os.environ.get(
+        "FLASHINFER_REPLAYSSM_PRECISION", "native"
+    )
+    if args.kernel_precision not in KERNEL_PRECISION_MODES:
+        parser.error("Invalid FLASHINFER_REPLAYSSM_PRECISION setting")
+    os.environ["FLASHINFER_REPLAYSSM_PRECISION"] = args.kernel_precision
     if args.ablate_dump is not None:
         if args.compare_standard or args.reference_only or args.verify_patch:
             parser.error("--ablate-dump is a standalone mode")
@@ -1175,6 +1223,33 @@ def main():
         parser.error("CUDA is required; --reference-only runs just the CPU arithmetic")
 
     import flashinfer
+
+    if args.kernel_precision != "native":
+        try:
+            from flashinfer.jit.mamba.replayssm_precision import (
+                replayssm_precision_mask,
+            )
+        except ImportError:
+            parser.error("Install the updated FlashInfer source for --kernel-precision")
+        mask = replayssm_precision_mask()
+        if mask != KERNEL_PRECISION_MODES[args.kernel_precision]:
+            parser.error(
+                "FlashInfer precision mode was already frozen; use a new process"
+            )
+        print(
+            json.dumps(
+                {
+                    "cuda_precision_mode": args.kernel_precision,
+                    "mask": mask,
+                    "module_suffix": f"_precision_v1_m{mask}",
+                    "scope": (
+                        "SIMT CUDA path, including prefix materialization; "
+                        "slower than native MMA"
+                    ),
+                }
+            ),
+            flush=True,
+        )
 
     print(f"FlashInfer {flashinfer.__version__}; GPU {torch.cuda.get_device_name()}")
     print(json.dumps({"flashinfer_path": flashinfer.__file__}), flush=True)
@@ -1260,7 +1335,7 @@ def main():
                             "drift and actual prior RN/SR cache values are held fixed. "
                             "Reference is a local FP64 sequential recurrence. "
                             "Output metrics include final BF16 rounding; compare "
-                            "output_rounding_floor. Check native_emulation_vs_kernel "
+                            "output_rounding_floor. Check selected_emulation_vs_kernel "
                             "before attributing error: CUDA fast math, MMA reduction "
                             "order and FMA are not reproduced bitwise. Reconstruction "
                             "affects current output only at checkpoints; its state "
