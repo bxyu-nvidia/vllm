@@ -12,6 +12,11 @@ The main reference is the unrounded FP32 recurrence. Prefix resume also reports
 agreement with the actual stored state: FP16 quantization alone is not a bad read.
 Use --steps 128 for randomized repeated checkpoints and --prefix-every 17 to
 include prefix materialization. These report errors, not model accuracy or timing.
+
+Use --compare-standard --steps 128 to compare against ordinary FlashInfer SSU,
+using vLLM's paged multi-token API. This runs FP32, FP16 RN, and FP16 SR controls
+on identical synthetic inputs (one request, default TP4 shape: 32 heads/2 groups).
+It does not exercise vLLM scheduling, convolution, model weights, or PD transport.
 """
 
 import argparse
@@ -62,7 +67,7 @@ def materialize(
         dim=state.size(2),
         dstate=state.size(3),
         num_heads=state.size(1),
-        heads_per_group=state.size(1),
+        heads_per_group=state.size(1) // b_cache.size(1),
         max_window=window,
         ring_buffer_len=x_cache.size(2),
         rand_seed=rand_seed,
@@ -380,6 +385,245 @@ def run_trajectory(algorithm, tokens, rounds, steps, window, prefix_every):
     }
 
 
+class ComparisonStats:
+    """Aggregate errors over elements, retaining the worst call and its step."""
+
+    def __init__(self):
+        self.calls = self.elements = self.matches = 0
+        self.error_squared = self.reference_squared = 0.0
+        self.max_abs_error = self.worst_relative_rms = 0.0
+        self.worst_step = None
+        self.first_nonfinite_step = None
+
+    def update(self, actual, reference, step):
+        assert actual.shape == reference.shape
+        actual, reference = actual.float(), reference.float()
+        self.calls += 1
+        self.elements += actual.numel()
+        self.matches += (actual == reference).sum().item()
+        if not bool(actual.isfinite().all() & reference.isfinite().all()):
+            if self.first_nonfinite_step is None:
+                self.first_nonfinite_step = step
+            return
+        diff = actual - reference
+        error_squared = diff.double().square().sum().item()
+        reference_squared = reference.double().square().sum().item()
+        relative_rms = (error_squared / max(reference_squared, 1e-40)) ** 0.5
+        self.error_squared += error_squared
+        self.reference_squared += reference_squared
+        self.max_abs_error = max(self.max_abs_error, diff.abs().max().item())
+        if self.worst_step is None or relative_rms > self.worst_relative_rms:
+            self.worst_relative_rms, self.worst_step = relative_rms, step
+
+    def result(self):
+        finite = self.first_nonfinite_step is None
+        return {
+            "calls": self.calls,
+            "elements": self.elements,
+            "finite": finite,
+            "matching_fraction": self.matches / self.elements,
+            "max_abs_error": self.max_abs_error if finite else None,
+            "relative_rms": (
+                (self.error_squared / max(self.reference_squared, 1e-40)) ** 0.5
+                if finite
+                else None
+            ),
+            "worst_call_relative_rms": self.worst_relative_rms if finite else None,
+            "worst_step": self.worst_step,
+            "first_nonfinite_step": self.first_nonfinite_step,
+        }
+
+
+def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda"):
+    """Compare real SSU kernels with shared inputs but independent live state.
+
+    Ordinary SSU writes all T speculative states, then the next call reads the
+    accepted one. ReplaySSM commits only those accepted inputs to its ring.
+    Neither arm consumes rejected states. The same-state probe has no history;
+    it isolates output arithmetic without inherited state divergence. SR uses
+    equal seed values, but different kernels need not map Philox draws equally.
+    """
+    from flashinfer.mamba import selective_state_update
+    from flashinfer.mamba.checkpointing_ssu import (
+        allocate_checkpointing_ssu_scratch,
+        checkpointing_ssu,
+    )
+
+    tokens, window = args.tokens, args.window
+    heads, groups, dim, dstate = args.heads, args.groups, 64, 128
+    ring_len = window + tokens
+    rng = torch.Generator(device=device).manual_seed(args.seed)
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=rng, device=device)
+
+    # All controls start with identical values, including the FP32 control.
+    initial = (randn(heads, dim, dstate) * 0.1).half().to(state_dtype)
+    standard = initial.expand(tokens, -1, -1, -1).clone()
+    replay = initial.expand(2, -1, -1, -1).clone()
+    xc = torch.zeros(2, heads, ring_len, dim, dtype=torch.bfloat16, device=device)
+    bc = torch.zeros(2, groups, ring_len, dstate, dtype=torch.bfloat16, device=device)
+    dc = torch.zeros(2, heads, ring_len, device=device)
+    # Probe storage must not alias either trajectory's state or ring.
+    probe = torch.empty_like(replay)
+    probe_rings = tuple(torch.zeros_like(t) for t in (xc, bc, dc))
+    zeros = torch.zeros(2, dtype=torch.int32, device=device)
+    index = torch.tensor([0], dtype=torch.int32, device=device)
+    pages = torch.arange(tokens, dtype=torch.int32, device=device)[None]
+    cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device=device)
+    a = -torch.logspace(-3, 1, heads, device=device)
+    a_expanded = a.as_strided((heads, dim, dstate), (1, 0, 0))
+    bias = torch.full((heads, 1), -4.0, dtype=torch.bfloat16, device=device)
+    d = randn(heads, 1).bfloat16().expand(heads, dim)
+    scratch = allocate_checkpointing_ssu_scratch(
+        1, heads, tokens, window, torch.bfloat16, device
+    )
+    stats = {}
+    start = committed = accepted_total = checkpoints = prefixes = 0
+    previous_accepted = 1
+
+    def record(name, actual, reference, step):
+        stats.setdefault(name, ComparisonStats()).update(actual, reference, step)
+
+    for step in range(args.steps):
+        x = randn(1, tokens, heads, dim).bfloat16()
+        dt = randn(1, tokens, heads, 1).bfloat16().expand_as(x)
+        b = randn(1, tokens, groups, dstate).bfloat16()
+        c = randn(1, tokens, groups, dstate).bfloat16()
+        seed = (
+            torch.tensor([args.seed + step], dtype=torch.int64, device=device)
+            if rounds
+            else None
+        )
+        checkpoint = committed + tokens > window
+        accepted = step % tokens + 1
+        before = standard[previous_accepted - 1].clone()
+        ordinary_out = torch.empty_like(x)
+        selective_state_update(
+            standard,
+            x[0],
+            dt[0],
+            a_expanded,
+            b[0],
+            c[0],
+            D=d,
+            dt_bias=bias.expand(heads, dim),
+            dt_softplus=True,
+            state_batch_indices=pages,
+            dst_state_batch_indices=pages,
+            num_accepted_tokens=torch.tensor(
+                [previous_accepted], dtype=torch.int32, device=device
+            ),
+            cu_seqlens=cu_seqlens,
+            cache_steps=tokens,
+            out=ordinary_out[0],
+            rand_seed=seed,
+            philox_rounds=rounds,
+            algorithm=args.standard_algorithm,
+        )
+        probe[0].copy_(before)
+        outputs = []
+        for state, rings, starts, counts in (
+            (probe, probe_rings, zeros, zeros),
+            (
+                replay,
+                (xc, bc, dc),
+                torch.tensor([start, 0], dtype=torch.int32, device=device),
+                torch.tensor([committed, 0], dtype=torch.int32, device=device),
+            ),
+        ):
+            out = torch.empty_like(x)
+            checkpointing_ssu(
+                state,
+                *rings,
+                starts,
+                counts,
+                x,
+                dt,
+                a_expanded,
+                b,
+                c,
+                out,
+                D=d,
+                dt_bias=bias.expand(heads, dim),
+                dt_softplus=True,
+                state_batch_indices=index,
+                rand_seed=seed,
+                philox_rounds=rounds,
+                cb_scaled=scratch[0],
+                cumAdt_vec=scratch[1],
+                cb_old=scratch[2],
+                algorithm=algorithm,
+                d_split=1,
+            )
+            outputs.append(out)
+        record("same_state_empty_history_output", outputs[0], ordinary_out, step)
+        phase = "checkpoint" if checkpoint else "live"
+        record(f"trajectory_{phase}_output", outputs[1], ordinary_out, step)
+        record(
+            "trajectory_accepted_output",
+            outputs[1][:, :accepted],
+            ordinary_out[:, :accepted],
+            step,
+        )
+        if checkpoint:
+            # Both now describe the history BEFORE this verification call.
+            record("checkpoint_cache_vs_standard_start", replay[0], before, step)
+            start = (start + committed) % ring_len
+            committed = 0
+            checkpoints += 1
+        committed += accepted
+        accepted_total += accepted
+        previous_accepted = accepted
+        if args.prefix_every and (step + 1) % args.prefix_every == 0:
+            materialize(
+                replay,
+                xc,
+                bc,
+                dc,
+                a,
+                seed,
+                rounds,
+                count=committed,
+                start=start,
+                window=window,
+                src=0,
+                dst=1,
+            )
+            record(
+                "prefix_cache_vs_standard_accepted",
+                replay[1],
+                standard[accepted - 1],
+                step,
+            )
+            replay[0].copy_(replay[1])
+            start = committed = 0
+            prefixes += 1
+    return {
+        "mode": "compare-standard",
+        "reference": "flashinfer.mamba.selective_state_update (paged varlen API)",
+        "state_dtype": str(state_dtype),
+        "philox_rounds": rounds,
+        "algorithm": algorithm,
+        "standard_algorithm": args.standard_algorithm,
+        "seed": args.seed,
+        "shape": {
+            "batch": 1,
+            "heads": heads,
+            "groups": groups,
+            "dim": dim,
+            "dstate": dstate,
+            "tokens": tokens,
+            "window": window,
+        },
+        "steps": args.steps,
+        "accepted_tokens": accepted_total,
+        "checkpoint_calls": checkpoints,
+        "prefix_materializations": prefixes,
+        "metrics": {name: value.result() for name, value in stats.items()},
+    }
+
+
 def loaded_replay_libraries():
     """Report actual loaded Linux DSOs, including any prebuilt provider path."""
     try:
@@ -391,7 +635,14 @@ def loaded_replay_libraries():
             line.split(maxsplit=5)[-1]
             for line in lines
             if ".so" in line
-            and ("checkpointing_ssu_" in line or "replayssm_materialize_" in line)
+            and any(
+                name in line
+                for name in (
+                    "checkpointing_ssu_",
+                    "replayssm_materialize_",
+                    "selective_state_update",
+                )
+            )
         }
     )
 
@@ -442,6 +693,20 @@ def main():
     )
     parser.add_argument("--reference-only", action="store_true")
     parser.add_argument(
+        "--compare-standard",
+        action="store_true",
+        help="Compare actual ordinary SSU and ReplaySSM; defaults to 128 steps",
+    )
+    parser.add_argument("--heads", type=int, default=32)
+    parser.add_argument("--groups", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=20261011)
+    parser.add_argument(
+        "--standard-algorithm",
+        choices=["auto", "simple", "vertical", "horizontal"],
+        default="auto",
+        help="Ordinary FlashInfer SSU algorithm for --compare-standard",
+    )
+    parser.add_argument(
         "--verify-patch",
         action="store_true",
         help="Require patched headers and exact checkpoint output before trajectories",
@@ -466,6 +731,12 @@ def main():
     args = parser.parse_args()
     if args.steps < 0 or args.prefix_every < 0 or args.tokens > args.window:
         parser.error("steps/prefix-every must be nonnegative and tokens <= window")
+    if args.heads <= 0 or args.groups <= 0 or args.heads % args.groups:
+        parser.error("heads and groups must be positive, and groups must divide heads")
+    if args.compare_standard and args.steps == 0:
+        args.steps = 128
+    if not 0 <= args.seed < 2**63 - args.steps:
+        parser.error("seed and seed + steps must fit a nonnegative int64")
     exact = torch.tensor(1 + 17 / 4096, dtype=torch.float32)
     print(
         json.dumps(
@@ -529,6 +800,47 @@ def main():
                         "Patched checkpoint behavior was not observed; verify the "
                         "build before interpreting trajectory or model accuracy results"
                     )
+    if args.compare_standard:
+        print(
+            json.dumps(
+                {
+                    "comparison_notes": {
+                        "same_state_empty_history_output": (
+                            "Same cached values and new inputs; no replay history. "
+                            "Isolates output arithmetic without accumulated drift."
+                        ),
+                        "trajectory": (
+                            "Independent caches, identical inputs and acceptance "
+                            "schedule (1..tokens cyclically). Includes each "
+                            "algorithm's native cache-rounding frequency."
+                        ),
+                        "stochastic_rounding": (
+                            "Same seed values do not imply the same Philox draws "
+                            "or bitwise cache parity across different kernels."
+                        ),
+                        "scope": (
+                            "Synthetic single-request SSM comparison, not model "
+                            "accuracy, scheduling, convolution, or PD transport."
+                        ),
+                    }
+                }
+            ),
+            flush=True,
+        )
+        finite = True
+        for algorithm in algorithms:
+            for dtype, rounds in (
+                (torch.float32, 0),
+                (torch.float16, 0),
+                (torch.float16, 5),
+            ):
+                result = run_standard_comparison(args, dtype, rounds, algorithm)
+                finite &= all(m["finite"] for m in result["metrics"].values())
+                print(json.dumps(result), flush=True)
+        print(json.dumps({"loaded_libraries": loaded_replay_libraries()}), flush=True)
+        if not finite:
+            parser.exit(1, "Non-finite values detected in the SSU comparison\n")
+        return
     for algorithm in algorithms:
         if args.steps:
             for rounds in (0, 5):
