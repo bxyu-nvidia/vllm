@@ -15,7 +15,9 @@ include prefix materialization. These report errors, not model accuracy or timin
 """
 
 import argparse
+import hashlib
 import json
+import sys
 from pathlib import Path
 
 import torch
@@ -68,7 +70,9 @@ def materialize(
     )
 
 
-def run_case(state_dtype, philox_rounds, mode, algorithm, tokens):
+def run_case(
+    state_dtype, philox_rounds, mode, algorithm, tokens, *, checkpoint_window=8
+):
     from flashinfer.mamba.checkpointing_ssu import (
         allocate_checkpointing_ssu_scratch,
         checkpointing_ssu,
@@ -78,7 +82,7 @@ def run_case(state_dtype, philox_rounds, mode, algorithm, tokens):
     heads, dim, dstate = 8, 64, 128
     # Eight committed tokens plus up to eight new tokens force a checkpoint when
     # max_window=8. Both histories represent exactly the same mathematical state.
-    window = 8 if mode == "checkpoint" else 16
+    window = checkpoint_window if mode == "checkpoint" else 16
     ring_len = window + tokens
     state = torch.zeros(2, heads, dim, dstate, dtype=state_dtype, device=device)
     state[0, :, :, 0] = 1
@@ -95,7 +99,9 @@ def run_case(state_dtype, philox_rounds, mode, algorithm, tokens):
         else None
     )
     slot = 0
-    committed = torch.tensor([8, 0], dtype=torch.int32, device=device)
+    committed = torch.tensor(
+        [window if mode == "checkpoint" else 8, 0], dtype=torch.int32, device=device
+    )
     if mode == "cache-readout":
         # Both cache entries are exactly representable in FP16. Their small
         # difference disappears when the matmul operands are rounded to BF16.
@@ -155,6 +161,7 @@ def run_case(state_dtype, philox_rounds, mode, algorithm, tokens):
         "philox_rounds": philox_rounds,
         "algorithm": algorithm,
         "tokens": tokens,
+        "window": window,
         "mode": mode,
         "expected_bf16": expected.flatten()[0].item(),
         "observed_values": out.unique().float().tolist(),
@@ -389,11 +396,56 @@ def loaded_replay_libraries():
     )
 
 
+def replay_source_info():
+    """Identify JIT headers; markers alone do not establish binary freshness."""
+    from flashinfer.jit import env as jit_env
+
+    root = jit_env.FLASHINFER_INCLUDE_DIR / "flashinfer" / "mamba"
+    markers = {
+        "kernel_checkpointing_ssu.cuh": ("WRITE_READOUT", "smem.checkpoint_state"),
+        "kernel_checkpointing_ssu_main.cuh": (
+            "output_state_ptr<state_t, CHECKPOINT>",
+            "smem.checkpoint_state",
+        ),
+        "kernel_checkpointing_ssu_common.cuh": (
+            "struct CheckpointReadoutStorage",
+            "return smem.checkpoint_state",
+        ),
+    }
+    headers = []
+    for name, required in markers.items():
+        path = root / name
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            headers.append({"path": str(path.resolve()), "error": str(exc)})
+            continue
+        headers.append(
+            {
+                "path": str(path.resolve()),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "patch_markers_present": all(
+                    marker.encode() in data for marker in required
+                ),
+            }
+        )
+    return {
+        "python_executable": sys.executable,
+        "jit_workspace": str(jit_env.FLASHINFER_WORKSPACE_DIR),
+        "headers": headers,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--reference-only", action="store_true")
+    parser.add_argument(
+        "--verify-patch",
+        action="store_true",
+        help="Require patched headers and exact checkpoint output before trajectories",
+    )
     parser.add_argument("--tokens", type=int, choices=range(1, 9), default=6)
     parser.add_argument(
         "--steps",
@@ -443,9 +495,40 @@ def main():
 
     print(f"FlashInfer {flashinfer.__version__}; GPU {torch.cuda.get_device_name()}")
     print(json.dumps({"flashinfer_path": flashinfer.__file__}), flush=True)
+    source_info = replay_source_info()
+    print(json.dumps({"replay_source_info": source_info}), flush=True)
+    if args.verify_patch and not all(
+        entry.get("patch_markers_present", False) for entry in source_info["headers"]
+    ):
+        parser.error(
+            "The imported FlashInfer JIT headers are missing the readout patch"
+        )
     algorithms = (
         ["monolith", "two-kernel"] if args.algorithm == "both" else [args.algorithm]
     )
+    if args.verify_patch:
+        for algorithm in algorithms:
+            for rounds in (0, 5):
+                result = run_case(
+                    torch.float16,
+                    rounds,
+                    "checkpoint",
+                    algorithm,
+                    args.tokens,
+                    checkpoint_window=args.window,
+                )
+                print(json.dumps({"patch_smoke_test": result}), flush=True)
+                if not result["finite"] or result["matching_fraction"] != 1.0:
+                    print(
+                        json.dumps(
+                            {"loaded_replay_libraries": loaded_replay_libraries()}
+                        ),
+                        flush=True,
+                    )
+                    parser.error(
+                        "Patched checkpoint behavior was not observed; verify the "
+                        "build before interpreting trajectory or model accuracy results"
+                    )
     for algorithm in algorithms:
         if args.steps:
             for rounds in (0, 5):
