@@ -17,12 +17,17 @@ Use --compare-standard --steps 128 to compare against ordinary FlashInfer SSU,
 using vLLM's paged multi-token API. This runs FP32, FP16 RN, and FP16 SR controls
 on identical synthetic inputs (one request, default TP4 shape: 32 heads/2 groups).
 It does not exercise vLLM scheduling, convolution, model weights, or PD transport.
+Both kernels are also compared to a shared sequential PyTorch recurrence that
+never quantizes its state. --reference-dtype float64 checks oracle precision.
+--per-step prints the error trajectory; --dump-dir saves each case's worst
+ReplaySSM accepted-output error with all inputs needed to reproduce that call.
 """
 
 import argparse
 import hashlib
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 import torch
@@ -220,18 +225,33 @@ def cache_metrics(actual, unrounded, rounds):
 
 def recurrence_readout(state, x, dt, a, b, c):
     """Independent FP32 recurrence and contraction; dt is already processed."""
-    state = state.float().clone()
+    return recurrence_scan(state, x, dt, a, b, c)[0]
+
+
+def recurrence_scan(state, x, dt, a, b, c, d=None, *, dtype=torch.float32):
+    """Sequential PyTorch oracle with no cache quantization or matrix multiplies.
+
+    Inputs are token-major; dt is already processed. Return every output and
+    post-token state so the caller can commit only the accepted prefix. This is
+    a numerical reference, not a bitwise oracle for CUDA fast math/FMA ordering.
+    """
+    state = state.to(dtype).clone()
+    x, dt, a, b, c = (t.to(dtype) for t in (x, dt, a, b, c))
     heads_per_group = state.shape[0] // b.shape[1]
-    outputs = []
+    outputs, states = [], []
     for t in range(x.shape[0]):
-        bt = b[t].float().repeat_interleave(heads_per_group, dim=0)
-        ct = c[t].float().repeat_interleave(heads_per_group, dim=0)
+        bt = b[t].repeat_interleave(heads_per_group, dim=0)
+        ct = c[t].repeat_interleave(heads_per_group, dim=0)
         state = (
             state * torch.exp(a * dt[t])[:, None, None]
-            + x[t].float()[:, :, None] * (dt[t, :, None] * bt)[:, None, :]
+            + x[t, :, :, None] * (dt[t, :, None] * bt)[:, None, :]
         )
-        outputs.append((state * ct[:, None, :]).sum(-1))
-    return torch.stack(outputs)
+        out = (state * ct[:, None, :]).sum(-1)
+        if d is not None:
+            out = out + x[t] * d.to(dtype)
+        outputs.append(out)
+        states.append(state)
+    return torch.stack(outputs), torch.stack(states)
 
 
 def run_trajectory(algorithm, tokens, rounds, steps, window, prefix_every):
@@ -397,14 +417,15 @@ class ComparisonStats:
 
     def update(self, actual, reference, step):
         assert actual.shape == reference.shape
-        actual, reference = actual.float(), reference.float()
+        # Preserve an optional FP64 reference when computing differences.
+        actual, reference = actual.double(), reference.double()
         self.calls += 1
         self.elements += actual.numel()
         self.matches += (actual == reference).sum().item()
         if not bool(actual.isfinite().all() & reference.isfinite().all()):
             if self.first_nonfinite_step is None:
                 self.first_nonfinite_step = step
-            return
+            return {"finite": False, "relative_rms": None}
         diff = actual - reference
         error_squared = diff.double().square().sum().item()
         reference_squared = reference.double().square().sum().item()
@@ -414,6 +435,11 @@ class ComparisonStats:
         self.max_abs_error = max(self.max_abs_error, diff.abs().max().item())
         if self.worst_step is None or relative_rms > self.worst_relative_rms:
             self.worst_relative_rms, self.worst_step = relative_rms, step
+        return {
+            "finite": True,
+            "relative_rms": relative_rms,
+            "max_abs_error": diff.abs().max().item(),
+        }
 
     def result(self):
         finite = self.first_nonfinite_step is None
@@ -459,6 +485,8 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
 
     # All controls start with identical values, including the FP32 control.
     initial = (randn(heads, dim, dstate) * 0.1).half().to(state_dtype)
+    reference_dtype = getattr(torch, args.reference_dtype)
+    reference_state = initial.to(reference_dtype).clone()
     standard = initial.expand(tokens, -1, -1, -1).clone()
     replay = initial.expand(2, -1, -1, -1).clone()
     xc = torch.zeros(2, heads, ring_len, dim, dtype=torch.bfloat16, device=device)
@@ -481,11 +509,22 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
     stats = {}
     start = committed = accepted_total = checkpoints = prefixes = 0
     previous_accepted = 1
+    worst_dump = None
+    worst_dump_score = -1.0
+    case = {
+        "state_dtype": str(state_dtype),
+        "philox_rounds": rounds,
+        "algorithm": algorithm,
+        "reference_dtype": args.reference_dtype,
+    }
 
     def record(name, actual, reference, step):
-        stats.setdefault(name, ComparisonStats()).update(actual, reference, step)
+        step_metrics[name] = stats.setdefault(name, ComparisonStats()).update(
+            actual, reference, step
+        )
 
     for step in range(args.steps):
+        step_metrics = {}
         x = randn(1, tokens, heads, dim).bfloat16()
         dt = randn(1, tokens, heads, 1).bfloat16().expand_as(x)
         b = randn(1, tokens, groups, dstate).bfloat16()
@@ -498,6 +537,47 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
         checkpoint = committed + tokens > window
         accepted = step % tokens + 1
         before = standard[previous_accepted - 1].clone()
+        processed_dt = torch.nn.functional.softplus(
+            dt[0, :, :, 0].to(reference_dtype) + bias[:, 0].to(reference_dtype)
+        )
+        reference_out, reference_states = recurrence_scan(
+            reference_state,
+            x[0],
+            processed_dt,
+            a,
+            b[0],
+            c[0],
+            d,
+            dtype=reference_dtype,
+        )
+        same_state_reference, _ = recurrence_scan(
+            before,
+            x[0],
+            processed_dt,
+            a,
+            b[0],
+            c[0],
+            d,
+            dtype=reference_dtype,
+        )
+        # Preserve pre-call inputs only when a reproducible case was requested.
+        snapshot = None
+        if args.dump_dir is not None:
+            snapshot = {
+                "standard_state": standard.clone(),
+                "replay_state": replay.clone(),
+                "x_cache": xc.clone(),
+                "b_cache": bc.clone(),
+                "dt_cache": dc.clone(),
+                "reference_state": reference_state,
+                "x": x,
+                "dt": dt,
+                "a": a,
+                "b": b,
+                "c": c,
+                "d": d,
+                "dt_bias": bias,
+            }
         ordinary_out = torch.empty_like(x)
         selective_state_update(
             standard,
@@ -558,6 +638,34 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
             )
             outputs.append(out)
         record("same_state_empty_history_output", outputs[0], ordinary_out, step)
+        # Two references answer different questions: actual local input state
+        # isolates arithmetic; the shared trajectory also includes cache drift.
+        for name, actual in (("standard", ordinary_out), ("replay", outputs[0])):
+            record(
+                f"{name}_same_state_vs_reference",
+                actual[0],
+                same_state_reference.to(actual.dtype),
+                step,
+            )
+        for name, actual in (("standard", ordinary_out), ("replay", outputs[1])):
+            record(
+                f"{name}_accepted_vs_reference",
+                actual[0, :accepted],
+                reference_out[:accepted].to(actual.dtype),
+                step,
+            )
+            record(
+                f"{name}_accepted_vs_unrounded_reference",
+                actual[0, :accepted],
+                reference_out[:accepted],
+                step,
+            )
+        record(
+            "standard_accepted_cache_vs_reference",
+            standard[accepted - 1],
+            reference_states[accepted - 1],
+            step,
+        )
         phase = "checkpoint" if checkpoint else "live"
         record(f"trajectory_{phase}_output", outputs[1], ordinary_out, step)
         record(
@@ -569,12 +677,54 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
         if checkpoint:
             # Both now describe the history BEFORE this verification call.
             record("checkpoint_cache_vs_standard_start", replay[0], before, step)
+            record(
+                "replay_checkpoint_cache_vs_reference",
+                replay[0],
+                reference_state,
+                step,
+            )
+        if snapshot is not None:
+            score = step_metrics["replay_accepted_vs_unrounded_reference"]
+            rank = score["relative_rms"] if score["finite"] else float("inf")
+            if rank > worst_dump_score:
+                worst_dump_score = rank
+                snapshot.update(
+                    standard_out=ordinary_out,
+                    probe_out=outputs[0],
+                    replay_out=outputs[1],
+                    reference_out=reference_out,
+                    same_state_reference_out=same_state_reference,
+                    reference_states=reference_states,
+                )
+                worst_dump = {
+                    "format_version": 1,
+                    "case": case,
+                    "config": {
+                        k: str(v) if isinstance(v, Path) else v
+                        for k, v in vars(args).items()
+                    },
+                    "step": step,
+                    "accepted": accepted,
+                    "previous_accepted": previous_accepted,
+                    "ring_start": start,
+                    "committed": committed,
+                    "checkpoint": checkpoint,
+                    "rand_seed": args.seed + step if rounds else None,
+                    "metrics": dict(step_metrics),
+                    "strides": {k: list(v.stride()) for k, v in snapshot.items()},
+                    "tensors": {
+                        k: v.detach().cpu().clone() for k, v in snapshot.items()
+                    },
+                }
+        if checkpoint:
             start = (start + committed) % ring_len
             committed = 0
             checkpoints += 1
         committed += accepted
         accepted_total += accepted
         previous_accepted = accepted
+        # Never carry rejected draft states into the independent oracle.
+        reference_state = reference_states[accepted - 1].clone()
         if args.prefix_every and (step + 1) % args.prefix_every == 0:
             materialize(
                 replay,
@@ -596,9 +746,45 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
                 standard[accepted - 1],
                 step,
             )
+            record(
+                "replay_prefix_cache_vs_reference",
+                replay[1],
+                reference_state,
+                step,
+            )
             replay[0].copy_(replay[1])
             start = committed = 0
             prefixes += 1
+        if args.per_step:
+            print(
+                json.dumps(
+                    {
+                        "mode": "comparison-step",
+                        **case,
+                        "step": step,
+                        "accepted": accepted,
+                        "checkpoint": checkpoint,
+                        "metrics": step_metrics,
+                    }
+                ),
+                flush=True,
+            )
+    dump_path = None
+    if worst_dump is not None:
+        dump_path = args.dump_dir / (
+            f"{str(state_dtype).split('.')[-1]}-sr{rounds}-{algorithm}.pt"
+        )
+        flashinfer = sys.modules["flashinfer"]
+        worst_dump["runtime"] = {
+            "python_executable": sys.executable,
+            "torch_version": str(torch.__version__),
+            "flashinfer_version": getattr(flashinfer, "__version__", None),
+            "flashinfer_path": getattr(flashinfer, "__file__", None),
+            "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "source_info": replay_source_info() if device == "cuda" else None,
+            "loaded_libraries": loaded_replay_libraries(),
+        }
+        torch.save(worst_dump, dump_path)
     return {
         "mode": "compare-standard",
         "reference": "flashinfer.mamba.selective_state_update (paged varlen API)",
@@ -606,6 +792,7 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
         "philox_rounds": rounds,
         "algorithm": algorithm,
         "standard_algorithm": args.standard_algorithm,
+        "independent_reference": f"PyTorch sequential {args.reference_dtype}",
         "seed": args.seed,
         "shape": {
             "batch": 1,
@@ -620,6 +807,8 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
         "accepted_tokens": accepted_total,
         "checkpoint_calls": checkpoints,
         "prefix_materializations": prefixes,
+        "prefix_every": args.prefix_every,
+        "worst_case_dump": str(dump_path) if dump_path is not None else None,
         "metrics": {name: value.result() for name, value in stats.items()},
     }
 
@@ -701,6 +890,22 @@ def main():
     parser.add_argument("--groups", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20261011)
     parser.add_argument(
+        "--reference-dtype",
+        choices=["float32", "float64"],
+        default="float32",
+        help="Independent recurrence precision for --compare-standard",
+    )
+    parser.add_argument(
+        "--per-step",
+        action="store_true",
+        help="Print per-call comparison metrics in addition to aggregate metrics",
+    )
+    parser.add_argument(
+        "--dump-dir",
+        type=Path,
+        help="Save worst-case tensors under a new subdirectory of this directory",
+    )
+    parser.add_argument(
         "--standard-algorithm",
         choices=["auto", "simple", "vertical", "horizontal"],
         default="auto",
@@ -735,6 +940,8 @@ def main():
         parser.error("heads and groups must be positive, and groups must divide heads")
     if args.compare_standard and args.steps == 0:
         args.steps = 128
+    if (args.per_step or args.dump_dir is not None) and not args.compare_standard:
+        parser.error("--per-step and --dump-dir require --compare-standard")
     if not 0 <= args.seed < 2**63 - args.steps:
         parser.error("seed and seed + steps must fit a nonnegative int64")
     exact = torch.tensor(1 + 17 / 4096, dtype=torch.float32)
@@ -801,6 +1008,10 @@ def main():
                         "build before interpreting trajectory or model accuracy results"
                     )
     if args.compare_standard:
+        if args.dump_dir is not None:
+            args.dump_dir.mkdir(parents=True, exist_ok=True)
+            args.dump_dir = Path(tempfile.mkdtemp(prefix="ssu-", dir=args.dump_dir))
+            print(json.dumps({"dump_directory": str(args.dump_dir)}), flush=True)
         print(
             json.dumps(
                 {
@@ -813,6 +1024,20 @@ def main():
                             "Independent caches, identical inputs and acceptance "
                             "schedule (1..tokens cyclically). Includes each "
                             "algorithm's native cache-rounding frequency."
+                        ),
+                        "independent_reference": (
+                            f"Sequential PyTorch {args.reference_dtype}, "
+                            "shared initial state and inputs, only accepted "
+                            "tokens committed; never reset or cache-quantized. "
+                            "No FlashInfer kernels or tensor-core matmuls."
+                        ),
+                        "reference_metrics": (
+                            "*_same_state_vs_reference isolates arithmetic from "
+                            "the actual ordinary-SSU starting cache. "
+                            "*_accepted_vs_reference uses the shared trajectory "
+                            "rounded to BF16; *_vs_unrounded_reference retains "
+                            "reference precision, including output-rounding error. "
+                            "Cache comparisons use unrounded reference states."
                         ),
                         "stochastic_rounding": (
                             "Same seed values do not imply the same Philox draws "
