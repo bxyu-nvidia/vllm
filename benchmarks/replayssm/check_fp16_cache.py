@@ -21,10 +21,18 @@ Both kernels are also compared to a shared sequential PyTorch recurrence that
 never quantizes its state. --reference-dtype float64 checks oracle precision.
 --per-step prints the error trajectory; --dump-dir saves each case's worst
 ReplaySSM accepted-output error with all inputs needed to reproduce that call.
+
+Add --precision-ablation to emulate all eight combinations of retaining/removing
+BF16 rounding of state readout, scaled CB, and reconstruction operands. Each call
+uses the real kernel's pre-call cache/history; these are local counterfactuals,
+not independent trajectories or replacement serving kernels. Native-emulation
+residuals against the real kernel must be checked before attributing its error.
+Use --ablate-dump FILE.pt to run the same analysis on a saved call without CUDA.
 """
 
 import argparse
 import hashlib
+import itertools
 import json
 import sys
 import tempfile
@@ -460,6 +468,169 @@ class ComparisonStats:
         }
 
 
+def replay_precision_variants(state, history, x, dt, a, b, c, d, *, checkpoint):
+    """Emulate ReplaySSM factorization with explicit optional BF16 conversions.
+
+    All arithmetic uses FP32 elementwise operations/reductions, never matmul
+    (so TF32 settings cannot silently affect the controls). CUDA fast math,
+    MMA accumulation order, and fused operations are not reproduced bitwise.
+    History is chronological, token-major (x, processed dt, B). Outputs remain
+    FP32 here; the caller applies the common final BF16 output conversion.
+    Reconstructed states precede cache quantization, including stochastic rounding.
+    """
+    state = state.float()
+    x, dt, a, b, c, d = (v.float() for v in (x, dt, a, b, c, d))
+    ox, odt, ob = (v.float() for v in history)
+    hpg = state.shape[0] // b.shape[1]
+    b, c, ob = (v.repeat_interleave(hpg, dim=1) for v in (b, c, ob))
+    cum = (dt * a).cumsum(0)
+    old_cum = (odt * a).cumsum(0)
+    total = old_cum[-1] if len(ox) else torch.zeros_like(a)
+    causal = torch.ones(len(x), len(x), device=x.device, dtype=torch.bool).tril()
+    delta = cum[:, None] - cum[None, :]
+    # Mask before exp too: unused future-token terms can otherwise overflow.
+    decay = torch.exp(delta.masked_fill(~causal[:, :, None], -torch.inf))
+    cb = (c[:, None] * b[None, :]).sum(-1) * decay * dt[None, :]
+    cb_old = (
+        (c[:, None] * ob[None, :]).sum(-1)
+        * torch.exp(cum[:, None] + total - old_cum[None, :])
+        * odt[None, :]
+    )
+    scaled_b = ob * (torch.exp(total - old_cum) * odt)[:, :, None]
+
+    def rounded(value, enabled):
+        return value.bfloat16().float() if enabled else value
+
+    def reconstruct(round_operand):
+        return state * torch.exp(total)[:, None, None] + (
+            ox[:, :, :, None] * rounded(scaled_b, round_operand)[:, :, None, :]
+        ).sum(0)
+
+    reconstructed = {flag: reconstruct(flag) for flag in (False, True)}
+    for readout, cb_round, reconstruction in itertools.product((True, False), repeat=3):
+        removed = [
+            name
+            for name, enabled in (
+                ("readout", readout),
+                ("cb", cb_round),
+                ("reconstruction", reconstruction),
+            )
+            if not enabled
+        ]
+        name = "without_" + "_".join(removed) if removed else "native"
+        base = reconstructed[reconstruction] if checkpoint else state
+        y = (c[:, :, None, :] * rounded(base, readout)[None]).sum(-1)
+        beta = torch.exp(cum)
+        if not checkpoint:
+            beta = beta * torch.exp(total)
+        y = y * beta[:, :, None]
+        y = y + (rounded(cb, cb_round)[:, :, :, None] * x[None]).sum(1)
+        if not checkpoint:
+            y = y + (rounded(cb_old, cb_round)[:, :, :, None] * ox[None]).sum(1)
+        yield name, y + d * x, reconstructed[reconstruction]
+
+
+def replay_history(snapshot, start, count):
+    """Extract only committed tokens, including a wrapped ring buffer."""
+    xc, dc, bc = (snapshot[k] for k in ("x_cache", "dt_cache", "b_cache"))
+    indices = (torch.arange(count, device=xc.device) + start) % xc.shape[2]
+    return tuple(t[0].index_select(1, indices).transpose(0, 1) for t in (xc, dc, bc))
+
+
+class PrecisionAblationStats:
+    """Condition every ablation on the same actual pre-call cache and history."""
+
+    def __init__(self):
+        self.stats = {}
+
+    def update(self, snapshot, actual, *, start, count, checkpoint, accepted, step):
+        history = replay_history(snapshot, start, count)
+        state = snapshot["replay_state"][0]
+        x, b, c = (snapshot[k][0] for k in ("x", "b", "c"))
+        a, d = (snapshot[k] for k in ("a", "d"))
+        raw_dt = snapshot["dt"][0, :, :, 0]
+        bias = snapshot["dt_bias"][:, 0]
+        dt = torch.nn.functional.softplus(raw_dt.float() + bias.float())
+        ref_state = state.double()
+        if count:
+            _, states = recurrence_scan(
+                ref_state,
+                history[0],
+                history[1],
+                a,
+                history[2],
+                torch.zeros_like(history[2]),
+                dtype=torch.float64,
+            )
+            ref_state = states[-1]
+        reference, _ = recurrence_scan(
+            ref_state,
+            x,
+            torch.nn.functional.softplus(raw_dt.double() + bias.double()),
+            a,
+            b,
+            c,
+            d,
+            dtype=torch.float64,
+        )
+        phase = "checkpoint" if checkpoint else "live" if count else "empty_history"
+        stats = self.stats.setdefault(phase, {})
+
+        def record(name, value, ref):
+            stats.setdefault(name, ComparisonStats()).update(value, ref, step)
+
+        record("kernel_vs_local_reference", actual[:accepted], reference[:accepted])
+        record(
+            "output_rounding_floor",
+            reference[:accepted].bfloat16(),
+            reference[:accepted],
+        )
+        for name, out, reconstructed in replay_precision_variants(
+            state, history, x, dt, a, b, c, d, checkpoint=checkpoint
+        ):
+            out = out[:accepted].bfloat16()
+            record(f"{name}/output_vs_local_reference", out, reference[:accepted])
+            if name in ("native", "without_reconstruction") and count:
+                record(
+                    f"{name}/reconstruction_vs_local_reference",
+                    reconstructed,
+                    ref_state,
+                )
+            if name == "native":
+                record("native_emulation_vs_kernel", out, actual[:accepted])
+
+    def result(self):
+        return {
+            phase: {name: stat.result() for name, stat in metrics.items()}
+            for phase, metrics in self.stats.items()
+        }
+
+
+def ablate_saved_call(path):
+    """Analyze a saved pre-call snapshot on CPU without importing FlashInfer."""
+    dump = torch.load(path, map_location="cpu", weights_only=True)
+    if dump.get("format_version") != 1:
+        raise ValueError("Expected a format_version=1 --compare-standard dump")
+    stats = PrecisionAblationStats()
+    stats.update(
+        dump["tensors"],
+        dump["tensors"]["replay_out"][0],
+        start=dump["ring_start"],
+        count=dump["committed"],
+        checkpoint=dump["checkpoint"],
+        accepted=dump["accepted"],
+        step=dump["step"],
+    )
+    return {
+        "mode": "precision-ablation-dump",
+        "file": str(path),
+        "case": dump["case"],
+        "step": dump["step"],
+        "scope": "Local FP32 arithmetic emulation; not a modified CUDA kernel",
+        "metrics": stats.result(),
+    }
+
+
 def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda"):
     """Compare real SSU kernels with shared inputs but independent live state.
 
@@ -507,6 +678,7 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
         1, heads, tokens, window, torch.bfloat16, device
     )
     stats = {}
+    ablation = PrecisionAblationStats() if args.precision_ablation else None
     start = committed = accepted_total = checkpoints = prefixes = 0
     previous_accepted = 1
     worst_dump = None
@@ -562,7 +734,7 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
         )
         # Preserve pre-call inputs only when a reproducible case was requested.
         snapshot = None
-        if args.dump_dir is not None:
+        if args.dump_dir is not None or ablation is not None:
             snapshot = {
                 "standard_state": standard.clone(),
                 "replay_state": replay.clone(),
@@ -637,6 +809,16 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
                 d_split=1,
             )
             outputs.append(out)
+        if ablation is not None:
+            ablation.update(
+                snapshot,
+                outputs[1][0],
+                start=start,
+                count=committed,
+                checkpoint=checkpoint,
+                accepted=accepted,
+                step=step,
+            )
         record("same_state_empty_history_output", outputs[0], ordinary_out, step)
         # Two references answer different questions: actual local input state
         # isolates arithmetic; the shared trajectory also includes cache drift.
@@ -683,7 +865,7 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
                 reference_state,
                 step,
             )
-        if snapshot is not None:
+        if args.dump_dir is not None:
             score = step_metrics["replay_accepted_vs_unrounded_reference"]
             rank = score["relative_rms"] if score["finite"] else float("inf")
             if rank > worst_dump_score:
@@ -810,6 +992,7 @@ def run_standard_comparison(args, state_dtype, rounds, algorithm, device="cuda")
         "prefix_every": args.prefix_every,
         "worst_case_dump": str(dump_path) if dump_path is not None else None,
         "metrics": {name: value.result() for name, value in stats.items()},
+        "precision_ablation": ablation.result() if ablation is not None else None,
     }
 
 
@@ -882,6 +1065,16 @@ def main():
     )
     parser.add_argument("--reference-only", action="store_true")
     parser.add_argument(
+        "--precision-ablation",
+        action="store_true",
+        help="With --compare-standard, isolate three BF16 conversions using emulation",
+    )
+    parser.add_argument(
+        "--ablate-dump",
+        type=Path,
+        help="Analyze a saved .pt call on CPU; no CUDA or FlashInfer required",
+    )
+    parser.add_argument(
         "--compare-standard",
         action="store_true",
         help="Compare actual ordinary SSU and ReplaySSM; defaults to 128 steps",
@@ -934,6 +1127,18 @@ def main():
         "--algorithm", choices=["monolith", "two-kernel", "both"], default="both"
     )
     args = parser.parse_args()
+    if args.ablate_dump is not None:
+        if args.compare_standard or args.reference_only or args.verify_patch:
+            parser.error("--ablate-dump is a standalone mode")
+        result = ablate_saved_call(args.ablate_dump)
+        print(json.dumps(result), flush=True)
+        if not all(
+            m["finite"] for phase in result["metrics"].values() for m in phase.values()
+        ):
+            parser.exit(1, "Non-finite values detected in precision ablation\n")
+        return
+    if args.precision_ablation and (not args.compare_standard or args.reference_only):
+        parser.error("--precision-ablation requires --compare-standard")
     if args.steps < 0 or args.prefix_every < 0 or args.tokens > args.window:
         parser.error("steps/prefix-every must be nonnegative and tokens <= window")
     if args.heads <= 0 or args.groups <= 0 or args.heads % args.groups:
@@ -1047,6 +1252,23 @@ def main():
                             "Synthetic single-request SSM comparison, not model "
                             "accuracy, scheduling, convolution, or PD transport."
                         ),
+                        "precision_ablation": (
+                            "FP32 PyTorch factorization, with all eight combinations "
+                            "of BF16 readout/CB/reconstruction rounding. CB includes "
+                            "both current and historical tokens. Each arm starts "
+                            "from identical real pre-call state/history; inherited "
+                            "drift and actual prior RN/SR cache values are held fixed. "
+                            "Reference is a local FP64 sequential recurrence. "
+                            "Output metrics include final BF16 rounding; compare "
+                            "output_rounding_floor. Check native_emulation_vs_kernel "
+                            "before attributing error: CUDA fast math, MMA reduction "
+                            "order and FMA are not reproduced bitwise. Reconstruction "
+                            "affects current output only at checkpoints; its state "
+                            "metric is BEFORE cache quantization. This does not "
+                            "simulate improved future trajectories or SR draws."
+                        )
+                        if args.precision_ablation
+                        else None,
                     }
                 }
             ),
@@ -1061,6 +1283,12 @@ def main():
             ):
                 result = run_standard_comparison(args, dtype, rounds, algorithm)
                 finite &= all(m["finite"] for m in result["metrics"].values())
+                if result["precision_ablation"] is not None:
+                    finite &= all(
+                        m["finite"]
+                        for phase in result["precision_ablation"].values()
+                        for m in phase.values()
+                    )
                 print(json.dumps(result), flush=True)
         print(json.dumps({"loaded_libraries": loaded_replay_libraries()}), flush=True)
         if not finite:
