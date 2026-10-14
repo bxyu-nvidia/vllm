@@ -355,6 +355,7 @@ def _prepare_attn_metadata(
     monkeypatch,
     input_batch: SimpleNamespace | None = None,
     cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    for_capture: bool = False,
 ) -> SimpleNamespace:
     captured = {}
 
@@ -372,6 +373,7 @@ def _prepare_attn_metadata(
     state.prepare_attn(
         input_batch=input_batch,
         cudagraph_mode=cudagraph_mode,
+        for_capture=for_capture,
         block_tables=(),
         slot_mappings={},
         attn_groups=[],
@@ -597,3 +599,36 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias() -
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
     expected_accepted = [9, 1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted
+
+
+def test_fp32_replay_slots_survive_v2_reordering_and_capture(monkeypatch):
+    """Capture must not consume ownership; batch order must not move live state."""
+    from vllm.v1.worker.mamba_utils import MambaActiveStateSlots
+
+    state = _mamba_hybrid_state(num_speculative_tokens=3)
+    state.device = torch.device("cpu")
+    state._active_slots = MambaActiveStateSlots(3, 2)
+    state._active_slots_by_req = torch.zeros(3, dtype=torch.int32)
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.model_states.mamba_hybrid.async_tensor_h2d",
+        lambda src, out: out.copy_(src),
+    )
+    batch = _input_batch([1, 1], [0, 0], [False, False])
+    batch.req_ids = ["a", "b"]
+    metadata = _prepare_attn_metadata(state, monkeypatch, batch)
+    assert metadata.mamba_active_slots.tolist() == [1, 3]
+    assert metadata.mamba_active_reset.tolist() == [True, True]
+    assert state._active_slots_by_req.tolist() == [1, 3, 0]
+
+    batch.req_ids = ["b", "a"]
+    batch.idx_mapping = torch.tensor([1, 0])
+    metadata = _prepare_attn_metadata(state, monkeypatch, batch)
+    assert metadata.mamba_active_slots.tolist() == [3, 1]
+    assert metadata.mamba_active_reset.tolist() == [False, False]
+    assert state._active_slots_by_req.tolist() == [1, 3, 0]
+
+    capture = _prepare_attn_metadata(
+        state, monkeypatch, batch, CUDAGraphMode.FULL, for_capture=True
+    )
+    assert capture.mamba_active_slots.tolist() == [0, 0]
+    assert state._active_slots.slots == {"b": 1, "a": 0}

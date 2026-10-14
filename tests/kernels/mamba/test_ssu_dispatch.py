@@ -69,15 +69,90 @@ def _cuda_ints(values):
     return torch.tensor(values, dtype=torch.int32, device="cuda")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_active_state_keeps_precision_and_commits_accepted_draft():
+    """Live slots survive snapshots; reused slots initialize without touching null."""
+    from vllm.model_executor.layers.mamba.ops.active_state import copy_mamba_state
+
+    snapshots = torch.full(
+        (5, 2, 8, 16), float("nan"), device="cuda", dtype=torch.float16
+    )
+    snapshots[3] = 1.125
+    working = torch.full((6, 2, 8, 16), 0.5001, device="cuda")
+    retained = working[4].clone()
+    copy_mamba_state(
+        snapshots,
+        working,
+        _cuda_ints([3, 0, 0]),
+        _cuda_ints([1, 4, 5]),
+        reset=torch.tensor([True, False, True], device="cuda"),
+        has_initial=torch.tensor([True, True, False], device="cuda"),
+        src_null=0,
+    )
+    assert torch.equal(working[1], snapshots[3].float())
+    assert torch.equal(working[4], retained)
+    assert torch.count_nonzero(working[5]) == 0
+    working[2] = 1 + 17 / 4096
+    accepted_state = working[2].clone()
+    copy_mamba_state(
+        working,
+        working,
+        _cuda_ints([[1, 2, 3]]),
+        _cuda_ints([1]),
+        accepted=_cuda_ints([2]),
+    )
+    assert torch.equal(working[1], accepted_state)
+    copy_mamba_state(working, snapshots, _cuda_ints([1, 0]), _cuda_ints([3, 0]))
+    assert torch.equal(snapshots[3], accepted_state.half())
+    assert torch.isnan(snapshots[0]).all()
+    assert torch.equal(working[1], accepted_state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "value, choices, tolerance",
+    [
+        (1 + 17 / 4096, (1 + 16 / 4096, 1 + 20 / 4096), 6e-5),
+        (-1 - 17 / 4096, (-1 - 16 / 4096, -1 - 20 / 4096), 6e-5),
+        (2**-25, (0, 2**-24), 2e-9),
+    ],
+)
+def test_active_snapshot_stochastic_rounding_is_bounded_and_unbiased(
+    value, choices, tolerance
+):
+    from vllm.model_executor.layers.mamba.ops.active_state import copy_mamba_state
+
+    torch.manual_seed(0)
+    working = torch.full((2, 2, 8, 256), value, device="cuda")
+    snapshots = torch.zeros_like(working, dtype=torch.float16)
+    copy_mamba_state(
+        working,
+        snapshots,
+        _cuda_ints([1]),
+        _cuda_ints([1]),
+        stochastic=True,
+        philox_rounds=5,
+    )
+    values = snapshots[1].float()
+    assert ((values == choices[0]) | (values == choices[1])).all()
+    torch.testing.assert_close(values.mean(), working[1].mean(), atol=tolerance, rtol=0)
+
+
 @pytest.mark.parametrize("post_step", [False, True], ids=["v1", "v2"])
 @pytest.mark.parametrize("prefill_tail", [False, True])
 @pytest.mark.parametrize(
-    ("state_dtype", "philox_rounds"),
-    [(torch.float32, 0), (torch.float16, 0), (torch.float16, 5)],
-    ids=["fp32", "fp16", "fp16-sr5"],
+    ("state_dtype", "philox_rounds", "active_precision"),
+    [
+        (torch.float32, 0, False),
+        (torch.float16, 0, False),
+        (torch.float16, 5, False),
+        (torch.float16, 0, True),
+        (torch.float16, 5, True),
+    ],
+    ids=["fp32", "fp16", "fp16-sr5", "active-fp16", "active-fp16-sr5"],
 )
 def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
-    post_step, prefill_tail, state_dtype, philox_rounds
+    post_step, prefill_tail, state_dtype, philox_rounds, active_precision
 ):
     """Publish a boundary without modifying its live or cached-prefix sources."""
     try:
@@ -150,6 +225,22 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
             stochastic_rounding_philox_rounds=philox_rounds,
         ),
     )
+    if active_precision:
+        mixer.active_ssm_state = torch.zeros(
+            8, heads, dim, dstate, dtype=torch.float32, device="cuda"
+        )
+        mixer.active_ssm_state[:slots].copy_(state)
+        # Keep precision that cannot be represented in the snapshot cache.
+        mixer.active_ssm_state[3].add_(0.0000123)
+        mixer.active_ssm_state[5].add_(0.0000123)
+        original = mixer.active_ssm_state[:slots].clone()
+        mixer.active_replayssm_cache = tuple(
+            torch.zeros(8, *ring.shape[1:], dtype=ring.dtype, device="cuda")
+            for ring in (x, dt, B)
+        )
+        for working, physical in zip(mixer.active_replayssm_cache, (x, dt, B)):
+            working[:slots].copy_(physical)
+        physical_before = state.clone()
     group = _ReplaySSMGroupContext.create(
         [mixer],
         _cuda_ints(
@@ -184,6 +275,7 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
         is_prefill_tail=torch.tensor(
             [False, prefill_tail, False, False], device="cuda"
         ),
+        active_slots=_cuda_ints([5, 0, 3]) if active_precision else None,
     )
     assert group.active_request_indices.tolist() == [
         0,
@@ -192,6 +284,23 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
         -1,
     ]
     assert group.plan_flush_count.tolist() == [4, 2 if prefill_tail else -1, -1, -1]
+    if active_precision:
+        reference = SimpleNamespace(**vars(mixer))
+        reference.active_ssm_state = None
+        reference.kv_cache = (mixer.kv_cache[0], original.clone())
+        reference.mamba_config = MambaConfig(backend=MambaBackendEnum.FLASHINFER)
+        reference_group = _ReplaySSMGroupContext.create(
+            [reference], group.block_table, "align", 16, 4
+        )
+        for name in (
+            "src_slots",
+            "dst_slots",
+            "plan_ring_start",
+            "plan_flush_count",
+            "active_request_indices",
+        ):
+            getattr(reference_group, name).copy_(getattr(group, name))
+        reference_group.materialize()
     group.materialize()
 
     expected = original[3].float().clone()
@@ -207,7 +316,12 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
     torch.testing.assert_close(state[2], expected.to(state_dtype), atol=2e-3, rtol=2e-3)
     # The snapshot excludes the accepted tail past 16 and all rejected drafts.
     for slot in (0, 1, 3, 4):
-        torch.testing.assert_close(state[slot], original[slot], atol=0, rtol=0)
+        torch.testing.assert_close(
+            state[slot],
+            physical_before[slot] if active_precision else original[slot],
+            atol=0,
+            rtol=0,
+        )
     expected_tail = original[5].float().clone()
     if prefill_tail:
         # One previous committed token and one prompt token; exclude the three
@@ -223,8 +337,20 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
         assert mixer._replayssm_ring_start[5].item() == 0
         assert mixer._replayssm_prev_num_accepted[5].item() == 0
     torch.testing.assert_close(
-        state[5], expected_tail.to(state_dtype), atol=2e-3, rtol=2e-3
+        state[5],
+        physical_before[5]
+        if active_precision and not prefill_tail
+        else expected_tail.to(state_dtype),
+        atol=2e-3,
+        rtol=2e-3,
     )
+    if active_precision:
+        torch.testing.assert_close(
+            mixer.active_ssm_state[3], original[3], atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            mixer.active_ssm_state[5], reference.kv_cache[1][5], atol=0, rtol=0
+        )
     assert mixer._replayssm_prev_num_accepted[3].item() == 5
     assert mixer._replayssm_prev_num_accepted[2].item() == 0
     for tensor, before in zip(rings["neighbor"], neighbor_before, strict=True):
@@ -235,7 +361,10 @@ def test_replayssm_materializes_only_accepted_boundary_with_compacted_rows(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("post_step", [False, True], ids=["v1", "v2"])
-def test_replayssm_skips_canonical_self_copy_but_resets_prefill_trackers(post_step):
+@pytest.mark.parametrize("active_precision", [False, True])
+def test_replayssm_skips_canonical_self_copy_but_resets_prefill_trackers(
+    post_step, active_precision
+):
     """Skip prefill self-copies, reset trackers, and preserve in-place MTP replay."""
     mixer = SimpleNamespace(
         kv_cache=(
@@ -252,6 +381,12 @@ def test_replayssm_skips_canonical_self_copy_but_resets_prefill_trackers(post_st
         replayssm_buffer_len=16,
         A=torch.empty(1, device="cuda"),
     )
+    if active_precision:
+        mixer.active_ssm_state = torch.ones(5, 1, 1, 1, device="cuda")
+        mixer.active_replayssm_cache = tuple(
+            torch.zeros(5, *ring.shape[1:], device="cuda")
+            for ring in mixer.replayssm_cache
+        )
     group = _ReplaySSMGroupContext.create(
         [mixer],
         _cuda_ints(
@@ -282,8 +417,16 @@ def test_replayssm_skips_canonical_self_copy_but_resets_prefill_trackers(post_st
         is_prefilling=torch.tensor([True, False, True, True], device="cuda"),
         live_cols=_cuda_ints([0, 2, 1]),
         num_reqs=4,
+        active_slots=_cuda_ints([0, 1, 3]) if active_precision else None,
     )
 
+    if active_precision:
+        assert group.active_src_slots is not None
+        assert group.active_dst_slots is not None
+        assert group.active_commit_slots is not None
+        assert group.active_src_slots.tolist() == [[0, 3, 0, 0]]
+        assert group.active_dst_slots.tolist() == [[0, 4, 0, 0]]
+        assert group.active_commit_slots.tolist() == [[0, 3, 0, 0]]
     assert group.plan_flush_count.tolist() == [-1, 6, -1, -1]
     assert group.active_request_indices.tolist() == [1, -1, -1, -1]
     assert group.src_slots[0, 1].item() == 4
@@ -566,6 +709,7 @@ def test_replayssm_mixer_selects_mtp_layout(
     mixer.n_groups = mixer.tp_size = 1
     mixer.ssm_state_size = 8
     mixer.num_spec = 3
+    mixer.active_ssm_state = None
     mixer.use_replayssm = True
     mixer.use_flashinfer_replayssm = True
     mixer.replayssm_buffer_len = 16

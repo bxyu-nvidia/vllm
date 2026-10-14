@@ -1502,6 +1502,28 @@ class VllmConfig:
                 "`--enable-mamba-cache-stochastic-rounding`."
             )
 
+        from vllm.platforms import current_platform
+
+        if self.mamba_config.fp32_active_state and (
+            (self.use_v2_model_runner and not self.use_flashinfer_replayssm)
+            or (
+                self.cache_config.use_replayssm
+                and self.mamba_config.backend != MambaBackendEnum.FLASHINFER
+            )
+            or self.cache_config.mamba_cache_mode not in ("align", "none")
+            or self.cache_config.mamba_ssm_cache_dtype != "float16"
+            or self.mamba_config.backend == MambaBackendEnum.CPU
+            or not current_platform.is_cuda()
+            or self.parallel_config.pipeline_parallel_size != 1
+            or self.parallel_config.use_ubatching
+        ):
+            raise ValueError(
+                "FP32 active Mamba state requires CUDA, Model Runner V1 "
+                "or FlashInfer ReplaySSM with Model Runner V2, float16 SSM snapshots, "
+                "align or none cache mode, and standard or FlashInfer ReplaySSM SSU "
+                "without pipeline parallelism or microbatching."
+            )
+
         if self.quant_config is None and self.model_config is not None:
             self.quant_config = VllmConfig._get_quantization_config(
                 self.model_config, self.load_config
@@ -1536,7 +1558,6 @@ class VllmConfig:
                     model_type,
                 )
 
-        from vllm.platforms import current_platform
         from vllm.v1.executor.abstract import Executor
 
         executor_backend = self.parallel_config.distributed_executor_backend

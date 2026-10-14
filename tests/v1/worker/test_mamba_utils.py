@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.mamba_utils import (
+    MambaActiveStateSlots,
     MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
     _reinterpret_u64_as_i64,
@@ -46,6 +47,32 @@ _COPY_FUNCS: MambaStateCopyFuncsByType = {
     MambaAttentionBackendEnum.GDN_ATTN: _DEFAULT_COPY_FUNCS,
     MambaAttentionBackendEnum.SHORT_CONV: (get_conv_copy_spec,),
 }
+
+
+def test_active_state_slots_follow_requests_and_reset_on_resume():
+    """Batch movement preserves working state; eviction and preemption do not."""
+    slots = MambaActiveStateSlots(2, 6)
+    indices, fresh = slots.prepare(["a", "b"])
+    assert fresh == [True, True]
+    assert slots.prepare(["b", "a"]) == (indices[::-1], [False, False])
+    slots.release(["a"])
+    resumed, fresh = slots.prepare(["b", "a"])
+    assert fresh == [False, True]
+    assert resumed[0] == indices[1]
+    slots.prepare(["b"])
+    reused, fresh = slots.prepare(["b", "c"])
+    assert fresh == [False, True]
+    assert reused[1] == indices[0]
+
+
+def test_active_state_survives_scheduling_pause_until_slot_is_needed():
+    slots = MambaActiveStateSlots(2, 1)
+    a, _ = slots.prepare(["a"])
+    b, _ = slots.prepare(["b"])
+    assert slots.prepare(["a", "b"]) == (a + b, [False, False])
+    slots.prepare(["b", "c"])
+    _, reset = slots.prepare(["a", "b"])
+    assert reset == [True, False]
 
 
 def postprocess_mamba(

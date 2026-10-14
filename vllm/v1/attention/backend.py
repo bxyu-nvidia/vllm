@@ -472,6 +472,9 @@ class CommonAttentionMetadata:
     at the current decode run's last full-state write. write_pos counts from
     here, so a preemption-resumed request re-anchors past the prompt boundary."""
 
+    mamba_active_slots: torch.Tensor | None = None
+    mamba_active_reset: torch.Tensor | None = None
+
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
 
@@ -553,6 +556,8 @@ class CommonAttentionMetadata:
             req_idx=maybe_slice_reqs(self.req_idx),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
+            mamba_active_slots=maybe_slice_reqs(self.mamba_active_slots),
+            mamba_active_reset=maybe_slice_reqs(self.mamba_active_reset),
         )
 
 

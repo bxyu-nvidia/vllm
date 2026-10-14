@@ -108,6 +108,11 @@ class Mamba2AttentionMetadata(BaseMambaAttentionMetadata):
 
     # Chunk-related metadata (only for prefill)
     seq_idx_p: torch.Tensor | None = None
+    active_state_indices_p: torch.Tensor | None = None
+    active_state_indices_d: torch.Tensor | None = None
+    active_state_reset_p: torch.Tensor | None = None
+    active_state_reset_d: torch.Tensor | None = None
+    active_state_accepted_d: torch.Tensor | None = None
 
 
 class Mamba2AttentionMetadataBuilder(
@@ -128,6 +133,18 @@ class Mamba2AttentionMetadataBuilder(
             "chunk_size needs to be set in the model config for Mamba2 models"
         )
         self.chunk_size: int = chunk_size
+        self.fp32_active_state = vllm_config.mamba_config.fp32_active_state
+        if self.fp32_active_state:
+            width = 1 + self.num_spec_tokens
+            self.active_indices_d = torch.zeros(
+                (self.decode_cudagraph_max_bs, width), dtype=torch.int32, device=device
+            )
+            self.active_reset_d = torch.zeros(
+                self.decode_cudagraph_max_bs, dtype=torch.bool, device=device
+            )
+            self.active_accepted_d = torch.ones(
+                self.decode_cudagraph_max_bs, dtype=torch.int32, device=device
+            )
 
     def build(
         self,
@@ -171,6 +188,41 @@ class Mamba2AttentionMetadataBuilder(
                 )
             )
 
+        active_args = {}
+        if self.fp32_active_state:
+            slots = common_attn_metadata.mamba_active_slots
+            reset = common_attn_metadata.mamba_active_reset
+            if slots is None:
+                slots = torch.zeros(
+                    common.num_reqs, dtype=torch.int32, device=self.device
+                )
+                reset = torch.zeros_like(slots, dtype=torch.bool)
+            assert reset is not None
+            offsets = torch.arange(1 + self.num_spec_tokens, device=self.device)
+            indices = torch.where(slots[:, None] > 0, slots[:, None] + offsets, 0)
+            nd = common.num_decodes
+            padded = common.num_reqs if common.num_prefills == 0 else nd
+            if padded > self.active_indices_d.shape[0]:
+                decode_indices = indices[:nd].to(torch.int32)
+                decode_reset = reset[:nd]
+                decode_accepted = torch.ones(nd, dtype=torch.int32, device=self.device)
+            else:
+                decode_indices = self.active_indices_d[:padded]
+                decode_reset = self.active_reset_d[:padded]
+                decode_accepted = self.active_accepted_d[:padded]
+            if nd > 0 and padded <= self.active_indices_d.shape[0]:
+                self.active_indices_d[:nd].copy_(indices[:nd])
+                self.active_indices_d[nd:padded].zero_()
+                self.active_reset_d[:nd].copy_(reset[:nd])
+                self.active_reset_d[nd:padded].zero_()
+            active_args = dict(
+                active_state_indices_p=indices[nd:, 0].to(torch.int32),
+                active_state_reset_p=reset[nd:],
+                active_state_indices_d=decode_indices,
+                active_state_reset_d=decode_reset,
+                active_state_accepted_d=decode_accepted,
+            )
+
         return replace(
             common,
             prep_initial_states=prep_initial_states,
@@ -178,4 +230,5 @@ class Mamba2AttentionMetadataBuilder(
             seq_idx_p=seq_idx_p,
             cu_chunk_seqlen_p=cu_chunk_seqlen_p,
             last_chunk_indices_p=last_chunk_indices_p,
+            **active_args,
         )

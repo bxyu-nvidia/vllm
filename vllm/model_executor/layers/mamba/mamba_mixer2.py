@@ -3,6 +3,7 @@
 
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 import torch
 from torch import nn
@@ -31,6 +32,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
+from vllm.model_executor.layers.mamba.ops.active_state import copy_mamba_state
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -43,6 +45,9 @@ from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+    FlashInferSSUBackend,
+    MambaSSUBackend,
+    TritonSSUBackend,
     selective_state_update,
     selective_state_update_replayssm_flashinfer,
 )
@@ -552,6 +557,66 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
 
         self.num_spec = vllm_config.num_speculative_tokens
+        self.active_ssm_state: torch.Tensor | None = None
+        self.active_ssu_backend: MambaSSUBackend | None = None
+        if self.mamba_config.fp32_active_state:
+            active_slots = (
+                vllm_config.scheduler_config.max_num_seqs
+                * (2 if self.use_replayssm else 1 + self.num_spec)
+                + 1
+            )
+            self.register_buffer(
+                "_active_ssm_state",
+                torch.zeros(
+                    active_slots,
+                    num_heads // self.tp_size,
+                    head_dim,
+                    ssm_state_size,
+                    dtype=torch.float32,
+                    device=self.A.device,
+                ),
+                persistent=False,
+            )
+            self.active_ssm_state = self._active_ssm_state
+            if not self.use_replayssm:
+                working_config = replace(
+                    self.mamba_config, enable_stochastic_rounding=False
+                )
+                backend = (
+                    FlashInferSSUBackend
+                    if self.mamba_config.backend == MambaBackendEnum.FLASHINFER
+                    else TritonSSUBackend
+                )
+                self.active_ssu_backend = backend(working_config)
+            if self.use_flashinfer_replayssm:
+                assert self.model_config is not None
+                shapes = self._get_replayssm_ring_shapes(self.tp_size)
+                dtypes = MambaStateDtypeCalculator.replayssm_ring_dtypes(
+                    self.model_config.dtype
+                )
+                for name, shape, dtype in zip(("x", "dt", "B"), shapes, dtypes):
+                    self.register_buffer(
+                        f"_active_replay_{name}",
+                        torch.zeros(
+                            active_slots, *shape, dtype=dtype, device=self.A.device
+                        ),
+                        persistent=False,
+                    )
+                self.active_replayssm_cache = (
+                    self._active_replay_x,
+                    self._active_replay_dt,
+                    self._active_replay_B,
+                )
+                self.register_buffer(
+                    "_active_replay_start",
+                    torch.zeros(active_slots, dtype=torch.int32, device=self.A.device),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "_active_replay_accepted",
+                    torch.zeros(active_slots, dtype=torch.int32, device=self.A.device),
+                    persistent=False,
+                )
         if self.num_spec > 0:
             self.register_buffer(
                 "_decode_state_offsets",
@@ -641,7 +706,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # Triton's autotuner includes tensor dtypes in its cache key,
         # so state_dtype must match what real inference uses.
-        ssm_state_dtype = self.get_state_dtype()[1]
+        ssm_state_dtype = (
+            torch.float32
+            if self.active_ssm_state is not None
+            else self.get_state_dtype()[1]
+        )
 
         # SSD kernel autotune keys depend on dtype and head dimensions,
         # not on sequence length or batch size, so a single shape suffices.
@@ -893,6 +962,19 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
             # 3. State Space Model sequence transformation
             initial_states = None
+            active_indices_p = attn_metadata.active_state_indices_p
+            if self.active_ssm_state is not None:
+                assert active_indices_p is not None
+                assert state_indices_tensor_p is not None
+                copy_mamba_state(
+                    ssm_state,
+                    self.active_ssm_state,
+                    state_indices_tensor_p,
+                    active_indices_p,
+                    reset=attn_metadata.active_state_reset_p,
+                    has_initial=has_initial_states_p,
+                    src_null=0,
+                )
             if has_initial_states_p is not None and prep_initial_states:
                 assert state_indices_tensor_p is not None
                 kernel_ssm_indices = state_indices_tensor_p
@@ -900,11 +982,14 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     kernel_ssm_indices = state_indices_tensor_p.gather(
                         1, block_idx_last_computed_token_p.unsqueeze(1)
                     ).squeeze(1)
-                initial_states = torch.where(
-                    has_initial_states_p[:, None, None, None],
-                    ssm_state[kernel_ssm_indices],
-                    0,
-                )
+                if self.active_ssm_state is not None:
+                    initial_states = self.active_ssm_state[active_indices_p]
+                else:
+                    initial_states = torch.where(
+                        has_initial_states_p[:, None, None, None],
+                        ssm_state[kernel_ssm_indices],
+                        0,
+                    )
 
             # NOTE: final output is an in-place update of out tensor
             assert preallocated_ssm_out_p is not None
@@ -929,7 +1014,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
-                state_dtype=ssm_state.dtype,
+                state_dtype=(
+                    torch.float32
+                    if self.active_ssm_state is not None
+                    else ssm_state.dtype
+                ),
             )
 
             if is_mamba_cache_all:
@@ -1007,7 +1096,22 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 # - varlen state is a (num_prefills, nheads, headdim, dstate)
                 #   tensor
                 assert state_indices_tensor_p is not None
-                ssm_state[state_indices_tensor_p] = varlen_states
+                if self.active_ssm_state is not None:
+                    assert active_indices_p is not None
+                    rows = torch.arange(num_prefills, device=varlen_states.device)
+                    copy_mamba_state(
+                        varlen_states, self.active_ssm_state, rows, active_indices_p
+                    )
+                    copy_mamba_state(
+                        varlen_states,
+                        ssm_state,
+                        rows,
+                        state_indices_tensor_p,
+                        stochastic=self.mamba_config.enable_stochastic_rounding,
+                        philox_rounds=self.mamba_config.stochastic_rounding_philox_rounds,
+                    )
+                else:
+                    ssm_state[state_indices_tensor_p] = varlen_states
 
         # Process decode requests
         if has_decode:
@@ -1123,8 +1227,50 @@ class MambaMixer2(MambaBase, PluggableLayer):
                             )
                             fi_cu_seqlens = None
                             fi_max_seqlen = None
+                    replay_state = ssm_state
+                    replay_indices = replayssm_state_indices_d
+                    if self.active_ssm_state is not None:
+                        assert attn_metadata.active_state_indices_d is not None
+                        active_base = attn_metadata.active_state_indices_d[:, 0]
+                        assert replay_indices is not None
+                        copy_mamba_state(
+                            ssm_state,
+                            self.active_ssm_state,
+                            replay_indices,
+                            active_base,
+                            reset=attn_metadata.active_state_reset_d,
+                            src_null=0,
+                        )
+                        for physical, working in zip(
+                            (x_cache, dt_cache, B_cache),
+                            self.active_replayssm_cache,
+                        ):
+                            copy_mamba_state(
+                                physical,
+                                working,
+                                replay_indices,
+                                active_base,
+                                reset=attn_metadata.active_state_reset_d,
+                                src_null=0,
+                            )
+                        for physical, working in (
+                            (ring_start, self._active_replay_start),
+                            (prev_num_accepted, self._active_replay_accepted),
+                        ):
+                            copy_mamba_state(
+                                physical,
+                                working,
+                                replay_indices,
+                                active_base,
+                                src_null=0,
+                            )
+                        replay_state = self.active_ssm_state
+                        replay_indices = active_base.contiguous()
+                        x_cache, dt_cache, B_cache = self.active_replayssm_cache
+                        ring_start = self._active_replay_start
+                        prev_num_accepted = self._active_replay_accepted
                     selective_state_update_replayssm_flashinfer(
-                        ssm_state,
+                        replay_state,
                         hidden_states_d,
                         dt_d,
                         A_d,
@@ -1139,10 +1285,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         D=D_d,
                         dt_bias=dt_bias,
                         dt_softplus=True,
-                        state_batch_indices=replayssm_state_indices_d,
+                        state_batch_indices=replay_indices,
                         scratch=attn_metadata.replayssm_scratch,
                         enable_stochastic_rounding=(
                             self.mamba_config.enable_stochastic_rounding
+                            and self.active_ssm_state is None
                         ),
                         stochastic_rounding_philox_rounds=(
                             self.mamba_config.stochastic_rounding_philox_rounds
@@ -1151,6 +1298,24 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         max_seqlen=fi_max_seqlen,
                         enable_pdl=False,
                     )
+                    if self.active_ssm_state is not None:
+                        copy_mamba_state(
+                            self.active_ssm_state,
+                            ssm_state,
+                            active_base,
+                            replayssm_state_indices_d,
+                            stochastic=self.mamba_config.enable_stochastic_rounding,
+                            philox_rounds=self.mamba_config.stochastic_rounding_philox_rounds,
+                        )
+                        for working, physical in zip(
+                            self.active_replayssm_cache, self.replayssm_cache
+                        ):
+                            copy_mamba_state(
+                                working,
+                                physical,
+                                active_base,
+                                replayssm_state_indices_d,
+                            )
                 else:
                     selective_state_update_replayssm_output_only(
                         ssm_state,
@@ -1179,8 +1344,30 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         ),
                     )
             else:
-                selective_state_update(
-                    ssm_state,
+                decode_state = ssm_state
+                decode_input = state_indices_tensor_d_input
+                decode_output = state_indices_tensor_d_output
+                decode_accepted = num_accepted_tokens
+                update = selective_state_update
+                if self.active_ssm_state is not None:
+                    assert attn_metadata.active_state_indices_d is not None
+                    active_indices_d = attn_metadata.active_state_indices_d
+                    copy_mamba_state(
+                        ssm_state,
+                        self.active_ssm_state,
+                        state_indices_tensor_d_input,
+                        active_indices_d[:, 0],
+                        reset=attn_metadata.active_state_reset_d,
+                        accepted=num_accepted_tokens,
+                        src_null=0,
+                    )
+                    decode_state = self.active_ssm_state
+                    decode_input = decode_output = active_indices_d
+                    decode_accepted = attn_metadata.active_state_accepted_d
+                    assert self.active_ssu_backend is not None
+                    update = self.active_ssu_backend
+                update(
+                    decode_state,
                     hidden_states_d,
                     dt_d,
                     A_d,
@@ -1189,13 +1376,22 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     D_d,
                     dt_bias,
                     dt_softplus=True,
-                    state_batch_indices=state_indices_tensor_d_input,
-                    dst_state_batch_indices=state_indices_tensor_d_output,
+                    state_batch_indices=decode_input,
+                    dst_state_batch_indices=decode_output,
                     out=preallocated_ssm_out_d,
-                    num_accepted_tokens=num_accepted_tokens,
+                    num_accepted_tokens=decode_accepted,
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
+                if self.active_ssm_state is not None:
+                    copy_mamba_state(
+                        self.active_ssm_state,
+                        ssm_state,
+                        active_indices_d,
+                        state_indices_tensor_d_output,
+                        stochastic=self.mamba_config.enable_stochastic_rounding,
+                        philox_rounds=self.mamba_config.stochastic_rounding_philox_rounds,
+                    )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None

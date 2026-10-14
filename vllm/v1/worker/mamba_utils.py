@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, NamedTuple
 
 import torch
@@ -38,6 +38,39 @@ logger = init_logger(__name__)
 # 16 saturates HBM on H100/GB200 across the reqs=8..128 range in
 # microbenchmarks
 _TEMPORAL_TILES = 16
+
+
+class MambaActiveStateSlots:
+    """Assign working-state slots independently of persistent batch order."""
+
+    def __init__(self, capacity: int, width: int):
+        self.width = width
+        self.slots: dict[str, int] = {}
+        self.free_slots = list(range(capacity - 1, -1, -1))
+
+    def release(self, req_ids: Iterable[str]) -> None:
+        for req_id in req_ids:
+            slot = self.slots.pop(req_id, None)
+            if slot is not None:
+                self.free_slots.append(slot)
+
+    def prepare(self, req_ids: list[str]) -> tuple[list[int], list[bool]]:
+        scheduled = set(req_ids)
+        indices, reset = [], []
+        for req_id in req_ids:
+            fresh = req_id not in self.slots
+            if fresh:
+                if not self.free_slots:
+                    victim = next((r for r in self.slots if r not in scheduled), None)
+                    if victim is None:
+                        raise RuntimeError("Mamba active-state slot capacity exceeded")
+                    self.release([victim])
+                self.slots[req_id] = self.free_slots.pop()
+            slot = self.slots.pop(req_id)
+            self.slots[req_id] = slot
+            indices.append(1 + slot * self.width)
+            reset.append(fresh)
+        return indices, reset
 
 
 @triton.jit(do_not_specialize=["num_requests"])
@@ -1692,6 +1725,7 @@ def postprocess_mamba_gpu(
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: MambaStateCopyFuncsByType,
     run_prefix_state_migration: bool,
+    active_slots: torch.Tensor | None = None,
 ) -> None:
     """Publish accepted-token results to model-wide Mamba state.
 
@@ -1760,6 +1794,7 @@ def postprocess_mamba_gpu(
             ),
             live_cols=live_cols,
             num_reqs=num_reqs,
+            active_slots=active_slots,
         )
         ctx.replayssm.materialize()
 

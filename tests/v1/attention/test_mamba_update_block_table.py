@@ -15,8 +15,14 @@ from types import SimpleNamespace
 
 import torch
 
-from tests.v1.attention.utils import MockMambaBuilder
+from tests.v1.attention.utils import (
+    BatchSpec,
+    MockMambaBuilder,
+    create_common_attn_metadata,
+)
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.mamba import MambaConfig
+from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba_attn import BaseMambaAttentionMetadata
 from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -69,6 +75,46 @@ def test_mamba_single_token_prompt_runs_as_prefill():
     assert metadata.num_decodes == 2
     assert metadata.num_prefills == 1
     assert metadata.has_initial_states_p.tolist() == [False]
+
+
+def test_active_state_metadata_refreshes_graph_buffers_after_batch_reorder():
+    """Stable graph addresses must carry the current requests' working slots."""
+    config = _make_vllm_config(256, 2, block_size=16)
+    config.cache_config.mamba_cache_mode = "none"
+    config.use_flashinfer_replayssm = False
+    config.mamba_config = MambaConfig(fp32_active_state=True)
+    config.model_config.get_mamba_chunk_size = lambda: 16
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((1, 1), (1, 1, 1)),
+        dtypes=(torch.bfloat16, torch.float16),
+        mamba_cache_mode="none",
+    )
+    builder = Mamba2AttentionMetadataBuilder(
+        spec, ["layer0"], config, torch.device("cpu")
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100, 100], query_lens=[1, 1]), 16, torch.device("cpu")
+    ).replace(
+        is_prefilling=torch.tensor([False, False]),
+        mamba_active_slots=torch.tensor([2, 1], dtype=torch.int32),
+        mamba_active_reset=torch.tensor([True, False]),
+    )
+    first = builder.build(0, common)
+    address = first.active_state_indices_d.data_ptr()
+    assert first.active_state_indices_d.tolist() == [[2], [1]]
+    assert first.active_state_reset_d.tolist() == [True, False]
+    second = builder.build(
+        0,
+        common.replace(
+            mamba_active_slots=torch.tensor([1, 2], dtype=torch.int32),
+            mamba_active_reset=torch.tensor([False, False]),
+        ),
+    )
+    assert second.active_state_indices_d.data_ptr() == address
+    assert second.active_state_indices_d.tolist() == [[1], [2]]
+    assert second.active_state_reset_d.tolist() == [False, False]
+    assert second.active_state_accepted_d.tolist() == [1, 1]
 
 
 def test_update_block_table_copies_block_idx_to_persistent_buffers():

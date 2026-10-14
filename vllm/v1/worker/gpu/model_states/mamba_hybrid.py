@@ -29,6 +29,7 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 from vllm.v1.worker.mamba_utils import (
+    MambaActiveStateSlots,
     MambaSpecDecodeGPUContext,
     get_mamba_group_ids,
     get_mamba_groups,
@@ -43,11 +44,17 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    mamba_active_slots: torch.Tensor | None = None
+    mamba_active_reset: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self, kv_cache_group_id: int, num_reqs: int
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        return {
+            "is_prefilling": self.is_prefilling[:num_reqs],
+            "mamba_active_slots": self.mamba_active_slots,
+            "mamba_active_reset": self.mamba_active_reset,
+        }
 
     def get_extra_attn_kwargs(
         self, attn_metadata_builder: Any, num_reqs: int
@@ -88,6 +95,13 @@ class MambaHybridModelState(DefaultModelState):
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
         self._replayssm_query_start_loc: torch.Tensor | None = None
+        self._active_slots: MambaActiveStateSlots | None = None
+        self._active_slots_by_req: torch.Tensor | None = None
+        if vllm_config.mamba_config.fp32_active_state:
+            self._active_slots = MambaActiveStateSlots(self.max_num_reqs, 2)
+            self._active_slots_by_req = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=device
+            )
         # Pre-copy prefix-cache state (V2). The migration of each request's
         # mamba state across block boundaries runs as a fused GPU kernel reusing
         # the postprocess copy machinery, so the per-step src columns and the
@@ -120,6 +134,9 @@ class MambaHybridModelState(DefaultModelState):
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
+        active_slots = getattr(self, "_active_slots", None)
+        if active_slots is not None:
+            active_slots.release([new_req_data.req_id])
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._align_mode:
@@ -138,6 +155,12 @@ class MambaHybridModelState(DefaultModelState):
                 else (new_req_data.num_computed_tokens - 1) // mamba_block_size
             )
             self._mamba_state_idx_gpu[req_index].fill_(state_idx)
+
+    def remove_request(self, req_id: str) -> None:
+        super().remove_request(req_id)
+        active_slots = getattr(self, "_active_slots", None)
+        if active_slots is not None:
+            active_slots.release([req_id])
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -358,10 +381,33 @@ class MambaHybridModelState(DefaultModelState):
                 for group_idx, builder in aligned_index_builders:
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
 
+        active_slots = active_reset = None
+        slot_manager = getattr(self, "_active_slots", None)
+        if slot_manager is not None:
+            active_slots = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
+            active_reset = torch.zeros(num_reqs, dtype=torch.bool, device=self.device)
+            if not for_capture:
+                bases, fresh = slot_manager.prepare(input_batch.req_ids)
+                async_tensor_h2d(
+                    torch.tensor(bases, dtype=torch.int32),
+                    out=active_slots[: input_batch.num_reqs],
+                )
+                async_tensor_h2d(
+                    torch.tensor(fresh, dtype=torch.bool),
+                    out=active_reset[: input_batch.num_reqs],
+                )
+                assert self._active_slots_by_req is not None
+                self._active_slots_by_req.index_copy_(
+                    0,
+                    input_batch.idx_mapping.to(torch.long),
+                    active_slots[: input_batch.num_reqs],
+                )
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            mamba_active_slots=active_slots,
+            mamba_active_reset=active_reset,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
@@ -487,6 +533,7 @@ class MambaHybridModelState(DefaultModelState):
             is_prefill_tail=self._is_prefill_tail_gpu[:num_reqs],
             live_cols=(self._mamba_state_idx_gpu if self._align_mode else None),
             num_reqs=num_reqs,
+            active_slots=getattr(self, "_active_slots_by_req", None),
         )
         replayssm.materialize()
 

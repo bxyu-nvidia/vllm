@@ -18,6 +18,7 @@ import torch
 
 from vllm.config.mamba import MambaBackendEnum, MambaConfig, MambaSSUAlgorithm
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.ops.active_state import copy_mamba_state
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
@@ -280,6 +281,43 @@ def _compact_replayssm_requests_kernel(
     )
 
 
+@triton.jit
+def _map_active_replay_plan(
+    physical_src,
+    physical_dst,
+    plan_flush_count,
+    active_slots,
+    idx_mapping,
+    working_src,
+    working_dst,
+    commit_dst,
+    NUM_REQS: tl.constexpr,
+    STRIDE: tl.constexpr,
+    HAS_MAPPING: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    layer = tl.program_id(1)
+    valid = row < NUM_REQS
+    req = row
+    if HAS_MAPPING:
+        req = tl.load(idx_mapping + row, mask=valid, other=-1)
+    base = tl.load(active_slots + req, mask=valid & (req >= 0), other=0)
+    src = tl.load(physical_src + layer * STRIDE + row, mask=valid, other=0)
+    dst = tl.load(physical_dst + layer * STRIDE + row, mask=valid, other=0)
+    flush_count = tl.load(plan_flush_count + row, mask=valid, other=-1)
+    publish = (src > 0) & (dst > 0) & (base > 0) & (flush_count >= 0)
+    tl.store(working_src + layer * STRIDE + row, tl.where(publish, base, 0), mask=valid)
+    tl.store(
+        working_dst + layer * STRIDE + row, tl.where(publish, base + 1, 0), mask=valid
+    )
+    tl.store(
+        commit_dst + layer * STRIDE + row,
+        tl.where(publish & (src == dst), base, 0),
+        mask=valid,
+    )
+
+
 class _ReplaySSMMaterializeTables(NamedTuple):
     state_ptrs: torch.Tensor
     state_slot_strides: torch.Tensor
@@ -314,6 +352,11 @@ class _ReplaySSMGroupContext:
     ring_buffer_len: int
     materialize_prefixes: bool
 
+    active_tables: _ReplaySSMMaterializeTables | None = None
+    active_src_slots: torch.Tensor | None = None
+    active_dst_slots: torch.Tensor | None = None
+    active_commit_slots: torch.Tensor | None = None
+
     @classmethod
     def create(
         cls,
@@ -329,7 +372,7 @@ class _ReplaySSMGroupContext:
 
         device = first_ssm.device
         zero_table = torch.zeros(len(mixers), dtype=torch.int64, device=device)
-        return cls(
+        context = cls(
             mixers=mixers,
             block_table=block_table,
             ring_start=first._replayssm_ring_start,
@@ -381,6 +424,39 @@ class _ReplaySSMGroupContext:
             materialize_prefixes=cache_mode == "align",
         )
 
+        if getattr(first, "active_ssm_state", None) is not None:
+            context.active_tables = _ReplaySSMMaterializeTables(
+                state_ptrs=_cuda_i64_ptrs([m.active_ssm_state for m in mixers]),
+                state_slot_strides=_cuda_i64_slot_strides(
+                    [m.active_ssm_state for m in mixers]
+                ),
+                x_cache_ptrs=_cuda_i64_ptrs(
+                    [m.active_replayssm_cache[0] for m in mixers]
+                ),
+                x_cache_slot_strides=_cuda_i64_slot_strides(
+                    [m.active_replayssm_cache[0] for m in mixers]
+                ),
+                B_cache_ptrs=_cuda_i64_ptrs(
+                    [m.active_replayssm_cache[2] for m in mixers]
+                ),
+                B_cache_slot_strides=_cuda_i64_slot_strides(
+                    [m.active_replayssm_cache[2] for m in mixers]
+                ),
+                dt_cache_ptrs=_cuda_i64_ptrs(
+                    [m.active_replayssm_cache[1] for m in mixers]
+                ),
+                dt_cache_slot_strides=_cuda_i64_slot_strides(
+                    [m.active_replayssm_cache[1] for m in mixers]
+                ),
+                A_ptrs=context.materialize_tables.A_ptrs,
+                state_scale_ptrs=zero_table,
+                state_scale_slot_strides=zero_table,
+            )
+            context.active_src_slots = torch.zeros_like(context.src_slots)
+            context.active_dst_slots = torch.zeros_like(context.dst_slots)
+            context.active_commit_slots = torch.zeros_like(context.dst_slots)
+        return context
+
     def reset_new_slots(
         self,
         *,
@@ -417,6 +493,7 @@ class _ReplaySSMGroupContext:
         live_cols: torch.Tensor | None,
         num_reqs: int,
         is_prefill_tail: torch.Tensor | None = None,
+        active_slots: torch.Tensor | None = None,
     ) -> None:
         """Commit a completed step and prepare an optional prefix snapshot."""
         if num_reqs == 0:
@@ -459,25 +536,52 @@ class _ReplaySSMGroupContext:
                 BLOCK_SIZE=triton.next_power_of_2(self.max_num_reqs),
             )
 
+        if self.active_tables is not None and self.materialize_prefixes:
+            assert active_slots is not None
+            assert self.active_src_slots is not None
+            assert self.active_dst_slots is not None
+            assert self.active_commit_slots is not None
+            self.active_src_slots.zero_()
+            self.active_dst_slots.zero_()
+            self.active_commit_slots.zero_()
+            _map_active_replay_plan[
+                (triton.cdiv(self.max_num_reqs, 128), len(self.mixers))
+            ](
+                self.src_slots,
+                self.dst_slots,
+                self.plan_flush_count,
+                active_slots,
+                idx_mapping,
+                self.active_src_slots,
+                self.active_dst_slots,
+                self.active_commit_slots,
+                NUM_REQS=num_reqs,
+                STRIDE=self.src_slots.stride(0),
+                HAS_MAPPING=idx_mapping is not None,
+                BLOCK=128,
+            )
+
     def materialize(self) -> None:
         """Publish the canonical prefix snapshots prepared by ``postprocess``."""
         first = self.mixers[0]
         mamba_config = first.mamba_config
         rand_seed = None
         philox_rounds = 0
-        if mamba_config.enable_stochastic_rounding:
+        if mamba_config.enable_stochastic_rounding and self.active_tables is None:
             rand_seed = torch.randint(
                 0, 2**32, (1,), device=self.src_slots.device, dtype=torch.int64
             )
             philox_rounds = mamba_config.stochastic_rounding_philox_rounds or 10
         _load_replayssm_materialize()(
-            *self.materialize_tables,
-            self.src_slots,
-            self.dst_slots,
+            *(self.active_tables or self.materialize_tables),
+            self.active_src_slots if self.active_tables else self.src_slots,
+            self.active_dst_slots if self.active_tables else self.dst_slots,
             self.plan_ring_start,
             self.plan_flush_count,
             self.active_request_indices,
-            state_dtype=first.kv_cache[1].dtype,
+            state_dtype=(
+                torch.float32 if self.active_tables else first.kv_cache[1].dtype
+            ),
             input_dtype=first.replayssm_cache[0].dtype,
             matrixA_dtype=first.A.dtype,
             dim=first.kv_cache[1].size(2),
@@ -491,6 +595,28 @@ class _ReplaySSMGroupContext:
             rand_seed=rand_seed,
             philox_rounds=philox_rounds,
         )
+        if self.active_tables is not None:
+            assert self.active_dst_slots is not None
+            assert self.active_commit_slots is not None
+            for layer_idx, mixer in enumerate(self.mixers):
+                copy_mamba_state(
+                    mixer.active_ssm_state,
+                    mixer.kv_cache[1],
+                    self.active_dst_slots[layer_idx],
+                    torch.where(
+                        self.active_dst_slots[layer_idx] > 0,
+                        self.dst_slots[layer_idx],
+                        0,
+                    ),
+                    stochastic=mamba_config.enable_stochastic_rounding,
+                    philox_rounds=mamba_config.stochastic_rounding_philox_rounds,
+                )
+                copy_mamba_state(
+                    mixer.active_ssm_state,
+                    mixer.active_ssm_state,
+                    self.active_dst_slots[layer_idx],
+                    self.active_commit_slots[layer_idx],
+                )
 
 
 @dataclass

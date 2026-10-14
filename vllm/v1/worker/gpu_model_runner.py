@@ -1000,6 +1000,20 @@ class GPUModelRunner(
         self._needs_prefix_state_migration = (
             self.cache_config.mamba_cache_mode == "align"
         )
+        self._mamba_active_slots = None
+        self._mamba_active_slot_buffer = None
+        self._mamba_active_reset_buffer = None
+        if vllm_config.mamba_config.fp32_active_state:
+            self._mamba_active_slots = mamba_utils.MambaActiveStateSlots(
+                self.max_num_reqs,
+                2 if self.cache_config.use_replayssm else 1 + self.num_spec_tokens,
+            )
+            self._mamba_active_slot_buffer = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self._mamba_active_reset_buffer = self._make_buffer(
+                self.max_num_reqs, dtype=torch.bool
+            )
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -1227,6 +1241,13 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        active_slots = getattr(self, "_mamba_active_slots", None)
+        if active_slots is not None:
+            active_slots.release(scheduler_output.finished_req_ids)
+            active_slots.release(scheduler_output.preempted_req_ids or ())
+            active_slots.release(scheduler_output.scheduled_cached_reqs.resumed_req_ids)
+            active_slots.release(r.req_id for r in scheduler_output.scheduled_new_reqs)
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             req_state = self.requests.pop(req_id, None)
@@ -1626,6 +1647,29 @@ class GPUModelRunner(
                 dim=1
             )
 
+        if (
+            getattr(self, "_mamba_active_slots", None) is not None
+            and not self.cache_config.use_replayssm
+        ):
+            from vllm.model_executor.layers.mamba.ops.active_state import (
+                copy_mamba_state,
+            )
+
+            assert self._mamba_active_slot_buffer is not None
+            bases = self._mamba_active_slot_buffer.gpu[:num_reqs]
+            offsets = torch.arange(1 + self.num_spec_tokens, device=self.device)
+            indices = bases[:, None] + offsets
+            for layer in self.compilation_config.static_forward_context.values():
+                active_state = getattr(layer, "active_ssm_state", None)
+                if active_state is not None:
+                    copy_mamba_state(
+                        active_state,
+                        active_state,
+                        indices,
+                        bases,
+                        accepted=self.num_accepted_tokens.gpu[:num_reqs],
+                    )
+
         if self._needs_prefix_state_migration or self._use_flashinfer_replayssm:
             # Fused GPU postprocess: state copies + per-request accepted-token
             # update without CPU-GPU sync. The metadata
@@ -1645,6 +1689,11 @@ class GPUModelRunner(
                 forward_context=self.compilation_config.static_forward_context,
                 mamba_state_copy_funcs=self._get_mamba_state_copy_funcs(),
                 run_prefix_state_migration=self._needs_prefix_state_migration,
+                active_slots=(
+                    self._mamba_active_slot_buffer.gpu
+                    if self._mamba_active_slot_buffer is not None
+                    else None
+                ),
             )
 
             if self._use_flashinfer_replayssm:
@@ -2533,12 +2582,33 @@ class GPUModelRunner(
                 self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded]
             )
 
+        active_slots = active_reset = None
+        if self._mamba_active_slots is not None:
+            assert self._mamba_active_slot_buffer is not None
+            assert self._mamba_active_reset_buffer is not None
+            req_ids = self.input_batch.req_ids[:num_reqs]
+            if req_ids:
+                bases, reset = self._mamba_active_slots.prepare(req_ids)
+            else:
+                # Graph warmup has synthetic rows without request ownership.
+                bases, reset = [0] * num_reqs, [False] * num_reqs
+            self._mamba_active_slot_buffer.np[:num_reqs] = bases
+            self._mamba_active_slot_buffer.np[num_reqs:num_reqs_padded] = 0
+            self._mamba_active_reset_buffer.np[:num_reqs] = reset
+            self._mamba_active_reset_buffer.np[num_reqs:num_reqs_padded] = False
+            self._mamba_active_slot_buffer.copy_to_gpu(num_reqs_padded)
+            self._mamba_active_reset_buffer.copy_to_gpu(num_reqs_padded)
+            active_slots = self._mamba_active_slot_buffer.gpu[:num_reqs_padded]
+            active_reset = self._mamba_active_reset_buffer.gpu[:num_reqs_padded]
+
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             replayssm_decode_base_cpu=replayssm_decode_base_cpu,
+            mamba_active_slots=active_slots,
+            mamba_active_reset=active_reset,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens_padded,
             max_query_len=max_query_len,

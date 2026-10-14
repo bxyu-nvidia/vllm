@@ -40,6 +40,17 @@ class MambaConfig:
     backend: MambaBackendEnum = MambaBackendEnum.TRITON
     """Mamba SSU backend to use."""
 
+    fp32_active_state: bool = False
+    """Keep Mamba2 working states in FP32 while storing FP16 snapshots.
+    Requires Model Runner V1 or FlashInfer ReplaySSM on Model Runner V2,
+    and align or none cache mode. Working memory
+    scales with max_num_seqs and the speculative verification window.
+    Each layer allocates (1 + max_num_seqs * (1 + num_speculative_tokens))
+    FP32 states in addition to the snapshot cache. ReplaySSM instead reserves
+    two states per request (anchor and snapshot scratch), plus replay rings.
+    Prefix resumes and P/D transfers still initialize from FP16 snapshots.
+    """
+
     enable_stochastic_rounding: bool = False
     """Enable stochastic rounding when writing SSM state to fp16 cache.
     Uses random bits to unbias the rounding error, which can improve

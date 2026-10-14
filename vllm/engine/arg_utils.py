@@ -793,6 +793,7 @@ class EngineArgs:
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     mamba_ssu_algorithm: MambaSSUAlgorithm | None = None
+    enable_mamba_fp32_active_state: bool = MambaConfig.fp32_active_state
     enable_mamba_cache_stochastic_rounding: bool = (
         MambaConfig.enable_stochastic_rounding
     )
@@ -1071,6 +1072,9 @@ class EngineArgs:
             description=MambaConfig.__doc__,
         )
         mamba_group.add_argument("--mamba-backend", **mamba_kwargs["backend"])
+        mamba_group.add_argument(
+            "--enable-mamba-fp32-active-state", **mamba_kwargs["fp32_active_state"]
+        )
         mamba_group.add_argument(
             "--mamba-ssu-algorithm", **mamba_kwargs["ssu_algorithm"]
         )
@@ -2656,6 +2660,8 @@ class EngineArgs:
 
         # Mamba config overrides
         mamba_config = copy.deepcopy(self.mamba_config)
+        if self.enable_mamba_fp32_active_state:
+            mamba_config.fp32_active_state = True
         # Convert string to enum if needed (CLI parsing returns a string)
         if isinstance(self.mamba_backend, str):
             mamba_config.backend = MambaBackendEnum[self.mamba_backend.upper()]
