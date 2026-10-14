@@ -7,6 +7,10 @@ from typing import Any
 import torch
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers.mamba.checkpoint import (
+    MambaPrefillCheckpointBuilder,
+    MambaPrefillCheckpointMetadata,
+)
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -108,6 +112,7 @@ class Mamba2AttentionMetadata(BaseMambaAttentionMetadata):
 
     # Chunk-related metadata (only for prefill)
     seq_idx_p: torch.Tensor | None = None
+    prefill_checkpoint: MambaPrefillCheckpointMetadata | None = None
 
 
 class Mamba2AttentionMetadataBuilder(
@@ -128,6 +133,9 @@ class Mamba2AttentionMetadataBuilder(
             "chunk_size needs to be set in the model config for Mamba2 models"
         )
         self.chunk_size: int = chunk_size
+        self.prefill_checkpoint_builder = MambaPrefillCheckpointBuilder(
+            vllm_config, kv_cache_spec
+        )
 
     def build(
         self,
@@ -147,6 +155,7 @@ class Mamba2AttentionMetadataBuilder(
         cu_chunk_seqlen_p = None
         last_chunk_indices_p = None
         prep_initial_states = False
+        prefill_checkpoint = None
 
         # Compute seq_idx for prefill only
         if common.num_prefills > 0:
@@ -170,6 +179,10 @@ class Mamba2AttentionMetadataBuilder(
                     common_attn_metadata,
                 )
             )
+            prefill_checkpoint = self.prefill_checkpoint_builder.build(
+                common_attn_metadata,
+                list(range(common.num_decodes, common.num_reqs)),
+            )
 
         return replace(
             common,
@@ -178,4 +191,5 @@ class Mamba2AttentionMetadataBuilder(
             seq_idx_p=seq_idx_p,
             cu_chunk_seqlen_p=cu_chunk_seqlen_p,
             last_chunk_indices_p=last_chunk_indices_p,
+            prefill_checkpoint=prefill_checkpoint,
         )
