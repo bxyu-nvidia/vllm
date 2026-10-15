@@ -3,11 +3,12 @@
 
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 import torch
 from torch import nn
 
-from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
+from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.config.mamba import MambaBackendEnum
 from vllm.distributed import (
     divide,
@@ -40,6 +41,7 @@ from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_outpu
     selective_state_update_replayssm_output_only,
 )
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
+    export_mamba2_prefill_checkpoint,
     mamba_chunk_scan_combined_varlen,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
@@ -64,7 +66,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec
 
 logger = init_logger(__name__)
 
@@ -925,7 +927,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 cu_chunk_seqlens=cu_chunk_seqlen_p,
                 last_chunk_indices=last_chunk_indices_p,
                 initial_states=initial_states,
-                return_intermediate_states=is_mamba_cache_all,
+                return_intermediate_states=(
+                    is_mamba_cache_all or attn_metadata.prefill_checkpoint is not None
+                ),
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
                 out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
@@ -1007,6 +1011,23 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 # - varlen state is a (num_prefills, nheads, headdim, dstate)
                 #   tensor
                 assert state_indices_tensor_p is not None
+                if attn_metadata.prefill_checkpoint is not None:
+                    assert query_start_loc_p is not None
+                    assert last_chunk_indices_p is not None
+                    checkpoint = attn_metadata.prefill_checkpoint
+                    export_mamba2_prefill_checkpoint(
+                        checkpoint.checkpoint_offsets,
+                        checkpoint.state_indices,
+                        query_start_loc_p,
+                        last_chunk_indices_p,
+                        varlen_states,
+                        x,
+                        conv_state,
+                        ssm_state,
+                        chunk_size,
+                        self.conv_kernel_size - 1,
+                    )
+                    varlen_states = varlen_states[last_chunk_indices_p]
                 ssm_state[state_indices_tensor_p] = varlen_states
 
         # Process decode requests
@@ -1196,6 +1217,29 @@ class MambaMixer2(MambaBase, PluggableLayer):
                     cu_seqlens=query_start_loc_d,
                     is_blackwell=self.is_blackwell,
                 )
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        assert isinstance(spec, MambaSpec)
+        assert self.model_config is not None
+        chunk_size = self.model_config.get_mamba_chunk_size()
+        assert chunk_size is not None
+        hash_block_size = vllm_config.cache_config.prefix_match_unit
+        # A hash-aligned resume must also start on an SSD chunk boundary.
+        # Without an explicit hash size, hybrid groups resolve it after this call.
+        if (
+            spec.mamba_cache_mode == "align"
+            and not current_platform.is_cpu()
+            and hash_block_size is not None
+            and hash_block_size % chunk_size == 0
+            and hash_block_size >= self.conv_kernel_size - 1
+        ):
+            return replace(
+                spec,
+                num_prefill_checkpoint_blocks=1,
+                prefill_checkpoint_alignment=chunk_size,
+            )
+        return spec
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None

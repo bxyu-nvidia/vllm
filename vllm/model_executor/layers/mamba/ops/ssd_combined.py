@@ -10,7 +10,8 @@ import torch
 from einops import rearrange
 from packaging import version
 
-from vllm.triton_utils import triton
+from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
@@ -18,6 +19,106 @@ from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
 from .ssd_state_passing import _state_passing_fwd
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+
+
+@triton.jit
+def _export_mamba2_prefill_checkpoint_kernel(
+    offsets,
+    state_indices,
+    query_start_loc,
+    last_chunk_indices,
+    states,
+    x,
+    conv_cache,
+    ssm_cache,
+    stride_states_chunk: tl.int64,
+    stride_x_dim: tl.int64,
+    stride_x_token: tl.int64,
+    stride_conv_block: tl.int64,
+    stride_conv_dim: tl.int64,
+    stride_conv_token: tl.int64,
+    stride_ssm_block: tl.int64,
+    SSM_SIZE: tl.constexpr,
+    CONV_DIM: tl.constexpr,
+    CONV_WIDTH: tl.constexpr,
+    CHUNK_SIZE: tl.constexpr,
+    NULL_STATE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offset = tl.load(offsets + row)
+    if offset == 0:
+        return
+    state_idx = tl.load(state_indices + row).to(tl.int64)
+    if state_idx == NULL_STATE:
+        return
+    first_chunk = tl.load(last_chunk_indices + row - 1, row > 0, other=-1) + 1
+    chunk = first_chunk + offset // CHUNK_SIZE - 1
+    idx = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    state = tl.load(
+        states + chunk.to(tl.int64) * stride_states_chunk + idx,
+        idx < SSM_SIZE,
+        other=0,
+    )
+    tl.store(ssm_cache + state_idx * stride_ssm_block + idx, state, idx < SSM_SIZE)
+
+    dim = idx // CONV_WIDTH
+    token = tl.load(query_start_loc + row) + offset - CONV_WIDTH + idx % CONV_WIDTH
+    conv = tl.load(
+        x + dim * stride_x_dim + token.to(tl.int64) * stride_x_token,
+        dim < CONV_DIM,
+        other=0,
+    )
+    tl.store(
+        conv_cache
+        + state_idx * stride_conv_block
+        + dim * stride_conv_dim
+        + idx % CONV_WIDTH * stride_conv_token,
+        conv,
+        dim < CONV_DIM,
+    )
+
+
+def export_mamba2_prefill_checkpoint(
+    offsets: torch.Tensor,
+    state_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    last_chunk_indices: torch.Tensor,
+    states: torch.Tensor,
+    x: torch.Tensor,
+    conv_cache: torch.Tensor,
+    ssm_cache: torch.Tensor,
+    chunk_size: int,
+    conv_width: int,
+) -> None:
+    """Save a chunk-aligned SSD state and its convolution input window."""
+    ssm_size = states.shape[1] * states.shape[2] * states.shape[3]
+    block = 1024
+    _export_mamba2_prefill_checkpoint_kernel[
+        (offsets.numel(), triton.cdiv(max(ssm_size, x.shape[0] * conv_width), block))
+    ](
+        offsets,
+        state_indices,
+        query_start_loc,
+        last_chunk_indices,
+        states,
+        x,
+        conv_cache,
+        ssm_cache,
+        states.stride(0),
+        x.stride(0),
+        x.stride(1),
+        conv_cache.stride(0),
+        conv_cache.stride(1),
+        conv_cache.stride(2),
+        ssm_cache.stride(0),
+        SSM_SIZE=ssm_size,
+        CONV_DIM=x.shape[0],
+        CONV_WIDTH=conv_width,
+        CHUNK_SIZE=chunk_size,
+        NULL_STATE=NULL_BLOCK_ID,
+        BLOCK=block,
+    )
 
 
 def is_int_pow_2(n):

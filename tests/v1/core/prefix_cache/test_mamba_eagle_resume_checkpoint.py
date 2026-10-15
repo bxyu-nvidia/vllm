@@ -37,6 +37,7 @@ def _manager(
     eagle_group=None,
     num_prefill_lookahead=0,
     num_speculative_blocks=0,
+    prefill_checkpoint_alignment=None,
 ):
     init_none_hash(sha256)
     config = _make_hybrid_kv_cache_config(
@@ -45,6 +46,8 @@ def _manager(
     config.kv_cache_groups[1].kv_cache_spec = replace(
         config.kv_cache_groups[1].kv_cache_spec,
         num_speculative_blocks=num_speculative_blocks,
+        num_prefill_checkpoint_blocks=int(prefill_checkpoint_alignment is not None),
+        prefill_checkpoint_alignment=prefill_checkpoint_alignment,
     )
     if eagle_group is not None:
         groups = list(config.kv_cache_groups)
@@ -79,7 +82,14 @@ def _stub(manager, block_size, hash_block_size, *, block_drop=True):
         # they exist only to compensate for the drop.
         use_eagle_block_drop=block_drop,
         hash_block_size=hash_block_size,
-        mamba_has_prefill_checkpoint_blocks=False,  # forced False under eagle
+        mamba_has_prefill_checkpoint_blocks=(
+            manager.coordinator.single_type_managers[1].has_prefill_checkpoint_blocks
+        ),
+        mamba_prefill_checkpoint_alignment=(
+            manager.coordinator.single_type_managers[
+                1
+            ].kv_cache_spec.prefill_checkpoint_alignment
+        ),
         mamba_partial_cache_hit=partial_hit,
         mamba_shared_prefix_checkpoint=(
             partial_hit and manager.mamba_shared_prefix_checkpoint
@@ -149,6 +159,21 @@ def _sibling_hit(manager, shared, suffix, hash_block_size):
 
 # --------------------------------------------------------------------------
 # The two positions a sibling resumes at
+
+
+@pytest.mark.parametrize("prompt_len", [102400, 102401])
+def test_internal_checkpoint_avoids_prefill_tail_forward_passes(prompt_len):
+    """Exporting an SSD chunk state preserves reuse without extra forwards."""
+    manager = _manager(4352, 128, prefill_checkpoint_alignment=128)
+    stub = _stub(manager, 4352, 128)
+    tokens = list(range(prompt_len))
+    owner = make_request("owner", tokens, 128, sha256)
+
+    assert _prefill(manager, stub, owner) == [len(tokens)]
+    manager.free(owner)
+    sibling = make_request("sibling", tokens + [-1], 128, sha256)
+    expected = 102272
+    assert manager.get_computed_blocks(sibling)[1] == expected
 
 
 def test_sibling_resumes_from_the_observed_junction():

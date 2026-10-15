@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
+    export_mamba2_prefill_checkpoint,
     mamba_chunk_scan_combined_varlen,
 )
 from vllm.platforms import current_platform
@@ -578,3 +579,90 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
             rtol=rtol,
             msg=lambda x, i=i: f"seq{i} state " + x,
         )
+
+
+@pytest.mark.parametrize("dim_first", [False, True])
+@pytest.mark.parametrize("null_offset", [0, 128])
+def test_prefill_checkpoint_exports_ssd_state_and_conv_window(dim_first, null_offset):
+    """Checkpoint state and convolution inputs must describe the same boundary."""
+    states = torch.randn(9, 4, 8, 16, device=DEVICE, dtype=torch.float32)
+    projection = torch.randn(1152, 80, device=DEVICE, dtype=torch.bfloat16)
+    x = projection[:, :64].T
+    conv_cache = torch.full(
+        (8, 64, 8) if dim_first else (8, 8, 64),
+        -123,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    if not dim_first:
+        conv_cache = conv_cache.transpose(1, 2)
+    ssm_storage = torch.full((8, 4 * 8 * 16 + 32), -123.0, device=DEVICE)
+    ssm_cache = ssm_storage[:, : 4 * 8 * 16].view(8, 4, 8, 16)
+    offsets = torch.tensor([128, 256, null_offset], device=DEVICE, dtype=torch.int32)
+    indices = torch.tensor([2, 5, 0], device=DEVICE, dtype=torch.int32)
+    starts = torch.tensor([0, 384, 896, 1152], device=DEVICE, dtype=torch.int32)
+    last = torch.tensor([2, 6, 8], device=DEVICE, dtype=torch.int32)
+
+    export_mamba2_prefill_checkpoint(
+        offsets, indices, starts, last, states, x, conv_cache, ssm_cache, 128, 3
+    )
+
+    torch.testing.assert_close(ssm_cache[2], states[0], rtol=0, atol=0)
+    torch.testing.assert_close(ssm_cache[5], states[4], rtol=0, atol=0)
+    torch.testing.assert_close(conv_cache[2, :, :3], x[:, 125:128], rtol=0, atol=0)
+    torch.testing.assert_close(conv_cache[5, :, :3], x[:, 637:640], rtol=0, atol=0)
+    assert torch.all(ssm_cache[0] == -123)
+    assert torch.all(conv_cache[:, :, 3:] == -123)
+    assert torch.all(ssm_storage[:, -32:] == -123)
+
+
+@pytest.mark.parametrize("checkpoint_offset", [128, 256])
+def test_prefill_checkpoint_resumes_ssd_recurrence(checkpoint_offset):
+    """An exported intermediate state must reproduce the remaining scan."""
+    A, dt, X, B, C = generate_random_inputs(1, 384, 4, 8, torch.float32)
+    X, dt, B, C = (t.squeeze(0) for t in (X, dt, B, C))
+
+    def scan(start, end, initial_states=None, intermediate=False):
+        lengths = torch.tensor([0, end - start], device=DEVICE, dtype=torch.int32)
+        chunks, last, seq_idx = compute_varlen_chunk_metadata(lengths, 128)
+        out = torch.empty_like(X[start:end])
+        states = mamba_chunk_scan_combined_varlen(
+            X[start:end],
+            dt[start:end],
+            A,
+            B[start:end],
+            C[start:end],
+            128,
+            cu_seqlens=lengths,
+            cu_chunk_seqlens=chunks,
+            last_chunk_indices=last,
+            seq_idx=seq_idx,
+            out=out,
+            initial_states=initial_states,
+            return_intermediate_states=intermediate,
+            state_dtype=torch.float32,
+        )
+        return out, states
+
+    whole_out, states = scan(0, 384, intermediate=True)
+    ssm_cache = torch.zeros((2, 4, 8, 8), device=DEVICE)
+    conv_cache = torch.zeros((2, 32, 3), device=DEVICE)
+    export_mamba2_prefill_checkpoint(
+        torch.tensor([checkpoint_offset], device=DEVICE, dtype=torch.int32),
+        torch.tensor([1], device=DEVICE, dtype=torch.int32),
+        torch.tensor([0, 384], device=DEVICE, dtype=torch.int32),
+        torch.tensor([2], device=DEVICE, dtype=torch.int32),
+        states,
+        X.flatten(1).T,
+        conv_cache,
+        ssm_cache,
+        128,
+        3,
+    )
+    _, prefix_state = scan(0, checkpoint_offset)
+    torch.testing.assert_close(ssm_cache[1:2], prefix_state, rtol=0, atol=0)
+    resumed_out, resumed_state = scan(checkpoint_offset, 384, ssm_cache[1:2])
+    torch.testing.assert_close(
+        resumed_out, whole_out[checkpoint_offset:], rtol=5e-3, atol=8e-3
+    )
+    torch.testing.assert_close(resumed_state[0], states[-1], rtol=0, atol=0)
