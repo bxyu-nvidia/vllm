@@ -366,3 +366,94 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
     runner.capture_model(profile_only=True)
 
     assert lock_calls == []
+
+
+@pytest.mark.parametrize(
+    "num_reqs,num_tokens,padded_tokens,mode,padded_reqs",
+    [
+        (1, 6, 8, "PIECEWISE", None),
+        (2, 12, 16, "PIECEWISE", None),
+        (1, 6, 128, "PIECEWISE", None),  # padding to another DP rank's size
+        (1, 6, 6, "NONE", 1),
+        (1, 6, 12, "FULL", 2),
+    ],
+)
+def test_dummy_graph_padding_preserves_dp_sync(
+    monkeypatch, num_reqs, num_tokens, padded_tokens, mode, padded_reqs
+):
+    """The MTP drafter must reuse the target's DP sync after dummy graph padding."""
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.worker.gpu import dp_utils
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
+    from vllm.v1.worker.utils import get_uniform_decode_token_count
+
+    mode = CUDAGraphMode[mode]
+    desc = BatchExecutionDescriptor(
+        cg_mode=mode, num_tokens=padded_tokens, num_reqs=padded_reqs
+    )
+    sync = dp_utils.DPSyncState(
+        num_tokens_across_dp=torch.full((4,), padded_tokens, dtype=torch.int32),
+        uniform_token_count=6,
+        eager=mode == CUDAGraphMode.NONE,
+        num_reqs=num_reqs,
+    )
+    runner = Mock()
+    runner.lora_config = runner.ubatch_runner = runner.pcp_manager = None
+    runner.is_encoder_decoder = False
+    runner.decode_query_len = 6
+    runner.dp_size, runner.dp_rank = 4, 3
+    runner.input_buffers = InputBuffers(4, padded_tokens, torch.device("cpu"))
+    runner.gather_batch_req_state = lambda output, dummy: (
+        model_runner_module.GPUModelRunner.gather_batch_req_state(runner, output, dummy)
+    )
+    dispatch = Mock(return_value=(desc, sync))
+    monkeypatch.setattr(model_runner_module, "dispatch_cg_and_sync_dp", dispatch)
+
+    class BatchPrepared(Exception):
+        pass
+
+    runner.prepare_dummy_attn.side_effect = BatchPrepared
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {str(i): 6 for i in range(num_reqs)}
+    output.total_num_scheduled_tokens = num_tokens
+    with pytest.raises(BatchPrepared):
+        GPUModelRunner.execute_model(runner, output, dummy_run=True)
+
+    # Inspect the batch actually passed to attention, before any GPU kernels run.
+    batch = runner.prepare_dummy_attn.call_args.args[0]
+    assert dispatch.call_args.args[3] == 6
+    assert batch.num_tokens == (
+        padded_tokens if mode == CUDAGraphMode.FULL else num_tokens
+    )
+    assert batch.num_tokens_after_padding == padded_tokens
+    assert batch.num_scheduled_tokens.tolist() == [6] * (padded_reqs or num_reqs)
+    assert batch.query_start_loc_np[-1] == batch.num_tokens
+    assert batch.logits_indices.tolist() == list(range(5, batch.num_tokens, 6))
+    assert batch.input_ids.shape == batch.positions.shape == (padded_tokens,)
+    GPUModelRunner.prepare_dummy_attn(runner, batch)
+    runner.block_tables.get_dummy_slot_mappings.assert_called_once_with(padded_tokens)
+
+    uniform = get_uniform_decode_token_count(
+        batch.num_reqs,
+        batch.num_tokens,
+        int(batch.num_scheduled_tokens.max()),
+        batch.decode_graph_eligible,
+    )
+    manager = Mock()
+    manager.dispatch.return_value = desc
+    # Reusing the agreement must not issue another collective on only idle ranks.
+    monkeypatch.setattr(
+        dp_utils, "get_dp_group", Mock(side_effect=AssertionError("new collective"))
+    )
+    _, reused = dp_utils.dispatch_cg_and_sync_dp(
+        manager,
+        batch.num_reqs,
+        batch.num_tokens_after_padding,
+        uniform,
+        dp_size=4,
+        dp_rank=3,
+        dp_sync=sync,
+    )
+    assert reused is sync

@@ -1557,7 +1557,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for block_table in block_tables:
                 block_table[:, 0].copy_(state_slots)
         slot_mappings = block_table_provider.get_dummy_slot_mappings(
-            input_batch.num_tokens
+            input_batch.num_tokens_after_padding
         )
         return block_tables, slot_mappings
 
@@ -1800,10 +1800,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             dummy_num_reqs = batch_desc.num_reqs or num_reqs
+            # PIECEWISE pads tokens without padding requests. Keep that padding
+            # out of query lengths so the drafter can reuse the target's DP sync.
+            dummy_num_tokens = (
+                num_toks
+                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE
+                else batch_desc.num_tokens
+            )
             input_batch = InputBatch.make_dummy(
                 dummy_num_reqs,
-                batch_desc.num_tokens,
+                dummy_num_tokens,
                 self.input_buffers,
+                num_tokens_after_padding=batch_desc.num_tokens,
                 max_query_len=batch_desc.max_query_len,
                 # Profiling and warmup must route the dummy tokens to experts
                 # so MoE memory is measured and MoE kernels are exercised.
