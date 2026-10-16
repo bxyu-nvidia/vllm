@@ -493,7 +493,10 @@ class SpeculativeConfig:
     """Batch-size schedule used to dynamically choose speculative-token count.
 
     Each entry is ``(range_start, range_end, num_speculative_tokens)`` with an
-    inclusive batch-size range.
+    inclusive batch-size range. With data parallelism, only schedules that resolve
+    to a constant count across supported batch sizes are kept, and only with the
+    V2 model runner and async scheduling. These control target verification;
+    the V2 drafter still uses the static ``num_speculative_tokens``.
     """
 
     # params generated in the post-init stage
