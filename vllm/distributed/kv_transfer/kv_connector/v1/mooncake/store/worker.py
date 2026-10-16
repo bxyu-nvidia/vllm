@@ -90,6 +90,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from .metrics import MooncakeStoreConnectorStats
+from .pipeline import PIPELINE_KEY, PipelineTracker
 
 logger = init_logger(__name__)
 
@@ -326,6 +327,7 @@ class KVTransferThread(threading.Thread):
         self.tp_rank = tp_rank
         self.token_databases = token_databases
         self._record_operation_cb = record_operation
+        self.pipeline_tracker: PipelineTracker | None = None
         self.done_task_lock = threading.Lock()
         self.request_queue: queue.Queue[Any] = request_queue or queue.Queue()
         self.finished_requests: set[str] = set()
@@ -349,16 +351,24 @@ class KVTransferThread(threading.Thread):
         self.ready_event.set()
         while True:
             request_data = None
+            ticket = None
             try:
                 request_data = self.request_queue.get()
                 if request_data is None:
                     logger.warning("Received a None request!")
                     self.request_queue.task_done()
                     continue
+                if self.pipeline_tracker is not None:
+                    request_data, ticket = request_data
+                    self.pipeline_tracker.start(ticket)
                 self._handle_request(request_data)
             except Exception:
                 req_id = getattr(request_data, "req_id", "<unknown>")
                 logger.exception("Error in %s (req=%s)", self.name, req_id)
+            finally:
+                if ticket is not None:
+                    assert self.pipeline_tracker is not None
+                    self.pipeline_tracker.finish(ticket)
 
     def _handle_request(self, req_meta: Any):
         pass
@@ -1586,7 +1596,8 @@ class MooncakeStoreWorker:
         # Pool of load-receive threads
         self.kv_recv_threads: list[KVCacheStoreRecvingThread] = []
         self.num_recv_threads = max(1, envs.VLLM_MOONCAKE_LOAD_RECV_THREADS)
-        self.recv_request_queue: queue.Queue[ReqMeta] = queue.Queue()
+        self.load_pipeline = PipelineTracker("load", vllm_config.parallel_config.rank)
+        self.recv_request_queue: queue.Queue[tuple[ReqMeta, int]] = queue.Queue()
         self.finished_store_req: set[str] = set()
         self._kv_connector_stats_lock = threading.Lock()
         self.kv_connector_stats = MooncakeStoreConnectorStats()
@@ -2041,6 +2052,7 @@ class MooncakeStoreWorker:
                 is_hma_required=self._is_hma_required,
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
+            recv_thread.pipeline_tracker = self.load_pipeline
             recv_thread.start()
             self.kv_recv_threads.append(recv_thread)
             ready_events_recving.append(ready_event_recving)
@@ -2066,7 +2078,8 @@ class MooncakeStoreWorker:
                 continue
 
             load_spec.token_len = load_spec.kvpool_cached_tokens
-            self.recv_request_queue.put(request)
+            ticket = self.load_pipeline.enqueue()
+            self.recv_request_queue.put((request, ticket))
 
         assert self.load_async, "load_async must be True for better performance."
 
@@ -2170,6 +2183,10 @@ class MooncakeStoreWorker:
 
     def get_kv_connector_stats(self) -> MooncakeStoreConnectorStats | None:
         with self._kv_connector_stats_lock:
+            if not self._capacity_only:
+                self.kv_connector_stats.data[PIPELINE_KEY] = [
+                    self.load_pipeline.snapshot()
+                ]
             if self.kv_connector_stats.is_empty():
                 return None
             kv_connector_stats = self.kv_connector_stats
@@ -2515,7 +2532,8 @@ class LookupKeyClient:
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="MooncakeLookupClient"
         )
-        self.futures: dict[str, Future[MooncakeLookupResult]] = {}
+        self.futures: dict[str, Future[tuple[MooncakeLookupResult, float]]] = {}
+        self.pipeline = PipelineTracker("lookup", -1)
 
     def _lookup(
         self, num_tokens: int, block_hashes: list[BlockHash]
@@ -2531,6 +2549,16 @@ class LookupKeyClient:
         resp = self.socket.recv()
         return decode_lookup_response(resp)
 
+    def _timed_lookup(
+        self, ticket: int, num_tokens: int, block_hashes: list[BlockHash]
+    ) -> tuple[MooncakeLookupResult, float]:
+        self.pipeline.start(ticket)
+        try:
+            result = self._lookup(num_tokens, block_hashes)
+        finally:
+            completed_at = self.pipeline.finish(ticket)
+        return result, completed_at
+
     def lookup(
         self,
         req_id: str,
@@ -2542,12 +2570,24 @@ class LookupKeyClient:
         so the caller retries on a later step."""
         future = self.futures.get(req_id)
         if future is None:
-            future = self.executor.submit(self._lookup, num_tokens, list(block_hashes))
+            ticket = self.pipeline.enqueue()
+            try:
+                future = self.executor.submit(
+                    self._timed_lookup, ticket, num_tokens, list(block_hashes)
+                )
+            except Exception:
+                self.pipeline.finish(ticket)
+                raise
+            future.add_done_callback(
+                lambda done: self.pipeline.finish(ticket) if done.cancelled() else None
+            )
             self.futures[req_id] = future
         if non_block and not future.done():
             return None
         try:
-            return future.result()
+            result, completed_at = future.result()
+            self.pipeline.record_consumption(completed_at)
+            return result
         except Exception as e:
             logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
             return MooncakeLookupResult(0)

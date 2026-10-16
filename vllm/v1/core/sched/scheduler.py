@@ -217,6 +217,7 @@ class Scheduler(SchedulerInterface):
         # Waiting requests that are deferred, i.e. were skipped by the scheduling
         # scan or enqueued in a blocked status.
         self.deferred_waiting: set[Request] = set()
+        self._deferred_reasons: dict[Request, str] = {}
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -874,9 +875,11 @@ class Scheduler(SchedulerInterface):
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
 
-            def skip_request(from_queue: RequestQueue) -> None:
+            def skip_request(from_queue: RequestQueue, reason: str = "other") -> None:
                 request_to_skip = from_queue.pop_request()
                 self.deferred_waiting.add(request_to_skip)
+                if self.log_stats:
+                    self._deferred_reasons[request_to_skip] = reason
                 if self._holds_kv_blocks(request_to_skip):
                     step_skipped_kv_holding.appendleft(request_to_skip)
                 else:
@@ -918,7 +921,7 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
-                    skip_request(request_queue)
+                    skip_request(request_queue, "lora_limit")
                     continue
 
                 num_external_computed_tokens = 0
@@ -957,7 +960,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            skip_request(request_queue)
+                            skip_request(request_queue, "external_cache_lookup")
                             continue
 
                         if self.prefix_replay_tokens:
@@ -1027,7 +1030,7 @@ class Scheduler(SchedulerInterface):
 
                     # Skip request with pending mm encoding prefetches
                     if self._ec_transfer_pending(request, num_computed_tokens):
-                        skip_request(request_queue)
+                        skip_request(request_queue, "encoder_cache_load")
                         continue
 
                     # Track first scheduled prefill, not post-preemption repeat prefills
@@ -1048,7 +1051,7 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens = request.num_computed_tokens
 
                     if self._ec_transfer_pending(request, num_computed_tokens):
-                        skip_request(request_queue)
+                        skip_request(request_queue, "encoder_cache_load")
                         continue
 
                 encoder_inputs_to_schedule = None
@@ -1289,6 +1292,7 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.pop_request()
                 self.deferred_waiting.discard(request)
+                self._deferred_reasons.pop(request, None)
                 self.running.append(request)
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
@@ -2239,6 +2243,8 @@ class Scheduler(SchedulerInterface):
             self.waiting.remove_requests(stopped_preempted_reqs)
             self.kv_holding_waiting.remove_requests(stopped_preempted_reqs)
             self.deferred_waiting.difference_update(stopped_preempted_reqs)
+            for request in stopped_preempted_reqs:
+                self._deferred_reasons.pop(request, None)
 
         error_req_ids = set(self.grammar_compile_error_reqs)
         self.grammar_compile_error_reqs.clear()
@@ -2631,6 +2637,8 @@ class Scheduler(SchedulerInterface):
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.kv_holding_waiting.remove_requests(waiting_requests_to_remove)
             self.deferred_waiting.difference_update(waiting_requests_to_remove)
+            for request in waiting_requests_to_remove:
+                self._deferred_reasons.pop(request, None)
 
         # Second pass: set status and free requests
         for request in valid_requests:
@@ -2856,6 +2864,20 @@ class Scheduler(SchedulerInterface):
         """
         self.encoder_cache_manager.reset()
 
+    def _get_deferred_waiting_reasons(self) -> dict[str, int]:
+        blocked_reasons = {
+            RequestStatus.WAITING_FOR_REMOTE_KVS: "remote_kv_load",
+            RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR: "grammar",
+            RequestStatus.WAITING_FOR_STREAMING_REQ: "streaming_input",
+        }
+        counts: dict[str, int] = {}
+        for request in self.deferred_waiting:
+            reason = blocked_reasons.get(
+                request.status, self._deferred_reasons.get(request, "other")
+            )
+            counts[reason] = counts.get(reason, 0) + 1
+        return counts
+
     def make_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,
@@ -2890,6 +2912,7 @@ class Scheduler(SchedulerInterface):
             num_running_reqs=num_running,
             num_waiting_reqs=num_waiting - num_deferred,
             num_skipped_waiting_reqs=num_deferred,
+            deferred_waiting_reasons=self._get_deferred_waiting_reasons(),
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

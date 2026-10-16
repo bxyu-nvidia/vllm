@@ -12,6 +12,8 @@ use vllm_metrics::{
     U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
+use vllm_metrics::{DEFERRED_REASONS, MooncakePipelineHistogramFamily, MooncakePipelineLabels};
+
 use crate::protocol::stats::{
     KvConnectorStats, MooncakeStats, MultiConnectorStats, NixlStats, SchedulerStats,
 };
@@ -53,6 +55,7 @@ struct SchedulerStatsHandles {
     scheduler_waiting: U64Gauge,
     scheduler_waiting_capacity: U64Gauge,
     scheduler_waiting_deferred: U64Gauge,
+    scheduler_deferred_by_reason: Family<WaitingReasonLabels, U64Gauge>,
     kv_cache_usage: F64Gauge,
 
     // Prefix-cache counters, including the connector-backed external cache path.
@@ -85,6 +88,13 @@ struct SchedulerStatsHandles {
     mooncake_operation_keys_total: MooncakeOperationCounterFamily,
     mooncake_operation_bytes_total: MooncakeOperationCounterFamily,
     mooncake_operation_failed_keys_total: MooncakeOperationCounterFamily,
+
+    mooncake_pipeline_queued: Family<MooncakePipelineLabels, U64Gauge>,
+    mooncake_pipeline_active: Family<MooncakePipelineLabels, U64Gauge>,
+    mooncake_pipeline_oldest_pending_seconds: Family<MooncakePipelineLabels, F64Gauge>,
+    mooncake_pipeline_queue_wait_seconds: MooncakePipelineHistogramFamily,
+    mooncake_pipeline_execution_seconds: MooncakePipelineHistogramFamily,
+    mooncake_pipeline_consumption_wait_seconds: MooncakePipelineHistogramFamily,
 
     // NIXL connector telemetry, decoded from `kv_connector_stats`.
     nixl_xfer_time_seconds: HistogramMetric,
@@ -150,6 +160,7 @@ fn resolve_scheduler_stats_handles(
     };
 
     SchedulerStatsHandles {
+        scheduler_deferred_by_reason: metrics.scheduler_deferred_by_reason.clone(),
         scheduler_running: metrics.scheduler_running.get_or_create_owned(&labels),
         scheduler_waiting: metrics.scheduler_waiting.get_or_create_owned(&labels),
         scheduler_waiting_capacity: metrics
@@ -193,6 +204,16 @@ fn resolve_scheduler_stats_handles(
         mooncake_operation_keys_total: metrics.mooncake_operation_keys_total.clone(),
         mooncake_operation_bytes_total: metrics.mooncake_operation_bytes_total.clone(),
         mooncake_operation_failed_keys_total: metrics.mooncake_operation_failed_keys_total.clone(),
+        mooncake_pipeline_queued: metrics.mooncake_pipeline_queued.clone(),
+        mooncake_pipeline_active: metrics.mooncake_pipeline_active.clone(),
+        mooncake_pipeline_oldest_pending_seconds: metrics
+            .mooncake_pipeline_oldest_pending_seconds
+            .clone(),
+        mooncake_pipeline_queue_wait_seconds: metrics.mooncake_pipeline_queue_wait_seconds.clone(),
+        mooncake_pipeline_execution_seconds: metrics.mooncake_pipeline_execution_seconds.clone(),
+        mooncake_pipeline_consumption_wait_seconds: metrics
+            .mooncake_pipeline_consumption_wait_seconds
+            .clone(),
         nixl_xfer_time_seconds: metrics.nixl_xfer_time_seconds.get_or_create_owned(&labels),
         nixl_post_time_seconds: metrics.nixl_post_time_seconds.get_or_create_owned(&labels),
         nixl_bytes_transferred: metrics.nixl_bytes_transferred.get_or_create_owned(&labels),
@@ -215,6 +236,16 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
         .set(stats.num_waiting_reqs + stats.num_skipped_waiting_reqs);
     handles.scheduler_waiting_capacity.set(stats.num_waiting_reqs);
     handles.scheduler_waiting_deferred.set(stats.num_skipped_waiting_reqs);
+    for reason in DEFERRED_REASONS {
+        handles
+            .scheduler_deferred_by_reason
+            .get_or_create(&WaitingReasonLabels {
+                model_name: handles.labels.model_name.clone(),
+                engine: handles.labels.engine,
+                reason,
+            })
+            .set(stats.deferred_waiting_reasons.get(reason).copied().unwrap_or(0));
+    }
     handles.kv_cache_usage.set(stats.kv_cache_usage);
 
     // Prefix-cache counters, including the connector-backed external cache path.
@@ -312,7 +343,39 @@ fn record_multi_connector_stats(handles: &SchedulerStatsHandles, stats: &MultiCo
 }
 
 fn record_mooncake_stats(handles: &SchedulerStatsHandles, stats: &MooncakeStats) {
-    for (operation, records) in &stats.0 {
+    for snapshot in &stats.pipeline {
+        let labels = MooncakePipelineLabels {
+            model_name: handles.labels.model_name.clone(),
+            engine: handles.labels.engine,
+            stage: snapshot.stage.clone(),
+            rank: snapshot.rank,
+        };
+        handles.mooncake_pipeline_queued.get_or_create(&labels).set(snapshot.queued);
+        handles.mooncake_pipeline_active.get_or_create(&labels).set(snapshot.active);
+        handles
+            .mooncake_pipeline_oldest_pending_seconds
+            .get_or_create(&labels)
+            .set(snapshot.oldest_pending_seconds);
+        for value in &snapshot.queue_wait_seconds {
+            handles
+                .mooncake_pipeline_queue_wait_seconds
+                .get_or_create(&labels)
+                .observe(*value);
+        }
+        for value in &snapshot.execution_seconds {
+            handles
+                .mooncake_pipeline_execution_seconds
+                .get_or_create(&labels)
+                .observe(*value);
+        }
+        for value in &snapshot.consumption_wait_seconds {
+            handles
+                .mooncake_pipeline_consumption_wait_seconds
+                .get_or_create(&labels)
+                .observe(*value);
+        }
+    }
+    for (operation, records) in &stats.operations {
         for record in records {
             let labels = MooncakeOperationLabels {
                 model_name: handles.labels.model_name.clone(),
@@ -475,6 +538,90 @@ mod tests {
         expect![[""]].assert_eq(&lora_series(&metrics.render().unwrap()));
     }
 
+    #[test]
+    fn mooncake_pipeline_payload_exports_live_backlog_and_clears_it() {
+        let metrics = Metrics::new();
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let payload = serde_json::json!({
+            "MooncakeStoreConnector": {
+                "_pipeline": [
+                    {"stage": "lookup", "rank": -1, "queued": 2, "active": 1,
+                     "oldest_pending_seconds": 7.0,
+                     "queue_wait_seconds": [2.0], "execution_seconds": [3.0],
+                     "consumption_wait_seconds": [0.25]},
+                    {"stage": "load", "rank": 0, "queued": 0, "active": 1,
+                     "oldest_pending_seconds": 4.0,
+                     "queue_wait_seconds": [], "execution_seconds": []},
+                    {"stage": "load", "rank": 1, "queued": 1, "active": 0,
+                     "oldest_pending_seconds": 4.0,
+                     "queue_wait_seconds": [], "execution_seconds": []}
+                ],
+                "load_get": [{"duration_seconds": 0.05, "num_keys": 3,
+                              "num_bytes": 1024, "status": "ok", "num_failed_keys": 0}]
+            }
+        });
+        let connector: KvConnectorStats = serde_json::from_value(payload).unwrap();
+        let KvConnectorStats::Multi(ref multi) = connector else {
+            panic!("pipeline payload was not decoded as MultiConnector stats");
+        };
+        assert_eq!(multi.mooncake.as_ref().unwrap().pipeline.len(), 3);
+        let stats = SchedulerStats {
+            num_skipped_waiting_reqs: 3,
+            deferred_waiting_reasons: BTreeMap::from([
+                ("external_cache_lookup".to_string(), 2),
+                ("remote_kv_load".to_string(), 1),
+            ]),
+            kv_connector_stats: Some(connector),
+            ..Default::default()
+        };
+        super::record_scheduler_stats_with_handles(&handles, &stats);
+        let rendered = metrics.render().unwrap();
+        for expected in [
+            "vllm:mooncake_pipeline_queued{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 2",
+            "vllm:mooncake_pipeline_active{model_name=\"model\",engine=\"0\",stage=\"load\",rank=\"0\"} 1",
+            "vllm:mooncake_pipeline_queued{model_name=\"model\",engine=\"0\",stage=\"load\",rank=\"1\"} 1",
+            "vllm:mooncake_pipeline_execution_seconds_sum{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 3",
+            "vllm:mooncake_pipeline_consumption_wait_seconds_sum{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 0.25",
+            "vllm:num_requests_deferred_by_reason{model_name=\"model\",engine=\"0\",reason=\"external_cache_lookup\"} 2",
+        ] {
+            assert!(rendered.contains(expected), "missing metric: {expected}");
+        }
+        let mut drained = stats.kv_connector_stats.unwrap();
+        let KvConnectorStats::Multi(ref mut multi) = drained else {
+            unreachable!()
+        };
+        let mooncake = multi.mooncake.as_mut().unwrap();
+        mooncake.operations.clear();
+        for snapshot in &mut mooncake.pipeline {
+            snapshot.queued = 0;
+            snapshot.active = 0;
+            snapshot.oldest_pending_seconds = 0.0;
+            snapshot.queue_wait_seconds.clear();
+            snapshot.execution_seconds.clear();
+            snapshot.consumption_wait_seconds.clear();
+        }
+        super::record_scheduler_stats_with_handles(
+            &handles,
+            &SchedulerStats {
+                kv_connector_stats: Some(drained),
+                ..Default::default()
+            },
+        );
+        let rendered = metrics.render().unwrap();
+        assert!(rendered.contains(
+            "vllm:mooncake_pipeline_queued{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 0"
+        ));
+        assert!(rendered.contains(
+            "vllm:num_requests_deferred_by_reason{model_name=\"model\",engine=\"0\",reason=\"external_cache_lookup\"} 0"
+        ));
+        assert!(rendered.contains(
+            "vllm:mooncake_pipeline_execution_seconds_count{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 1"
+        ));
+        assert!(rendered.contains(
+            "vllm:mooncake_pipeline_consumption_wait_seconds_count{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 1"
+        ));
+    }
+
     fn nixl_stats() -> NixlStats {
         NixlStats {
             transfer_duration: vec![0.01, 0.02],
@@ -488,16 +635,19 @@ mod tests {
     }
 
     fn mooncake_stats() -> MooncakeStats {
-        MooncakeStats(BTreeMap::from([(
-            MooncakeOperation::LoadGet,
-            vec![MooncakeRecord {
-                duration_seconds: 0.05,
-                num_keys: 3,
-                num_bytes: 1024,
-                status: MooncakeStatus::Ok,
-                num_failed_keys: 0,
-            }],
-        )]))
+        MooncakeStats {
+            pipeline: vec![],
+            operations: BTreeMap::from([(
+                MooncakeOperation::LoadGet,
+                vec![MooncakeRecord {
+                    duration_seconds: 0.05,
+                    num_keys: 3,
+                    num_bytes: 1024,
+                    status: MooncakeStatus::Ok,
+                    num_failed_keys: 0,
+                }],
+            )]),
+        }
     }
 
     /// Records one MultiConnector payload into Mooncake and NIXL metrics.

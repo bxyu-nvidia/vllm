@@ -237,8 +237,27 @@ pub mod kv_connector {
 
     /// Mooncake store telemetry grouped by operation.
     #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-    #[serde(transparent)]
-    pub struct MooncakeStats(pub BTreeMap<MooncakeOperation, Vec<MooncakeRecord>>);
+    pub struct MooncakeStats {
+        #[serde(default, rename = "_pipeline")]
+        pub pipeline: Vec<MooncakePipelineSnapshot>,
+        #[serde(flatten)]
+        pub operations: BTreeMap<MooncakeOperation, Vec<MooncakeRecord>>,
+    }
+
+    /// Live pipeline gauges plus timing observations since the previous update.
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct MooncakePipelineSnapshot {
+        pub stage: String,
+        /// -1 denotes engine-wide lookup work; other ranks identify load workers.
+        pub rank: i32,
+        pub queued: u64,
+        pub active: u64,
+        pub oldest_pending_seconds: f64,
+        pub queue_wait_seconds: Vec<f64>,
+        pub execution_seconds: Vec<f64>,
+        #[serde(default)]
+        pub consumption_wait_seconds: Vec<f64>,
+    }
 
     /// Telemetry emitted by a `MultiConnector` with a flat child payload map.
     #[serde_with::skip_serializing_none]
@@ -283,6 +302,9 @@ pub struct SchedulerStats {
     /// Number of waiting requests deferred by transient constraints or a blocked status.
     #[serde(default)]
     pub num_skipped_waiting_reqs: u64,
+    /// Last observed dependency for each deferred request.
+    #[serde(default)]
+    pub deferred_waiting_reasons: std::collections::BTreeMap<String, u64>,
     /// Internal DP load-balancing step counter.
     pub step_counter: u64,
     /// Internal DP load-balancing wave number.

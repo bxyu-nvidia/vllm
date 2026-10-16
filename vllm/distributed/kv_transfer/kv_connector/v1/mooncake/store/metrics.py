@@ -20,6 +20,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetricT,
 )
 
+from .pipeline import PIPELINE_BUCKETS, PIPELINE_KEY, PipelineSnapshot
+
 
 def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
     if not values:
@@ -40,7 +42,7 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
             self.reset()
 
     def reset(self):
-        self.data: dict[str, list[dict[str, int | float | str]]] = {}
+        self.data: dict[str, Any] = {}
 
     def is_empty(self) -> bool:
         return not self.data
@@ -49,12 +51,45 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
         if other.is_empty():
             return self
         for operation, records in other.data.items():
-            self.data.setdefault(operation, []).extend(records)
+            if operation == PIPELINE_KEY:
+                snapshots = {
+                    (s["stage"], s["rank"]): s for s in self.data.get(PIPELINE_KEY, [])
+                }
+                for record in records:
+                    key = (record["stage"], record["rank"])
+                    previous = snapshots.get(key)
+                    latest = dict(record)
+                    for field in (
+                        "queue_wait_seconds",
+                        "execution_seconds",
+                        "consumption_wait_seconds",
+                    ):
+                        latest[field] = (
+                            list(previous.get(field, [])) if previous else []
+                        ) + list(record.get(field, []))
+                    snapshots[key] = latest
+                self.data[PIPELINE_KEY] = list(snapshots.values())
+            else:
+                self.data.setdefault(operation, []).extend(records)
         return self
 
     def reduce(self) -> dict[str, int | float]:
         reduced: dict[str, int | float] = {}
         for operation, records in sorted(self.data.items()):
+            if operation == PIPELINE_KEY:
+                for snapshot in records:
+                    prefix = f"{snapshot['stage']}_rank{snapshot['rank']}"
+                    for name in ("queued", "active", "oldest_pending_seconds"):
+                        reduced[f"{prefix}_{name}"] = snapshot[name]
+                    for name in (
+                        "queue_wait_seconds",
+                        "execution_seconds",
+                        "consumption_wait_seconds",
+                    ):
+                        samples = snapshot.get(name, [])
+                        if samples:
+                            reduced[f"{prefix}_{name}_avg"] = fmean(samples)
+                continue
             if not records:
                 continue
             durations = [float(record["duration_seconds"]) for record in records]
@@ -111,6 +146,30 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
         metric_labelnames = labelnames + ["operation", "status"]
         self._metric_cache: dict[tuple[int, str, str], dict[str, PromMetric]] = {}
+        pipeline_labels = labelnames + ["stage", "rank"]
+        self._pipeline_metrics: dict[str, PromMetric] = {}
+        for field, description in (
+            ("queued", "Jobs waiting for a Mooncake pipeline worker."),
+            ("active", "Jobs executing in a Mooncake pipeline worker."),
+            ("oldest_pending_seconds", "Age of the oldest queued or active job."),
+        ):
+            self._pipeline_metrics[field] = self._gauge_cls(
+                name=f"vllm:mooncake_pipeline_{field}",
+                documentation=description,
+                labelnames=pipeline_labels,
+                multiprocess_mode="mostrecent",
+            )
+        for field in (
+            "queue_wait_seconds",
+            "execution_seconds",
+            "consumption_wait_seconds",
+        ):
+            self._pipeline_metrics[field] = self._histogram_cls(
+                name=f"vllm:mooncake_pipeline_{field}",
+                documentation=f"Mooncake pipeline {field}; rank -1 is engine-wide.",
+                labelnames=pipeline_labels,
+                buckets=PIPELINE_BUCKETS,
+            )
 
         self._histogram_operation_time = self._histogram_cls(
             name="vllm:mooncake_store_operation_time_seconds",
@@ -177,6 +236,10 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         if not transfer_stats_data:
             return
         for operation, records in transfer_stats_data.items():
+            if operation == PIPELINE_KEY:
+                for snapshot in records:
+                    self._observe_pipeline(snapshot, engine_idx)
+                continue
             assert isinstance(records, list)
             for record in records:
                 assert isinstance(record, dict)
@@ -187,3 +250,18 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
                 metrics["keys"].inc(int(record["num_keys"]))
                 metrics["bytes"].inc(int(record["num_bytes"]))
                 metrics["failed_keys"].inc(int(record["num_failed_keys"]))
+
+    def _observe_pipeline(self, snapshot: PipelineSnapshot, engine_idx: int) -> None:
+        labels = self.per_engine_labelvalues[engine_idx] + [
+            snapshot["stage"],
+            snapshot["rank"],
+        ]
+        for field in ("queued", "active", "oldest_pending_seconds"):
+            self._pipeline_metrics[field].labels(*labels).set(snapshot[field])
+        for field, samples in (
+            ("queue_wait_seconds", snapshot["queue_wait_seconds"]),
+            ("execution_seconds", snapshot["execution_seconds"]),
+            ("consumption_wait_seconds", snapshot.get("consumption_wait_seconds", [])),
+        ):
+            for value in samples:
+                self._pipeline_metrics[field].labels(*labels).observe(value)

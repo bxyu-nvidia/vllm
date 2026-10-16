@@ -191,6 +191,7 @@ class SchedulerStats:
     num_waiting_reqs: int = 0  # waiting requests not deferred
     # waiting requests deferred by transient constraints or a blocked status
     num_skipped_waiting_reqs: int = 0
+    deferred_waiting_reasons: dict[str, int] = field(default_factory=dict)
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0

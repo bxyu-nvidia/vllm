@@ -2319,6 +2319,7 @@ def test_scheduler_stats_waiting_queues():
     assert stats.num_running_reqs == 2  # 2 were scheduled
     assert stats.num_waiting_reqs == 1  # 1 waiting on capacity
     assert stats.num_skipped_waiting_reqs == 2  # 2 blocked by constraints
+    assert stats.deferred_waiting_reasons == {"grammar": 2}
 
 
 def _assert_right_scheduler_output(
@@ -7226,3 +7227,24 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
     assert "read" not in scheduler.schedule().num_scheduled_tokens
     assert read.next_decode_eligible_step == 7
+
+
+def test_deferred_reasons_follow_lookup_then_remote_load_and_cleanup():
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(
+            matched_tokens=32, is_async=True, num_defers_before_matching=1
+        ),
+        block_size=16,
+    )
+    request = create_requests(num_requests=1, num_tokens=64)[0]
+    scheduler.add_request(request)
+    scheduler.schedule()
+    assert scheduler.make_stats().deferred_waiting_reasons == {
+        "external_cache_lookup": 1
+    }
+    outputs = _step_until_kv_transfer_finished(scheduler, [request.request_id])
+    assert outputs[0].scheduler_stats.deferred_waiting_reasons == {"remote_kv_load": 1}
+    scheduler.schedule()
+    assert scheduler.make_stats().deferred_waiting_reasons == {}
+    assert not scheduler._deferred_reasons
