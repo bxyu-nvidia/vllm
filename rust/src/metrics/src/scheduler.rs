@@ -118,6 +118,37 @@ pub type MooncakeOperationHistogramFamily =
     Family<MooncakeOperationLabels, Histogram, fn() -> Histogram>;
 pub type MooncakeOperationCounterFamily = Family<MooncakeOperationLabels, U64Counter>;
 
+/// Pipeline backlog and timing labels; rank -1 denotes scheduler-side work.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct MooncakePipelineLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub stage: String,
+    pub rank: i32,
+}
+
+pub type MooncakePipelineHistogramFamily =
+    Family<MooncakePipelineLabels, Histogram, fn() -> Histogram>;
+
+fn mooncake_pipeline_histogram() -> Histogram {
+    Histogram::new(
+        [
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+        ]
+        .into_iter(),
+    )
+}
+
+pub const DEFERRED_REASONS: [&str; 7] = [
+    "external_cache_lookup",
+    "remote_kv_load",
+    "grammar",
+    "streaming_input",
+    "lora_limit",
+    "encoder_cache_load",
+    "other",
+];
+
 /// Adapter names encoded as a deterministic comma-joined Prometheus label value.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct LoraAdapterNames(pub BTreeSet<String>);
@@ -225,6 +256,7 @@ pub struct SchedulerMetrics {
     pub scheduler_running: Family<EngineLabels, U64Gauge>,
     pub scheduler_waiting: Family<EngineLabels, U64Gauge>,
     pub scheduler_waiting_by_reason: Family<WaitingReasonLabels, U64Gauge>,
+    pub scheduler_deferred_by_reason: Family<WaitingReasonLabels, U64Gauge>,
     pub kv_cache_usage: Family<EngineLabels, F64Gauge>,
 
     /// `vllm:lora_requests_info`. Value is the emit-time unix timestamp in
@@ -259,6 +291,12 @@ pub struct SchedulerMetrics {
     pub mooncake_operation_keys_total: MooncakeOperationCounterFamily,
     pub mooncake_operation_bytes_total: MooncakeOperationCounterFamily,
     pub mooncake_operation_failed_keys_total: MooncakeOperationCounterFamily,
+
+    pub mooncake_pipeline_queued: Family<MooncakePipelineLabels, U64Gauge>,
+    pub mooncake_pipeline_active: Family<MooncakePipelineLabels, U64Gauge>,
+    pub mooncake_pipeline_oldest_pending_seconds: Family<MooncakePipelineLabels, F64Gauge>,
+    pub mooncake_pipeline_queue_wait_seconds: MooncakePipelineHistogramFamily,
+    pub mooncake_pipeline_execution_seconds: MooncakePipelineHistogramFamily,
 
     // NIXL connector telemetry. Mirrors `NixlPromMetrics`.
     pub nixl_xfer_time_seconds: HistogramFamily,
@@ -421,6 +459,45 @@ impl SchedulerMetrics {
             kv_block_reuse_gap_seconds.clone(),
         );
 
+        let scheduler_deferred_by_reason = Family::default();
+        registry.register(
+            "vllm:num_requests_deferred_by_reason",
+            "Deferred requests by last observed scheduler dependency.",
+            scheduler_deferred_by_reason.clone(),
+        );
+        let mooncake_pipeline_queued = Family::default();
+        registry.register(
+            "vllm:mooncake_pipeline_queued",
+            "Mooncake pipeline queued; rank -1 is engine-wide, other ranks are workers.",
+            mooncake_pipeline_queued.clone(),
+        );
+        let mooncake_pipeline_active = Family::default();
+        registry.register(
+            "vllm:mooncake_pipeline_active",
+            "Mooncake pipeline active; rank -1 is engine-wide, other ranks are workers.",
+            mooncake_pipeline_active.clone(),
+        );
+        let mooncake_pipeline_oldest_pending_seconds = Family::default();
+        registry.register(
+            "vllm:mooncake_pipeline_oldest_pending_seconds",
+            "Mooncake pipeline oldest_pending_seconds; rank -1 is engine-wide, other ranks are workers.",
+            mooncake_pipeline_oldest_pending_seconds.clone(),
+        );
+        let mooncake_pipeline_queue_wait_seconds =
+            Family::new_with_constructor(mooncake_pipeline_histogram as fn() -> Histogram);
+        registry.register(
+            "vllm:mooncake_pipeline_queue_wait_seconds",
+            "Mooncake pipeline queue_wait_seconds; rank -1 is engine-wide, other ranks are workers.",
+            mooncake_pipeline_queue_wait_seconds.clone(),
+        );
+        let mooncake_pipeline_execution_seconds =
+            Family::new_with_constructor(mooncake_pipeline_histogram as fn() -> Histogram);
+        registry.register(
+            "vllm:mooncake_pipeline_execution_seconds",
+            "Mooncake pipeline execution_seconds; rank -1 is engine-wide, other ranks are workers.",
+            mooncake_pipeline_execution_seconds.clone(),
+        );
+
         // Mooncake store connector telemetry.
         let mooncake_operation_time_seconds =
             Family::new_with_constructor(mooncake_operation_time_histogram as fn() -> Histogram);
@@ -522,6 +599,7 @@ impl SchedulerMetrics {
             scheduler_running,
             scheduler_waiting,
             scheduler_waiting_by_reason,
+            scheduler_deferred_by_reason,
             kv_cache_usage,
             lora_info,
             prefix_cache_queries,
@@ -538,6 +616,11 @@ impl SchedulerMetrics {
             kv_block_lifetime_seconds,
             kv_block_idle_before_evict_seconds,
             kv_block_reuse_gap_seconds,
+            mooncake_pipeline_queued,
+            mooncake_pipeline_active,
+            mooncake_pipeline_oldest_pending_seconds,
+            mooncake_pipeline_queue_wait_seconds,
+            mooncake_pipeline_execution_seconds,
             mooncake_operation_time_seconds,
             mooncake_operation_total,
             mooncake_operation_keys_total,

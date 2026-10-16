@@ -2837,7 +2837,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
     assert!(matches!(
         mooncake_stats,
         KvConnectorStats::Mooncake(stats)
-            if stats.0.contains_key(&MooncakeOperation::LoadGet)
+            if stats.operations.contains_key(&MooncakeOperation::LoadGet)
     ));
 
     let multi_connector_stats: KvConnectorStats =

@@ -10,6 +10,7 @@ import queue
 import sys
 import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -43,6 +44,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.pipeline import (
+    PIPELINE_KEY,
+    PipelineTracker,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
@@ -3518,6 +3523,7 @@ def _make_bare_worker(
     worker.kv_recv_threads = []
     worker.num_recv_threads = 1
     worker.recv_request_queue = queue.Queue()
+    worker.load_pipeline = PipelineTracker("load", 0)
     worker.finished_store_req = set()
     worker.tp_size = 1
     worker.store_tp_size = None
@@ -4240,7 +4246,11 @@ def test_start_load_kv_queues_async_load():
     w.start_load_kv(meta)
 
     assert req.load_spec.token_len == 32
-    assert w.recv_request_queue.get_nowait() is req
+    queued, ticket = w.recv_request_queue.get_nowait()
+    assert queued is req
+    assert w.load_pipeline.snapshot()["queued"] == 1
+    w.load_pipeline.start(ticket)
+    w.load_pipeline.finish(ticket)
 
 
 def test_putting_consumer_queues_decode_save():
@@ -4779,7 +4789,10 @@ def test_worker_get_kv_connector_stats_resets_after_read():
 
     assert isinstance(stats, MooncakeStoreConnectorStats)
     assert stats.data["save_put"][0]["num_bytes"] == 128
-    assert worker.get_kv_connector_stats() is None
+    next_stats = worker.get_kv_connector_stats()
+    assert set(next_stats.data) == {PIPELINE_KEY}
+    assert next_stats.data[PIPELINE_KEY][0]["queued"] == 0
+    assert next_stats.data[PIPELINE_KEY][0]["active"] == 0
 
 
 def test_lookup_records_mooncake_metrics():
@@ -4854,3 +4867,136 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+def test_pipeline_tracks_queue_execution_and_oldest_age_without_completed_jobs():
+    now = [10.0]
+    tracker = PipelineTracker("lookup", -1, clock=lambda: now[0])
+    first = tracker.enqueue()
+    now[0] = 12.0
+    tracker.start(first)
+    second = tracker.enqueue()
+    now[0] = 15.0
+    pending = tracker.snapshot()
+    assert (pending["queued"], pending["active"]) == (1, 1)
+    assert pending["oldest_pending_seconds"] == 5.0
+    assert pending["queue_wait_seconds"] == [2.0]
+    assert pending["execution_seconds"] == []
+    tracker.finish(second)  # Cancel a job before it starts.
+    tracker.finish(first)
+    done = tracker.snapshot()
+    assert (done["queued"], done["active"], done["oldest_pending_seconds"]) == (0, 0, 0)
+    assert done["execution_seconds"] == [3.0]
+    assert done["queue_wait_seconds"] == []
+    assert tracker.snapshot()["execution_seconds"] == []
+
+
+def test_lookup_pipeline_cleans_up_cancelled_and_failed_jobs():
+    client = worker.LookupKeyClient.__new__(worker.LookupKeyClient)
+    client.pipeline = PipelineTracker("lookup", -1)
+    client.futures = {}
+    entered, release = threading.Event(), threading.Event()
+
+    def lookup(num_tokens, hashes):
+        if num_tokens == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+            return MooncakeLookupResult(1)
+        raise RuntimeError("lookup failed")
+
+    client._lookup = lookup
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        client.executor = executor
+        try:
+            assert client.lookup("first", 1, [], non_block=True) is None
+            assert entered.wait(timeout=5)
+            assert client.lookup("cancelled", 2, [], non_block=True) is None
+            pending = client.pipeline.snapshot()
+            assert (pending["queued"], pending["active"]) == (1, 1)
+            client.discard("cancelled")
+            assert client.pipeline.snapshot()["queued"] == 0
+        finally:
+            release.set()
+        assert client.lookup("first", 1, []).hit_length == 1
+        assert client.lookup("failed", 2, []).hit_length == 0
+    done = client.pipeline.snapshot()
+    assert (done["queued"], done["active"]) == (0, 0)
+    assert len(done["execution_seconds"]) == 2
+    assert not client.futures
+
+
+def test_load_pipeline_cleans_up_on_handler_exception():
+    tracker = PipelineTracker("load", 2)
+    transfer = worker.KVTransferThread(
+        MagicMock(), [], 16, 2, threading.Event(), "test-load"
+    )
+    transfer.pipeline_tracker = tracker
+    ticket = tracker.enqueue()
+    transfer.request_queue = MagicMock()
+    transfer.request_queue.get.side_effect = [
+        (SimpleNamespace(req_id="load"), ticket),
+        KeyboardInterrupt(),
+    ]
+    transfer._handle_request = MagicMock(side_effect=RuntimeError("load failed"))
+    with pytest.raises(KeyboardInterrupt):
+        transfer.run()
+    done = tracker.snapshot()
+    assert (done["queued"], done["active"]) == (0, 0)
+    assert len(done["execution_seconds"]) == 1
+
+
+def test_pipeline_aggregation_preserves_ranks_and_replaces_live_gauges():
+    now = [0.0]
+    rank0 = PipelineTracker("load", 0, clock=lambda: now[0])
+    rank1 = PipelineTracker("load", 1, clock=lambda: now[0])
+    ticket = rank0.enqueue()
+    now[0] = 2.0
+    rank0.start(ticket)
+    stats = MooncakeStoreConnectorStats(data={PIPELINE_KEY: [rank0.snapshot()]})
+    stats.aggregate(
+        MooncakeStoreConnectorStats(data={PIPELINE_KEY: [rank1.snapshot()]})
+    )
+    now[0] = 5.0
+    rank0.finish(ticket)
+    stats.aggregate(
+        MooncakeStoreConnectorStats(data={PIPELINE_KEY: [rank0.snapshot()]})
+    )
+    snapshots = {s["rank"]: s for s in stats.data[PIPELINE_KEY]}
+    assert set(snapshots) == {0, 1}
+    assert snapshots[0]["active"] == 0
+    assert snapshots[0]["queue_wait_seconds"] == [2.0]
+    assert snapshots[0]["execution_seconds"] == [3.0]
+    assert stats.reduce()["load_rank0_active"] == 0
+
+
+def test_pipeline_prometheus_exports_backlog_and_resets_to_zero():
+    from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
+        MooncakeStorePromMetrics,
+    )
+
+    registry = CollectorRegistry()
+    from functools import partial
+
+    metrics = MooncakeStorePromMetrics(
+        SimpleNamespace(kv_transfer_config=None),
+        {cls: partial(cls, registry=registry) for cls in (Counter, Gauge, Histogram)},
+        ["engine"],
+        {0: ["0"]},
+    )
+    tracker = PipelineTracker("lookup", -1)
+    ticket = tracker.enqueue()
+    tracker.start(ticket)
+    metrics.observe({PIPELINE_KEY: [tracker.snapshot()]})
+    labels = {"engine": "0", "stage": "lookup", "rank": "-1"}
+    assert registry.get_sample_value("vllm:mooncake_pipeline_active", labels) == 1
+    tracker.finish(ticket)
+    metrics.observe({PIPELINE_KEY: [tracker.snapshot()]})
+    assert registry.get_sample_value("vllm:mooncake_pipeline_active", labels) == 0
+    assert (
+        registry.get_sample_value(
+            "vllm:mooncake_pipeline_execution_seconds_count", labels
+        )
+        == 1
+    )

@@ -50,6 +50,7 @@ from vllm.v1.request import Request
 
 from .data import MooncakeStoreConnectorMetadata
 from .metrics import MooncakeStoreConnectorStats, MooncakeStorePromMetrics
+from .pipeline import PIPELINE_KEY
 from .scheduler import MooncakeStoreScheduler
 from .worker import MooncakeStoreWorker
 
@@ -406,6 +407,15 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.connector_worker is None:
+            assert self.connector_scheduler is not None
+            if self.connector_scheduler.enable_lookup:
+                return MooncakeStoreConnectorStats(
+                    data={
+                        PIPELINE_KEY: [
+                            self.connector_scheduler.client.pipeline.snapshot()
+                        ]
+                    }
+                )
             return None
         return self.connector_worker.get_kv_connector_stats()
 

@@ -1058,3 +1058,28 @@ def test_shutdown_scheduler_role_is_noop():
     # Scheduler role holds no store handle, so shutdown must be a safe no-op.
     assert connector.connector_worker is None
     connector.shutdown()
+
+
+def test_scheduler_pipeline_stats_are_available_before_lookup_completes():
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.pipeline import (
+        PIPELINE_KEY,
+        PipelineTracker,
+    )
+
+    connector = mooncake_store_connector.MooncakeStoreConnector.__new__(
+        mooncake_store_connector.MooncakeStoreConnector
+    )
+    tracker = PipelineTracker("lookup", -1)
+    connector.connector_worker = None
+    connector.connector_scheduler = SimpleNamespace(
+        enable_lookup=True, client=SimpleNamespace(pipeline=tracker)
+    )
+    ticket = tracker.enqueue()
+    stats = connector.get_kv_connector_stats()
+    assert stats.data[PIPELINE_KEY][0]["queued"] == 1
+    tracker.finish(ticket)
+    assert connector.get_kv_connector_stats().data[PIPELINE_KEY][0]["queued"] == 0
+    connector.connector_scheduler.enable_lookup = False
+    assert connector.get_kv_connector_stats() is None

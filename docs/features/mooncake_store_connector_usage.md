@@ -299,6 +299,60 @@ Tensor-parallel collectives and low-precision arithmetic are not bitwise
 invariant across TP sizes, so heterogeneous-TP reuse does not guarantee the
 same greedy output as recomputing the prefix at the decode TP size.
 
+## Diagnosing lookup and load queues
+
+Both the Python and Rust frontends expose pipeline metrics on `/metrics` when
+engine statistics are enabled. No extra Mooncake flag is required. The Rust
+frontend must be rebuilt together with these Python changes.
+
+All `vllm:mooncake_pipeline_*` metrics have `stage` (`lookup` or `load`) and
+`rank` labels in addition to the normal model and engine labels. Lookup uses
+`rank="-1"` and counts work once per engine. Load uses the worker's global rank:
+a logical TP4 load can produce four worker jobs. Do not sum worker jobs and
+interpret that sum as distinct requests.
+
+| Metric | Meaning |
+| --- | --- |
+| `vllm:mooncake_pipeline_queued` | Jobs submitted but not yet executing. |
+| `vllm:mooncake_pipeline_active` | Jobs currently executing. |
+| `vllm:mooncake_pipeline_oldest_pending_seconds` | Age since enqueue of the oldest queued or active job; zero when idle. |
+| `vllm:mooncake_pipeline_queue_wait_seconds` | Histogram from enqueue to execution start. |
+| `vllm:mooncake_pipeline_execution_seconds` | Histogram from execution start to return, including failed executions. |
+
+Lookup execution includes serialization, ZMQ round-trip, and the lookup server's
+work; it is not a pure Mooncake RPC timer. Load execution covers the receive
+handler, including preparation and any split read batches. Existing
+`vllm:mooncake_store_operation_time_seconds` measurements (`lookup_exists` and
+`load_get`) cover the narrower store operations. Cancelled jobs that never start
+are removed from backlog counts without recording an execution sample.
+
+Gauges are snapshots delivered with engine statistics, not an independent
+heartbeat. An entirely stalled engine can leave its last snapshot unchanged.
+Histograms contain observations only when a stage starts or finishes; use live
+backlog and oldest age to investigate operations still in progress.
+
+`vllm:num_requests_deferred_by_reason` counts logical requests once per engine,
+with reasons `external_cache_lookup`, `remote_kv_load`, `grammar`,
+`streaming_input`, `lora_limit`, `encoder_cache_load`, and `other`. It reports the
+last observed scheduler dependency; `remote_kv_load` includes any KV connector,
+not only Mooncake. The existing waiting-by-reason metric remains unchanged.
+
+For example, compare pending lookup and load work:
+
+```promql
+sum by (engine, stage, rank) (vllm:mooncake_pipeline_queued)
+```
+
+And inspect p95 queue time without mixing engines or worker ranks:
+
+```promql
+histogram_quantile(0.95,
+  sum by (le, engine, stage, rank) (
+    rate(vllm:mooncake_pipeline_queue_wait_seconds_bucket[5m])
+  )
+)
+```
+
 ## Notes
 
 ### Reproducible Block Hashes Across Processes

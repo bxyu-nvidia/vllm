@@ -537,6 +537,30 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             multiprocess_mode="mostrecent",
             labelnames=labelnames + ["reason"],
         )
+        deferred_gauge = self._gauge_cls(
+            name="vllm:num_requests_deferred_by_reason",
+            documentation="Deferred requests by last observed scheduler dependency.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames + ["reason"],
+        )
+        self.gauge_deferred_by_reason = {
+            reason: create_metric_per_engine(
+                deferred_gauge,
+                {
+                    idx: values + [reason]
+                    for idx, values in per_engine_labelvalues.items()
+                },
+            )
+            for reason in (
+                "external_cache_lookup",
+                "remote_kv_load",
+                "grammar",
+                "streaming_input",
+                "lora_limit",
+                "encoder_cache_load",
+                "other",
+            )
+        }
         self.gauge_waiting_by_reason: dict[str, dict[int, Gauge]] = {}
         for waiting_reason in [WAITING_REASON_CAPACITY, WAITING_REASON_DEFERRED]:
             per_engine_labelvalues_with_reason = {
@@ -1047,6 +1071,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_waiting_by_reason[WAITING_REASON_DEFERRED][engine_idx].set(
                 scheduler_stats.num_skipped_waiting_reqs
             )
+            for reason, gauges in self.gauge_deferred_by_reason.items():
+                gauges[engine_idx].set(
+                    scheduler_stats.deferred_waiting_reasons.get(reason, 0)
+                )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
 
             self.counter_prefix_cache_queries[engine_idx].inc(
