@@ -922,14 +922,16 @@ class Scheduler(SchedulerInterface):
             # Bound extra CPU work too when most queued requests have no result.
             prefetch_scan_budget = self.max_num_active_reqs
             budget_block_recorded = False
+            alignment_blocked = False
             while True:
                 # Requests holding KV blocks are always drained first.
                 request_queue = self.kv_holding_waiting or self.waiting
                 if not request_queue:
                     break
-                prefetch_only = token_budget <= 0 or input_budget <= draft_slots
+                budget_exhausted = token_budget <= 0 or input_budget <= draft_slots
+                prefetch_only = budget_exhausted or alignment_blocked
                 if prefetch_only:
-                    if not budget_block_recorded:
+                    if budget_exhausted and not budget_block_recorded:
                         self._record_admission_blocked(
                             "token_budget" if token_budget <= 0 else "input_budget"
                         )
@@ -1222,7 +1224,14 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             self._record_admission_blocked("mamba_alignment")
-                            break
+                            if prefetch_limit == 0:
+                                break
+                            # Remaining tokens cannot advance this request, but
+                            # ready async loads behind it need no compute tokens.
+                            # Preserve compute order and only scan for prefetches.
+                            alignment_blocked = True
+                            park_request(request_queue)
+                            continue
                         if (
                             pad_spec_decode
                             and num_new_tokens != 1 + self.num_spec_tokens

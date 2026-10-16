@@ -494,7 +494,7 @@ class KVConnectorBase_V1(ABC):
         return None
 
     def get_async_prefetch_limit(self, *, request: "Request | None" = None) -> int:
-        """Maximum waiting loads allowed when the compute budget is exhausted.
+        """Maximum waiting loads when budget or alignment blocks compute admission.
 
         Zero disables extra prefetching. Completed loads waiting for admission
         count toward this limit too; normal budgeted admission is unchanged.

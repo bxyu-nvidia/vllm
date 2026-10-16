@@ -559,7 +559,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         prefetch_events_counter = self._counter_cls(
             name="vllm:kv_prefetch_events",
             documentation=(
-                "Extra async prefetch events after compute budget exhaustion."
+                "Extra async prefetch events after budget or alignment blocks compute."
             ),
             labelnames=labelnames + ["reason"],
         )

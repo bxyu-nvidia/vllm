@@ -7276,32 +7276,44 @@ def test_lookup_polling_and_ready_reason_do_not_require_compute_budget(monkeypat
     "limit,num_blocks,expected_loads", [(0, 100, 0), (1, 100, 1), (1, 6, 0)]
 )
 @pytest.mark.parametrize("async_scheduling", [False, True])
-def test_budget_exhausted_prefetch_is_bounded_and_reserves_full_context(
+@pytest.mark.parametrize(
+    "alignment_blocked", [False, True], ids=["budget", "alignment"]
+)
+def test_extra_prefetch_is_bounded_and_reserves_full_context(
     monkeypatch,
     limit,
     num_blocks,
     expected_loads,
     async_scheduling,
+    alignment_blocked,
 ):
     scheduler = create_scheduler(
         async_scheduling=async_scheduling,
-        max_num_batched_tokens=16,
+        max_num_batched_tokens=24 if alignment_blocked else 16,
         max_model_len=128,
         max_num_seqs=8,
         num_blocks=num_blocks,
         block_size=16,
         use_kv_connector=mock_kv(32, True),
     )
-    active, first, second = create_requests(num_requests=3, num_tokens=64)
+    scheduler.need_mamba_block_aligned_split = alignment_blocked
+    active, blocked, first, second = create_requests(num_requests=4, num_tokens=64)
+    # Real alignment: 16 tokens scheduled from a budget of 24 leaves 8,
+    # which cannot advance the next fresh request to its 16-token boundary.
     connector = scheduler.connector
     monkeypatch.setattr(connector, "get_async_prefetch_limit", lambda **kw: limit)
     monkeypatch.setattr(connector, "is_lookup_ready", lambda req: True)
     monkeypatch.setattr(
         connector,
         "get_num_new_matched_tokens",
-        lambda req, computed: (0, False) if req is active else (32, True),
+        lambda req, computed: (0, False) if req in (active, blocked) else (32, True),
     )
-    for request in (active, first, second):
+    requests = (
+        (active, blocked, first, second)
+        if alignment_blocked
+        else (active, first, second)
+    )
+    for request in requests:
         scheduler.add_request(request)
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {active.request_id: 16}
@@ -7310,9 +7322,15 @@ def test_budget_exhausted_prefetch_is_bounded_and_reserves_full_context(
     ]
     assert len(loads) == expected_loads
     stats = scheduler.make_stats()
-    assert stats.admission_blocked["token_budget"] == 1
+    reason = "mamba_alignment" if alignment_blocked else "token_budget"
+    assert stats.admission_blocked[reason] == 1
+    if alignment_blocked:
+        assert "token_budget" not in stats.admission_blocked
+        assert "input_budget" not in stats.admission_blocked
+        assert scheduler.waiting.peek_request() is blocked
+        assert blocked.num_computed_tokens == 0
     if limit == 0:
-        assert stats.prefetch_events == {"disabled": 1}
+        assert stats.prefetch_events == ({} if alignment_blocked else {"disabled": 1})
     elif expected_loads:
         assert stats.prefetch_events == {
             "scanned": 1,
@@ -7348,13 +7366,21 @@ def test_budget_exhausted_prefetch_is_bounded_and_reserves_full_context(
         assert second.status == RequestStatus.WAITING
 
 
-def test_prefetch_scan_is_bounded_and_preserves_waiting_order(monkeypatch):
+@pytest.mark.parametrize(
+    "alignment_blocked", [False, True], ids=["budget", "alignment"]
+)
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_prefetch_scan_is_bounded_and_preserves_waiting_order(
+    monkeypatch, alignment_blocked, async_scheduling
+):
     scheduler = create_scheduler(
-        max_num_batched_tokens=16,
+        async_scheduling=async_scheduling,
+        max_num_batched_tokens=24 if alignment_blocked else 16,
         max_model_len=128,
         max_num_seqs=4,
         use_kv_connector=mock_kv(0, False),
     )
+    scheduler.need_mamba_block_aligned_split = alignment_blocked
     requests = create_requests(num_requests=20, num_tokens=64)
     readiness = Mock(return_value=False)
     monkeypatch.setattr(scheduler.connector, "is_lookup_ready", readiness)
@@ -7371,6 +7397,11 @@ def test_prefetch_scan_is_bounded_and_preserves_waiting_order(monkeypatch):
     }
     assert list(scheduler.waiting) == requests[1:]
     assert not scheduler.deferred_waiting
+
+    # The parked compute request keeps its place and can run on the next step.
+    scheduler.finish_requests(requests[0].request_id, RequestStatus.FINISHED_ABORTED)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {requests[1].request_id: 16}
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])

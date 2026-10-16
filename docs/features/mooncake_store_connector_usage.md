@@ -275,7 +275,7 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread so it never blocks the scheduler step. The request is held until the in-flight lookup completes, then resumed on a later step. Default: `false`.
-- `async_prefetch_limit` (int): With `lookup_async=true` and `load_async=true`, allow ready Mooncake hits to start loading even after the scheduler exhausts its compute-token budget. Default: `4` waiting loads per engine; `0` disables this extra prefetching. Both in-flight loads and completed loads awaiting compute admission count toward the limit. Normal budgeted admission is unchanged. Prefetching retains sequence-slot, LoRA, and full-context KV reservation checks. With `MultiConnector`, all child lookups must report readiness, and the selected loading connector must opt in; NIXL + Mooncake supports this.
+- `async_prefetch_limit` (int): With `lookup_async=true` and `load_async=true`, allow ready Mooncake hits to start loading after the scheduler exhausts its compute-token budget or Mamba alignment prevents the next waiting request from using the remaining tokens. Default: `4` waiting loads per engine; `0` disables this extra prefetching. Both in-flight loads and completed loads awaiting compute admission count toward the limit. Normal budgeted admission is unchanged. Prefetching retains sequence-slot, LoRA, and full-context KV reservation checks. With `MultiConnector`, all child lookups must report readiness, and the selected loading connector must opt in; NIXL + Mooncake supports this.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `cache_prefix` (str): Namespace prepended to every store key. Lets separate deployments share one Mooncake master without polluting each other — instances configured with different prefixes never see each other's cached blocks, even for identical prompts. All instances that should share a prefix cache must use the same value. Default: `""` (no prefix; keys are byte-identical to the unprefixed format).
 - `save_decode_cache` (bool): Enable offloading decode tokens' KV cache. A `kv_consumer` does not save during prefill; when decode starts, it fills any missing block-aligned prompt prefix before appending completed decode blocks. Default: `false`.
@@ -326,7 +326,8 @@ frontends export them with `model_name`, `engine`, and `reason` labels:
   `mamba_alignment`, `encoder_or_lookahead`, `lora_limit`, `stale_output`,
   `preemption`, and `paused`.
 - `vllm:kv_prefetch_events_total`: only the **extra** prefetch path after compute
-  budget exhaustion; ordinary budgeted async loads are excluded. `scanned`
+  budget exhaustion or an alignment-blocked admission; ordinary budgeted async
+  loads are excluded. `scanned`
   counts inspected candidates; `ineligible` means a candidate is not a fresh
   waiting/preempted request with a ready lookup. `attempted` counts candidates
   that pass that gate. `no_async_load` means lookup did not select an async load;
@@ -335,6 +336,13 @@ frontends export them with `model_name`, `engine`, and `reason` labels:
   were allocated and the request entered remote-load waiting, **not** that the
   transfer completed. `disabled`, `limit`, and `scan_limit` count loop stops
   with queued work. They count stops, not rejected requests.
+
+When alignment blocks admission, the scheduler parks that compute request for
+this step and scans only for ready async loads behind it, with the same scan,
+load-count, and KV reservation limits. Parked requests retain their queue order;
+compute admission resumes on the next scheduler step. `mamba_alignment` remains
+the recorded reason; the transition does not report a false exhausted budget.
+Setting `async_prefetch_limit=0` preserves the original stop at alignment.
 
 These counters accumulate across scheduler calls and drain once into each stats
 update. They count events, not unique requests or time spent waiting; a request

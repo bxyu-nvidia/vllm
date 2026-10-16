@@ -475,7 +475,7 @@ impl SchedulerMetrics {
         let prefetch_events = Family::default();
         registry.register(
             "vllm:kv_prefetch_events",
-            "Extra async prefetch events after compute budget exhaustion.",
+            "Extra async prefetch events after budget or alignment blocks compute.",
             prefetch_events.clone(),
         );
         let scheduler_deferred_by_reason = Family::default();
