@@ -155,6 +155,53 @@ def test_flashinfer_replayssm_rejects_microbatching():
         VllmConfig.validate_mamba_cached_kernel(config)
 
 
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize(
+    "connectors",
+    [
+        ["NixlConnector"],
+        ["MooncakeStoreConnector"],
+        ["NixlConnector", "MooncakeStoreConnector"],
+        ["NixlConnector", "OffloadingConnector"],
+        ["ExampleConnector"],
+    ],
+)
+@pytest.mark.parametrize("runner_v2", [False, True])
+def test_replayssm_kv_transfer_requires_canonical_state_connectors(
+    role, connectors, runner_v2
+):
+    transfer = KVTransferConfig(
+        kv_connector=connectors[0] if len(connectors) == 1 else "MultiConnector",
+        kv_role=role,
+        kv_connector_extra_config={
+            "connectors": [{"kv_connector": c, "kv_role": role} for c in connectors]
+        },
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            use_replayssm=True, mamba_cache_mode="align", replayssm_buffer_len=16
+        ),
+        num_speculative_tokens=5,
+        model_config=SimpleNamespace(
+            supports_replayssm=True,
+            architecture="NemotronHForCausalLM",
+            dtype=torch.bfloat16,
+        ),
+        mamba_config=SimpleNamespace(backend=MambaBackendEnum.FLASHINFER),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1, use_ubatching=False),
+        kv_transfer_config=transfer,
+        use_v2_model_runner=runner_v2,
+    )
+    if runner_v2:
+        with pytest.raises(ValueError, match="VLLM_USE_V2_MODEL_RUNNER=0"):
+            VllmConfig.validate_mamba_cached_kernel(config)
+    elif set(connectors) <= {"NixlConnector", "MooncakeStoreConnector"}:
+        assert VllmConfig.validate_mamba_cached_kernel(config) is config
+    else:
+        with pytest.raises(ValueError, match="supports only NixlConnector"):
+            VllmConfig.validate_mamba_cached_kernel(config)
+
+
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")

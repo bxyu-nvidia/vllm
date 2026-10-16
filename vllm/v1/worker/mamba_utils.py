@@ -840,6 +840,7 @@ class MambaSpecDecodeGPUContext:
     num_computed_tokens_buf: CpuGpuBuffer | None = None
     num_draft_tokens_buf: CpuGpuBuffer | None = None
     is_prefilling_buf: CpuGpuBuffer | None = None
+    is_prefill_tail_buf: CpuGpuBuffer | None = None
     precopy_src_col_buf: CpuGpuBuffer | None = None
     precopy_token_bias_buf: CpuGpuBuffer | None = None
 
@@ -938,6 +939,7 @@ class MambaSpecDecodeGPUContext:
             num_computed_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_draft_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             is_prefilling_buf=make_buffer(max_num_reqs, dtype=torch.bool),
+            is_prefill_tail_buf=make_buffer(max_num_reqs, dtype=torch.bool),
             precopy_src_col_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             precopy_token_bias_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             is_initialized=False,
@@ -1552,6 +1554,7 @@ def preprocess_mamba(
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         prev_state_idx = mamba_state_idx.get(req_id)
+        has_live_state = prev_state_idx is not None
         if prev_state_idx is None:
             # New / resumed request; num_computed_tokens == 0 gives -1.
             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
@@ -1576,10 +1579,10 @@ def preprocess_mamba(
         if fused is not None:
             fused.state_idx.np[i] = curr_state_idx
             if fused.ctx.replayssm is not None:
-                # A negative source means that this request has no live owner.
-                # Preserve same-column sources so ordinary decode steps are
-                # not mistaken for fresh slot ownership.
-                fused.src_col.np[i] = prev_state_idx
+                # New/resumed requests consume canonical checkpoints. Remote
+                # loads do not populate the replay rings or their cursors.
+                # Scheduling pauses retain their live owner and its cursors.
+                fused.src_col.np[i] = prev_state_idx if has_live_state else -1
 
         # Baseline Mamba migrates canonical state when ownership crosses a
         # column. ReplaySSM receives that ownership move through scheduler block
@@ -1750,6 +1753,11 @@ def postprocess_mamba_gpu(
             num_computed_is_post_step=False,
             num_accepted_tokens=accepted_tokens_for_postprocess,
             is_prefilling=ctx.is_prefilling_buf.gpu,
+            is_prefill_tail=(
+                ctx.is_prefill_tail_buf.gpu
+                if ctx.is_prefill_tail_buf is not None
+                else None
+            ),
             live_cols=live_cols,
             num_reqs=num_reqs,
         )
@@ -1780,6 +1788,7 @@ def stage_postprocess_inputs_to_gpu(
     assert ctx.num_computed_tokens_buf is not None
     assert ctx.num_draft_tokens_buf is not None
     assert ctx.is_prefilling_buf is not None
+    assert ctx.is_prefill_tail_buf is not None
 
     scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
     num_scheduled = scheduler_output.num_scheduled_tokens
@@ -1801,7 +1810,11 @@ def stage_postprocess_inputs_to_gpu(
         prefill_np[i] = computed < req_state.num_prompt_tokens and not (
             computed > 0 and (scheduled == 1 or scheduled == num_draft + 1)
         )
+        ctx.is_prefill_tail_buf.np[i] = (
+            computed < req_state.num_prompt_tokens and not prefill_np[i]
+        )
     ctx.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_computed_tokens_buf.copy_to_gpu(num_reqs)
     ctx.num_draft_tokens_buf.copy_to_gpu(num_reqs)
     ctx.is_prefilling_buf.copy_to_gpu(num_reqs)
+    ctx.is_prefill_tail_buf.copy_to_gpu(num_reqs)
