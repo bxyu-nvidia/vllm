@@ -35,6 +35,7 @@ class PipelineSnapshot(TypedDict):
     oldest_pending_seconds: float
     queue_wait_seconds: list[float]
     execution_seconds: list[float]
+    consumption_wait_seconds: list[float]
 
 
 class PipelineTracker:
@@ -59,6 +60,7 @@ class PipelineTracker:
         self._pending: dict[int, tuple[float, float | None]] = {}
         self._queue_wait: list[float] = []
         self._execution: list[float] = []
+        self._consumption_wait: list[float] = []
 
     def enqueue(self) -> int:
         with self._lock:
@@ -74,11 +76,19 @@ class PipelineTracker:
             self._pending[ticket] = (enqueued, now)
             self._queue_wait.append(now - enqueued)
 
-    def finish(self, ticket: int) -> None:
+    def finish(self, ticket: int) -> float:
+        """Finish execution and return its monotonic completion timestamp."""
         with self._lock:
+            now = self._clock()
             pending = self._pending.pop(ticket, None)
             if pending is not None and pending[1] is not None:
-                self._execution.append(self._clock() - pending[1])
+                self._execution.append(now - pending[1])
+            return now
+
+    def record_consumption(self, completed_at: float) -> None:
+        """Record the scheduler consuming a successful lookup result."""
+        with self._lock:
+            self._consumption_wait.append(self._clock() - completed_at)
 
     def snapshot(self) -> PipelineSnapshot:
         """Read live gauges and drain timing samples exactly once."""
@@ -97,7 +107,9 @@ class PipelineTracker:
                 oldest_pending_seconds=oldest,
                 queue_wait_seconds=self._queue_wait,
                 execution_seconds=self._execution,
+                consumption_wait_seconds=self._consumption_wait,
             )
             self._queue_wait = []
             self._execution = []
+            self._consumption_wait = []
             return result

@@ -59,10 +59,14 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
                     key = (record["stage"], record["rank"])
                     previous = snapshots.get(key)
                     latest = dict(record)
-                    for field in ("queue_wait_seconds", "execution_seconds"):
+                    for field in (
+                        "queue_wait_seconds",
+                        "execution_seconds",
+                        "consumption_wait_seconds",
+                    ):
                         latest[field] = (
-                            list(previous[field]) if previous else []
-                        ) + list(record[field])
+                            list(previous.get(field, [])) if previous else []
+                        ) + list(record.get(field, []))
                     snapshots[key] = latest
                 self.data[PIPELINE_KEY] = list(snapshots.values())
             else:
@@ -77,8 +81,12 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
                     prefix = f"{snapshot['stage']}_rank{snapshot['rank']}"
                     for name in ("queued", "active", "oldest_pending_seconds"):
                         reduced[f"{prefix}_{name}"] = snapshot[name]
-                    for name in ("queue_wait_seconds", "execution_seconds"):
-                        samples = snapshot[name]
+                    for name in (
+                        "queue_wait_seconds",
+                        "execution_seconds",
+                        "consumption_wait_seconds",
+                    ):
+                        samples = snapshot.get(name, [])
                         if samples:
                             reduced[f"{prefix}_{name}_avg"] = fmean(samples)
                 continue
@@ -151,7 +159,11 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
                 labelnames=pipeline_labels,
                 multiprocess_mode="mostrecent",
             )
-        for field in ("queue_wait_seconds", "execution_seconds"):
+        for field in (
+            "queue_wait_seconds",
+            "execution_seconds",
+            "consumption_wait_seconds",
+        ):
             self._pipeline_metrics[field] = self._histogram_cls(
                 name=f"vllm:mooncake_pipeline_{field}",
                 documentation=f"Mooncake pipeline {field}; rank -1 is engine-wide.",
@@ -249,6 +261,7 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         for field, samples in (
             ("queue_wait_seconds", snapshot["queue_wait_seconds"]),
             ("execution_seconds", snapshot["execution_seconds"]),
+            ("consumption_wait_seconds", snapshot.get("consumption_wait_seconds", [])),
         ):
             for value in samples:
                 self._pipeline_metrics[field].labels(*labels).observe(value)

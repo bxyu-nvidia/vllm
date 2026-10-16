@@ -2532,7 +2532,7 @@ class LookupKeyClient:
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="MooncakeLookupClient"
         )
-        self.futures: dict[str, Future[MooncakeLookupResult]] = {}
+        self.futures: dict[str, Future[tuple[MooncakeLookupResult, float]]] = {}
         self.pipeline = PipelineTracker("lookup", -1)
 
     def _lookup(
@@ -2551,12 +2551,13 @@ class LookupKeyClient:
 
     def _timed_lookup(
         self, ticket: int, num_tokens: int, block_hashes: list[BlockHash]
-    ) -> MooncakeLookupResult:
+    ) -> tuple[MooncakeLookupResult, float]:
         self.pipeline.start(ticket)
         try:
-            return self._lookup(num_tokens, block_hashes)
+            result = self._lookup(num_tokens, block_hashes)
         finally:
-            self.pipeline.finish(ticket)
+            completed_at = self.pipeline.finish(ticket)
+        return result, completed_at
 
     def lookup(
         self,
@@ -2584,7 +2585,9 @@ class LookupKeyClient:
         if non_block and not future.done():
             return None
         try:
-            return future.result()
+            result, completed_at = future.result()
+            self.pipeline.record_consumption(completed_at)
+            return result
         except Exception as e:
             logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
             return MooncakeLookupResult(0)

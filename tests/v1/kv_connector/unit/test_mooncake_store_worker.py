@@ -10,7 +10,7 @@ import queue
 import sys
 import threading
 import types
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -4891,6 +4891,54 @@ def test_pipeline_tracks_queue_execution_and_oldest_age_without_completed_jobs()
     assert tracker.snapshot()["execution_seconds"] == []
 
 
+@pytest.mark.parametrize("discard", [False, True])
+def test_lookup_completion_wait_excludes_execution_and_drains_once(discard):
+    """A ready result can wait for the scheduler after the pipeline is idle."""
+    now = [10.0]
+    client = worker.LookupKeyClient.__new__(worker.LookupKeyClient)
+    client.pipeline = PipelineTracker("lookup", -1, clock=lambda: now[0])
+    client.futures = {}
+    future: Future[tuple[MooncakeLookupResult, float]] = Future()
+    client.executor = MagicMock()
+    client.executor.submit.return_value = future
+
+    def lookup(num_tokens, hashes):
+        now[0] = 13.0
+        return MooncakeLookupResult(128)
+
+    client._lookup = lookup
+    assert client.lookup("req", 256, [], non_block=True) is None
+    assert client.lookup("req", 256, [], non_block=True) is None
+    client.executor.submit.assert_called_once()
+    now[0] = 12.0
+    future.set_running_or_notify_cancel()
+    if discard:
+        client.discard("req")  # An already-running lookup cannot be cancelled.
+    fn, *args = client.executor.submit.call_args.args
+    future.set_result(fn(*args))
+    completed = client.pipeline.snapshot()
+    assert (completed["queued"], completed["active"]) == (0, 0)
+    assert completed["queue_wait_seconds"] == [2.0]
+    assert completed["execution_seconds"] == [1.0]
+    assert completed["consumption_wait_seconds"] == []
+    stats = MooncakeStoreConnectorStats(data={PIPELINE_KEY: [completed]})
+    now[0] = 18.0
+    if not discard:
+        assert client.lookup("req", 256, [], non_block=True).hit_length == 128
+    assert not client.futures
+    stats.aggregate(
+        MooncakeStoreConnectorStats(data={PIPELINE_KEY: [client.pipeline.snapshot()]})
+    )
+    stats.aggregate(
+        MooncakeStoreConnectorStats(data={PIPELINE_KEY: [client.pipeline.snapshot()]})
+    )
+    assert stats.data[PIPELINE_KEY][0]["consumption_wait_seconds"] == (
+        [] if discard else [5.0]
+    )
+    if not discard:
+        assert stats.reduce()["lookup_rank-1_consumption_wait_seconds_avg"] == 5.0
+
+
 def test_lookup_pipeline_cleans_up_cancelled_and_failed_jobs():
     client = worker.LookupKeyClient.__new__(worker.LookupKeyClient)
     client.pipeline = PipelineTracker("lookup", -1)
@@ -4922,6 +4970,7 @@ def test_lookup_pipeline_cleans_up_cancelled_and_failed_jobs():
     done = client.pipeline.snapshot()
     assert (done["queued"], done["active"]) == (0, 0)
     assert len(done["execution_seconds"]) == 2
+    assert len(done["consumption_wait_seconds"]) == 1
     assert not client.futures
 
 
@@ -4985,13 +5034,17 @@ def test_pipeline_prometheus_exports_backlog_and_resets_to_zero():
         ["engine"],
         {0: ["0"]},
     )
-    tracker = PipelineTracker("lookup", -1)
+    now = [10.0]
+    tracker = PipelineTracker("lookup", -1, clock=lambda: now[0])
     ticket = tracker.enqueue()
     tracker.start(ticket)
     metrics.observe({PIPELINE_KEY: [tracker.snapshot()]})
     labels = {"engine": "0", "stage": "lookup", "rank": "-1"}
     assert registry.get_sample_value("vllm:mooncake_pipeline_active", labels) == 1
-    tracker.finish(ticket)
+    completed_at = tracker.finish(ticket)
+    now[0] = 12.0
+    tracker.record_consumption(completed_at)
+    metrics.observe({PIPELINE_KEY: [tracker.snapshot()]})
     metrics.observe({PIPELINE_KEY: [tracker.snapshot()]})
     assert registry.get_sample_value("vllm:mooncake_pipeline_active", labels) == 0
     assert (
@@ -4999,4 +5052,17 @@ def test_pipeline_prometheus_exports_backlog_and_resets_to_zero():
             "vllm:mooncake_pipeline_execution_seconds_count", labels
         )
         == 1
+    )
+
+    assert (
+        registry.get_sample_value(
+            "vllm:mooncake_pipeline_consumption_wait_seconds_count", labels
+        )
+        == 1
+    )
+    assert (
+        registry.get_sample_value(
+            "vllm:mooncake_pipeline_consumption_wait_seconds_sum", labels
+        )
+        == 2.0
     )

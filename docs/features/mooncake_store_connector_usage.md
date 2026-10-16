@@ -318,6 +318,7 @@ interpret that sum as distinct requests.
 | `vllm:mooncake_pipeline_oldest_pending_seconds` | Age since enqueue of the oldest queued or active job; zero when idle. |
 | `vllm:mooncake_pipeline_queue_wait_seconds` | Histogram from enqueue to execution start. |
 | `vllm:mooncake_pipeline_execution_seconds` | Histogram from execution start to return, including failed executions. |
+| `vllm:mooncake_pipeline_consumption_wait_seconds` | Histogram from successful lookup completion to the scheduler consuming its result (`stage="lookup"`, `rank="-1"` only). |
 
 Lookup execution includes serialization, ZMQ round-trip, and the lookup server's
 work; it is not a pure Mooncake RPC timer. Load execution covers the receive
@@ -326,9 +327,17 @@ handler, including preparation and any split read batches. Existing
 `load_get`) cover the narrower store operations. Cancelled jobs that never start
 are removed from backlog counts without recording an execution sample.
 
+Consumption wait is recorded once when the scheduler retrieves a successful
+lookup result, including a cache miss. It excludes queue wait and execution,
+and does not measure subsequent GPU admission delay. Failed, cancelled, or
+aborted lookups do not contribute a consumption sample. Completed lookups still
+awaiting consumption have not contributed a sample yet; they are also absent
+from the queued and active gauges. A large consumption wait explains how
+`external_cache_lookup` deferrals can remain high after lookup work finishes.
+
 Gauges are snapshots delivered with engine statistics, not an independent
 heartbeat. An entirely stalled engine can leave its last snapshot unchanged.
-Histograms contain observations only when a stage starts or finishes; use live
+Histograms contain observations only when the measured interval ends; use live
 backlog and oldest age to investigate operations still in progress.
 
 `vllm:num_requests_deferred_by_reason` counts logical requests once per engine,

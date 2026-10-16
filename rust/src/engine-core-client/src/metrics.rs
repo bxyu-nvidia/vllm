@@ -94,6 +94,7 @@ struct SchedulerStatsHandles {
     mooncake_pipeline_oldest_pending_seconds: Family<MooncakePipelineLabels, F64Gauge>,
     mooncake_pipeline_queue_wait_seconds: MooncakePipelineHistogramFamily,
     mooncake_pipeline_execution_seconds: MooncakePipelineHistogramFamily,
+    mooncake_pipeline_consumption_wait_seconds: MooncakePipelineHistogramFamily,
 
     // NIXL connector telemetry, decoded from `kv_connector_stats`.
     nixl_xfer_time_seconds: HistogramMetric,
@@ -210,6 +211,9 @@ fn resolve_scheduler_stats_handles(
             .clone(),
         mooncake_pipeline_queue_wait_seconds: metrics.mooncake_pipeline_queue_wait_seconds.clone(),
         mooncake_pipeline_execution_seconds: metrics.mooncake_pipeline_execution_seconds.clone(),
+        mooncake_pipeline_consumption_wait_seconds: metrics
+            .mooncake_pipeline_consumption_wait_seconds
+            .clone(),
         nixl_xfer_time_seconds: metrics.nixl_xfer_time_seconds.get_or_create_owned(&labels),
         nixl_post_time_seconds: metrics.nixl_post_time_seconds.get_or_create_owned(&labels),
         nixl_bytes_transferred: metrics.nixl_bytes_transferred.get_or_create_owned(&labels),
@@ -361,6 +365,12 @@ fn record_mooncake_stats(handles: &SchedulerStatsHandles, stats: &MooncakeStats)
         for value in &snapshot.execution_seconds {
             handles
                 .mooncake_pipeline_execution_seconds
+                .get_or_create(&labels)
+                .observe(*value);
+        }
+        for value in &snapshot.consumption_wait_seconds {
+            handles
+                .mooncake_pipeline_consumption_wait_seconds
                 .get_or_create(&labels)
                 .observe(*value);
         }
@@ -537,7 +547,8 @@ mod tests {
                 "_pipeline": [
                     {"stage": "lookup", "rank": -1, "queued": 2, "active": 1,
                      "oldest_pending_seconds": 7.0,
-                     "queue_wait_seconds": [2.0], "execution_seconds": [3.0]},
+                     "queue_wait_seconds": [2.0], "execution_seconds": [3.0],
+                     "consumption_wait_seconds": [0.25]},
                     {"stage": "load", "rank": 0, "queued": 0, "active": 1,
                      "oldest_pending_seconds": 4.0,
                      "queue_wait_seconds": [], "execution_seconds": []},
@@ -570,6 +581,7 @@ mod tests {
             "vllm:mooncake_pipeline_active{model_name=\"model\",engine=\"0\",stage=\"load\",rank=\"0\"} 1",
             "vllm:mooncake_pipeline_queued{model_name=\"model\",engine=\"0\",stage=\"load\",rank=\"1\"} 1",
             "vllm:mooncake_pipeline_execution_seconds_sum{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 3",
+            "vllm:mooncake_pipeline_consumption_wait_seconds_sum{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 0.25",
             "vllm:num_requests_deferred_by_reason{model_name=\"model\",engine=\"0\",reason=\"external_cache_lookup\"} 2",
         ] {
             assert!(rendered.contains(expected), "missing metric: {expected}");
@@ -586,6 +598,7 @@ mod tests {
             snapshot.oldest_pending_seconds = 0.0;
             snapshot.queue_wait_seconds.clear();
             snapshot.execution_seconds.clear();
+            snapshot.consumption_wait_seconds.clear();
         }
         super::record_scheduler_stats_with_handles(
             &handles,
@@ -603,6 +616,9 @@ mod tests {
         ));
         assert!(rendered.contains(
             "vllm:mooncake_pipeline_execution_seconds_count{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 1"
+        ));
+        assert!(rendered.contains(
+            "vllm:mooncake_pipeline_consumption_wait_seconds_count{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 1"
         ));
     }
 
