@@ -98,12 +98,16 @@ def _make_runner(
         max_model_len=MAX_MODEL_LEN,
         model_config=SimpleNamespace(get_vocab_size=lambda: 64),
         model_state=SimpleNamespace(max_encoder_len=0),
-        scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=2048),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=4, max_num_batched_tokens=2048, async_scheduling=False
+        ),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=kv_cache_groups, num_blocks=1024
         ),
         vllm_config=SimpleNamespace(
-            num_lookahead_tokens=num_lookahead_tokens, is_mm_encoder_only=False
+            num_lookahead_tokens=num_lookahead_tokens,
+            is_mm_encoder_only=False,
+            speculative_config=None,
         ),
         kv_block_zeroer=None,
         kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),

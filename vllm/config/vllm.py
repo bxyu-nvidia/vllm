@@ -1096,6 +1096,29 @@ class VllmConfig:
         ):
             return
 
+        if self.use_v2_model_runner and self.scheduler_config.async_scheduling:
+            from vllm.v1.spec_decode.dynamic.utils import (
+                build_dynamic_sd_schedule_lookup,
+            )
+
+            schedule = build_dynamic_sd_schedule_lookup(
+                speculative_config.num_speculative_tokens_per_batch_size,
+                vllm_max_batch_size=self.scheduler_config.max_num_seqs,
+                vllm_num_speculative_tokens=speculative_config.num_speculative_tokens,
+            )
+            # Constant schedules cannot select different K on different ranks.
+            # MRV2 uses the same draft execution path on real and dummy batches;
+            # async scheduling applies this K to target verification placeholders.
+            if len(set(schedule[1:])) == 1:
+                logger.info_once(
+                    "Keeping constant speculative-token schedule K=%d with data "
+                    "parallelism and V2 async scheduling. Retaining "
+                    "static draft capacity num_speculative_tokens=%d.",
+                    schedule[1],
+                    speculative_config.num_speculative_tokens,
+                )
+                return
+
         logger.warning_once(
             "Dynamic speculative decoding is not supported with data "
             "parallelism because data-parallel ranks can select different "

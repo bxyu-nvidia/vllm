@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.gpu import warmup
 from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
 
@@ -56,3 +57,44 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
     assert runner.adaptive_verification is manager
     assert manager.cost_tables is None
     assert rejection_sampler.enable_adaptive_verification
+
+
+@pytest.mark.parametrize("last_pp_rank", [False, True])
+@pytest.mark.parametrize(
+    "schedule,async_scheduling,expect_drafts",
+    [
+        ([(1, 1024, 0)], True, False),
+        ([(1, 4, 0), (5, 8, 3)], True, False),
+        ([(1, 2, 0), (3, 4, 3)], True, True),
+        ([(1, 4, 3)], True, True),
+        ([(1, 4, 0)], False, True),
+        (None, True, True),
+    ],
+)
+def test_kernel_warmup_does_not_consume_disabled_mtp_drafts(
+    monkeypatch, last_pp_rank, schedule, async_scheduling, expect_drafts
+):
+    from tests.v1.worker.test_gpu_warmup_blocks import (
+        _attention_group,
+        _make_runner,
+    )
+
+    runner = _make_runner([_attention_group()], 5, num_spec_steps=5)
+    runner.is_last_pp_rank = last_pp_rank
+    runner.scheduler_config.async_scheduling = async_scheduling
+    runner.vllm_config.speculative_config = SimpleNamespace(
+        num_speculative_tokens_per_batch_size=schedule
+    )
+    # No GPU kernels run: inspect the actual hand-built SchedulerOutputs.
+    monkeypatch.setattr(warmup.torch.accelerator, "synchronize", lambda: None)
+    outputs: list[SchedulerOutput] = []
+    warmup.warmup_kernels(runner, outputs.append, lambda _: None)
+    decode_outputs = [o for o in outputs if o.scheduled_cached_reqs.req_ids]
+    assert decode_outputs
+    assert set(outputs[0].num_scheduled_tokens.values()) == {7}
+    assert any(o.scheduled_spec_decode_tokens for o in decode_outputs) == expect_drafts
+    if not expect_drafts:
+        for output in decode_outputs:
+            assert set(output.num_scheduled_tokens.values()) == {1}
+    assert runner.num_speculative_steps == 5
+    assert runner.decode_query_len == 6

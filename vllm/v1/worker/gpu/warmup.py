@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
@@ -250,10 +251,26 @@ def _warmup_kernels(
 
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
-    # Use decode_query_len + 1 tokens so the prefill batch's per-request query
-    # length exceeds decode_query_len, preventing it from being misclassified as
-    # a uniform decode batch.
-    prompt_len = decode_query_len + 1
+    speculative_config = model_runner.vllm_config.speculative_config
+    if (
+        speculative_config is not None
+        and speculative_config.num_speculative_tokens_per_batch_size is not None
+        and model_runner.scheduler_config.async_scheduling
+    ):
+        schedule = build_dynamic_sd_schedule_lookup(
+            speculative_config.num_speculative_tokens_per_batch_size,
+            model_runner.scheduler_config.max_num_seqs,
+            num_spec_steps,
+        )
+        if all(k == 0 for k in schedule[1:]):
+            # Warmup bypasses the scheduler. A K=0 MTP proposer populates KV
+            # but returns invalid draft placeholders; never verify those as IDs.
+            # Derive this from config so every PP stage uses the same shapes.
+            num_spec_steps = 0
+            decode_query_len = 1
+    # Exceed the runner's static decode threshold even when K=0 warmup decodes
+    # use a single token, so this batch still exercises the prefill path.
+    prompt_len = model_runner.decode_query_len + 1
     prompt_token_ids = list(range(prompt_len))
     # Upper bound on the decode steps built in `decode_steps` below.
     num_decode_steps = 1
@@ -328,7 +345,7 @@ def _warmup_kernels(
     if model_runner.kv_block_zeroer is not None:
         model_runner.kv_block_zeroer.warmup(model_runner.kv_cache_config.num_blocks)
 
-    # Step 1: Prefill all requests with 1 + decode_query_len prompt tokens each.
+    # Step 1: Prefill all requests with prompt_len tokens each.
     new_reqs = [
         NewRequestData.from_request(
             Request(
