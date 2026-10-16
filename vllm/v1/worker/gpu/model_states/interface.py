@@ -17,6 +17,7 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
@@ -124,6 +125,12 @@ class ModelState(ABC):
         return None
 
     def apply_staged_writes(self) -> None:
+        return None
+
+    def initialize_kv_cache(
+        self, kv_cache_config: KVCacheConfig, block_tables: BlockTables
+    ) -> None:
+        """Hook run after the KV cache tensors are allocated and bound."""
         return None
 
     def get_additional_cg_support(self) -> tuple[AttentionCGSupport, str | None]:

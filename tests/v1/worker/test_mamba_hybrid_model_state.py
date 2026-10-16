@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+import vllm.utils.gpu_sync_debug as gsd
 from tests.v1.attention.test_gdn_metadata_builder import (
     BLOCK_SIZE,
     DEVICE,
@@ -21,31 +22,107 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMPostprocessMetadata,
 )
 from vllm.v1.worker.gpu.model_states import mamba_hybrid
-from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+    MambaHybridModelState,
+)
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 
 
-def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("use_flashinfer_replayssm", "expected_state_idx"), [(False, 2), (True, 2)]
+)
+def test_add_request_seeds_state_with_scoped_block_size(
+    use_flashinfer_replayssm: bool, expected_state_idx: int
+) -> None:
     state = object.__new__(MambaHybridModelState)
-    state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
+    state.rope_state = None
+    state.prompt_embeds_state = None
+    state.cache_config = SimpleNamespace(
+        block_size=16,
+        mamba_block_size=8,
+        mamba_cache_mode="align",
+    )
+    state._align_mode = True
+    state._use_flashinfer_replayssm = use_flashinfer_replayssm
+    state.num_accepted_tokens_gpu = torch.full((2,), 9, dtype=torch.int32)
+    state._mamba_state_idx_gpu = torch.full((2,), -1, dtype=torch.int32)
+
+    state.add_request(1, Mock(num_computed_tokens=17))
+
+    assert state.num_accepted_tokens_gpu.tolist() == [9, 1]
+    assert state._mamba_state_idx_gpu.tolist() == [-1, expected_state_idx]
+
+
+@pytest.mark.parametrize(
+    (
+        "computed",
+        "scheduled",
+        "drafts",
+        "prefilling",
+        "expected_prefilling",
+        "staging_device",
+    ),
+    [
+        pytest.param(256, 4, 3, True, False, "cpu", id="cpu-cached-tail"),
+        pytest.param(1, 4, 3, True, False, "cpu", id="cpu-short-prefix"),
+        pytest.param(256, 1, 0, True, False, "cpu", id="cpu-one-token-tail"),
+        pytest.param(0, 4, 3, True, True, "cpu", id="cpu-fresh-prefill"),
+        pytest.param(256, 4, 0, True, True, "cpu", id="cpu-chunked-prefill"),
+        pytest.param(256, 4, 3, False, False, "cpu", id="cpu-ordinary-decode"),
+        pytest.param(
+            256,
+            4,
+            3,
+            True,
+            False,
+            "cuda",
+            id="cuda-cached-tail",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+    computed,
+    scheduled,
+    drafts,
+    prefilling,
+    expected_prefilling,
+    staging_device,
+) -> None:
+    state = object.__new__(MambaHybridModelState)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=3)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
+    state._use_flashinfer_replayssm = True
+    if staging_device == "cpu":
+        monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    state._is_prefilling_gpu = torch.zeros(1, dtype=torch.bool, device=staging_device)
+    state._mamba_ctx = None
+    state.num_accepted_tokens_gpu = torch.ones(1, dtype=torch.int32)
+    state._get_mamba_group_info = Mock(return_value=([], None))
     state.recoverssm = None
 
-    positions = torch.tensor([1536], dtype=torch.int64)
+    positions = torch.arange(computed, computed + scheduled, dtype=torch.int64)
     input_batch = SimpleNamespace(
         num_reqs=1,
-        num_tokens=1,
+        num_tokens=scheduled,
         num_reqs_after_padding=1,
-        num_tokens_after_padding=1,
-        query_start_loc_np=torch.tensor([0, 1], dtype=torch.int32).numpy(),
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-        num_scheduled_tokens=torch.tensor([1], dtype=torch.int32),
+        num_tokens_after_padding=scheduled,
         max_query_len=None,
-        seq_lens_cpu_upper_bound=torch.tensor([1537], dtype=torch.int32),
-        seq_lens=torch.tensor([1537], dtype=torch.int32),
-        is_prefilling_np=torch.tensor([False]).numpy(),
-        prefill_runs_as_decode_np=None,
+        prefill_runs_as_decode_np=np.array(
+            [prefilling and computed > 0 and drafts > 0]
+        ),
+        query_start_loc_np=torch.tensor([0, scheduled], dtype=torch.int32).numpy(),
+        query_start_loc=torch.tensor([0, scheduled], dtype=torch.int32),
+        num_scheduled_tokens=torch.tensor([scheduled], dtype=torch.int32).numpy(),
+        num_draft_tokens_per_req=torch.tensor([drafts], dtype=torch.int32).numpy(),
+        idx_mapping=torch.tensor([0], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([computed + scheduled]),
+        seq_lens=torch.tensor([computed + scheduled]),
+        is_prefilling_np=torch.tensor([prefilling]).numpy(),
         dcp_local_seq_lens=None,
         positions=positions,
         prompt_lens=torch.tensor([1024], dtype=torch.int32),
@@ -54,7 +131,14 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
     build_attn_metadata = Mock(return_value=expected_metadata)
     monkeypatch.setattr(mamba_hybrid, "build_attn_metadata", build_attn_metadata)
 
-    metadata = state.prepare_attn(
+    prepare_attn = state.prepare_attn
+    if staging_device == "cuda":
+        monkeypatch.setattr(gsd, "_SYNC_CHECK_MODE", "error")
+        monkeypatch.setattr(gsd, "_sync_check_enabled", True)
+        gsd.enable_gpu_sync_check()
+        prepare_attn = gsd.with_gpu_sync_check(prepare_attn)
+
+    metadata = prepare_attn(
         input_batch=input_batch,
         cudagraph_mode=CUDAGraphMode.NONE,
         block_tables=(),
@@ -65,6 +149,23 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert metadata is expected_metadata
     assert build_attn_metadata.call_args.kwargs["positions"] is positions
+    assert state._is_prefilling_gpu.item() == expected_prefilling
+
+
+def test_add_request_seeds_state_idx_in_mamba_blocks() -> None:
+    """A drafter group can lower cache_config.block_size below the mamba
+    block size; the seeded column must still be in mamba blocks."""
+    state = object.__new__(MambaHybridModelState)
+    state.cache_config = SimpleNamespace(block_size=16, mamba_block_size=880)
+    state._align_mode = True
+    state.rope_state = None
+    state.prompt_embeds_state = None
+    state.num_accepted_tokens_gpu = torch.ones(2, dtype=torch.int32)
+    state._mamba_state_idx_gpu = torch.zeros(2, dtype=torch.int32)
+
+    state.add_request(1, SimpleNamespace(num_computed_tokens=107_360))
+
+    assert state._mamba_state_idx_gpu[1] == 121
 
 
 def test_padded_prompt_tail_builds_as_spec_decode(
@@ -80,6 +181,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
     state.vllm_config = SimpleNamespace(num_speculative_tokens=k)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
+    state._use_flashinfer_replayssm = False
     state.recoverssm = None
     state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32)
 
@@ -140,6 +242,178 @@ def test_padded_prompt_tail_builds_as_spec_decode(
     assert meta.num_prefill_tokens == k + 1
 
 
+def _mamba_hybrid_state(num_speculative_tokens: int) -> MambaHybridModelState:
+    state = object.__new__(MambaHybridModelState)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+    state.model_config = SimpleNamespace(max_model_len=8192)
+    state._align_mode = False
+    state._use_flashinfer_replayssm = False
+    state.recoverssm = None
+    # A request that accepted 3 drafts (plus the bonus token) on the previous
+    # step; the others have never had a draft accepted.
+    state.num_accepted_tokens_gpu = torch.tensor([4, 1, 1], dtype=torch.int32)
+    return state
+
+
+def _input_batch(
+    num_scheduled_tokens: list[int],
+    num_draft_tokens_per_req: list[int] | None,
+    is_prefilling: list[bool],
+    num_reqs_after_padding: int | None = None,
+) -> SimpleNamespace:
+    """`num_draft_tokens_per_req=None` is a batch where nobody proposed a
+    draft this step, e.g. because ngram found no match for anyone."""
+    num_reqs = len(num_scheduled_tokens)
+    query_start_loc = np.zeros(num_reqs + 1, dtype=np.int32)
+    query_start_loc[1:] = np.cumsum(num_scheduled_tokens)
+    num_tokens = int(query_start_loc[-1])
+    seq_lens = torch.full((num_reqs,), 10, dtype=torch.int32)
+    return SimpleNamespace(
+        num_reqs=num_reqs,
+        num_reqs_after_padding=num_reqs_after_padding or num_reqs,
+        num_tokens=num_tokens,
+        num_tokens_after_padding=num_tokens,
+        query_start_loc_np=query_start_loc,
+        num_scheduled_tokens=np.array(num_scheduled_tokens, dtype=np.int32),
+        max_query_len=None,
+        seq_lens_cpu_upper_bound=seq_lens,
+        is_prefilling_np=np.array(is_prefilling),
+        prefill_runs_as_decode_np=None,
+        num_draft_tokens_per_req=None
+        if num_draft_tokens_per_req is None
+        else np.array(num_draft_tokens_per_req, dtype=np.int32),
+        idx_mapping=torch.arange(num_reqs),
+        query_start_loc=torch.from_numpy(query_start_loc),
+        seq_lens=seq_lens,
+        dcp_local_seq_lens=None,
+        positions=torch.zeros(num_tokens, dtype=torch.int64),
+        prompt_lens=None,
+    )
+
+
+def _prepare_attn_metadata(
+    state: MambaHybridModelState,
+    monkeypatch,
+    input_batch: SimpleNamespace | None = None,
+    cudagraph_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+) -> SimpleNamespace:
+    captured = {}
+
+    def fake_build_attn_metadata(**kwargs):
+        captured.update(kwargs)
+        return Mock()
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.model_states.mamba_hybrid.build_attn_metadata",
+        fake_build_attn_metadata,
+    )
+
+    if input_batch is None:
+        input_batch = _input_batch([1, 1], None, [False, False])
+    state.prepare_attn(
+        input_batch=input_batch,
+        cudagraph_mode=cudagraph_mode,
+        block_tables=(),
+        slot_mappings={},
+        attn_groups=[],
+        kv_cache_config=Mock(),
+    )
+    return captured["model_specific_attn_metadata"]
+
+
+def test_prepare_attn_keeps_the_accepted_offset_when_the_batch_drafted_nothing(
+    monkeypatch,
+):
+    """`num_accepted_tokens` must reach the attention builders whenever the
+    speculative config is on, even when *this* batch scheduled no draft
+    tokens at all. Before the fix, `use_spec_decode` was gated on this step's
+    scheduled drafts (`len(scheduled_spec_decode_tokens) > 0` in the V1
+    runner) rather than on the speculative config, so a request that accepted
+    drafts on a previous step would silently lose that offset the moment
+    ngram found no match for anyone in the batch.
+    """
+    state = _mamba_hybrid_state(num_speculative_tokens=3)
+
+    metadata = _prepare_attn_metadata(state, monkeypatch)
+
+    assert metadata.num_accepted_tokens is not None
+    assert metadata.num_accepted_tokens.tolist() == [4, 1]
+    assert metadata.num_decode_draft_tokens_cpu is not None
+
+
+def test_prepare_attn_omits_the_offset_without_a_speculative_config(monkeypatch):
+    """Mirrors the check above: with speculative decoding off entirely, there
+    is no accepted-token offset to carry, and the metadata must say so
+    explicitly (`None`) rather than a stale or default value."""
+    state = _mamba_hybrid_state(num_speculative_tokens=0)
+
+    metadata = _prepare_attn_metadata(state, monkeypatch)
+
+    assert metadata.num_accepted_tokens is None
+    assert metadata.num_decode_draft_tokens_cpu is None
+
+
+def test_zero_draft_decode_row_is_marked_as_a_speculative_row(monkeypatch):
+    """A decode row that got no drafts still has to reach the speculative path.
+
+    The recurrent backends only apply a row's accepted-token offset on that
+    path, and a row that accepted drafts on the previous step keeps that offset
+    even when the current step proposes nothing (the scheduler drops drafts
+    whenever the token budget truncates the step). Marking such a row with the
+    -1 sentinel sends it to the plain decode path, which reads the state at
+    column 0 and ignores the offset.
+    """
+    state = _mamba_hybrid_state(num_speculative_tokens=3)
+    input_batch = _input_batch([3, 1, 1], [2, 0, 0], [False, False, True])
+
+    metadata = _prepare_attn_metadata(state, monkeypatch, input_batch)
+
+    assert metadata.num_decode_draft_tokens_cpu.tolist() == [
+        2,  # decode row with drafts
+        0,  # decode row with no drafts: speculative path, offset applied
+        -1,  # one-token prefill tail: no offset to apply, stays a plain row
+    ]
+
+
+def test_batch_without_any_drafts_still_marks_its_decode_rows(monkeypatch):
+    """`num_draft_tokens_per_req` is None whenever no row in the batch drafted
+    anything. Those rows are ordinary decode rows carrying an offset from the
+    previous step, so the absence of drafts in this step must not be read as
+    speculative decoding being off."""
+    state = _mamba_hybrid_state(num_speculative_tokens=3)
+    input_batch = _input_batch([1, 1], None, [False, True])
+
+    metadata = _prepare_attn_metadata(state, monkeypatch, input_batch)
+
+    assert metadata.num_decode_draft_tokens_cpu.tolist() == [0, -1]
+
+
+def test_padded_rows_keep_the_sentinel(monkeypatch):
+    """Full CUDA-graph capture pads the batch; padded rows describe no request
+    and must not be picked up as speculative rows."""
+    state = _mamba_hybrid_state(num_speculative_tokens=3)
+    input_batch = _input_batch([1, 1], [0, 0], [False, False], num_reqs_after_padding=4)
+
+    metadata = _prepare_attn_metadata(
+        state, monkeypatch, input_batch, cudagraph_mode=CUDAGraphMode.FULL
+    )
+
+    assert metadata.num_decode_draft_tokens_cpu.tolist() == [0, 0, -1, -1]
+
+
+def test_chunked_prefill_tail_of_two_or_three_tokens_keeps_the_sentinel(
+    monkeypatch,
+):
+    """A prefill continuation is excluded by `is_prefilling`, not by its token
+    count, so tails wider than one token are covered by the same rule."""
+    state = _mamba_hybrid_state(num_speculative_tokens=3)
+    input_batch = _input_batch([2, 3], [0, 0], [True, True])
+
+    metadata = _prepare_attn_metadata(state, monkeypatch, input_batch)
+
+    assert metadata.num_decode_draft_tokens_cpu.tolist() == [-1, -1]
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 @pytest.mark.parametrize(("num_sampled", "expected_value"), [(0, 1), (3, 3)])
 def test_postprocess_state_scalar_with_int32_mapping(
@@ -150,6 +424,7 @@ def test_postprocess_state_scalar_with_int32_mapping(
         (4,), 9, dtype=torch.int32, device="cuda"
     )
     state._align_mode = False
+    state._use_flashinfer_replayssm = False
     state.recoverssm = None
     state._mamba_ctx = None
     idx_mapping = torch.tensor([2, -1, 0], dtype=torch.int32, device="cuda")
@@ -160,6 +435,46 @@ def test_postprocess_state_scalar_with_int32_mapping(
         [expected_value, 9, expected_value, 9], dtype=torch.int32, device="cuda"
     )
     torch.testing.assert_close(state.num_accepted_tokens_gpu, expected)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_flashinfer_replayssm_prefix_uses_original_accepted_counts() -> None:
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = True
+    state._use_flashinfer_replayssm = True
+    state.recoverssm = None
+    state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32, device="cuda")
+    state._mamba_state_idx_gpu = torch.zeros(4, dtype=torch.int32, device="cuda")
+    state._is_prefilling_gpu = torch.zeros(4, dtype=torch.bool, device="cuda")
+    state._replayssm_query_start_loc = torch.tensor(
+        [0, 4], dtype=torch.int32, device="cuda"
+    )
+    replayssm = Mock()
+    accepted_snapshot = torch.zeros(4, dtype=torch.int32, device="cuda")
+    ctx = Mock(
+        is_initialized=True,
+        replayssm=replayssm,
+        num_accepted_tokens_snapshot=accepted_snapshot,
+    )
+
+    def normalize_live(*_args) -> None:
+        accepted_snapshot.copy_(state.num_accepted_tokens_gpu)
+        state.num_accepted_tokens_gpu[2] = 1
+
+    ctx.run_fused_postprocess_align.side_effect = normalize_live
+    state._mamba_ctx = ctx
+
+    state.postprocess_state(
+        torch.tensor([2], dtype=torch.int32, device="cuda"),
+        torch.tensor([3], dtype=torch.int32, device="cuda"),
+        num_computed_tokens=torch.tensor([0, 0, 8, 0], device="cuda"),
+    )
+
+    kwargs = replayssm.postprocess.call_args.kwargs
+    assert kwargs["num_accepted_tokens"] is accepted_snapshot
+    assert accepted_snapshot[2].item() == 3
+    assert state.num_accepted_tokens_gpu[2].item() == 1
+    assert state._replayssm_query_start_loc is None
 
 
 def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
@@ -192,6 +507,7 @@ def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
 def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias() -> None:
     state = object.__new__(MambaHybridModelState)
     state._align_mode = True
+    state._use_flashinfer_replayssm = False
     state._mamba_ctx = None
     state._mamba_state_idx_gpu = torch.full((5,), -1, dtype=torch.int32, device="cuda")
     state.recoverssm = RecoverSSMState()

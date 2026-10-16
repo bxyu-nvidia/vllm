@@ -613,6 +613,13 @@ class VllmConfig:
         )
 
     @property
+    def use_flashinfer_replayssm(self) -> bool:
+        return (
+            self.cache_config.use_replayssm
+            and self.mamba_config.backend == MambaBackendEnum.FLASHINFER
+        )
+
+    @property
     def num_speculative_tokens(self) -> int:
         if (
             self.speculative_config is not None
@@ -3448,19 +3455,35 @@ class VllmConfig:
         if not self.cache_config.use_replayssm:
             self.cache_config.use_kda_recoverssm = False
             return self
-        self.cache_config.use_kda_recoverssm = self.num_speculative_tokens > 0
+
+        kda_architectures = (
+            "KimiLinearForCausalLM",
+            "KimiK3ForConditionalGeneration",
+        )
+        is_kda_model = (
+            self.model_config is not None
+            and self.model_config.architecture in kda_architectures
+        )
+        self.cache_config.use_kda_recoverssm = (
+            self.num_speculative_tokens > 0 and is_kda_model
+        )
+        use_mamba_replayssm_spec = (
+            self.num_speculative_tokens > 0 and not self.cache_config.use_kda_recoverssm
+        )
 
         if self.model_config is not None and not self.model_config.supports_replayssm:
             raise ValueError(
                 "--use-replayssm is not supported for architecture "
                 f"{self.model_config.architecture!r}"
             )
+        if (
+            self.mamba_config.backend == MambaBackendEnum.FLASHINFER
+            and self.cache_config.replayssm_buffer_len > 16
+        ):
+            raise ValueError(
+                "FlashInfer ReplaySSM requires --replayssm-buffer-len <= 16"
+            )
         if self.cache_config.use_kda_recoverssm:
-            if self.model_config is not None and self.model_config.architecture not in (
-                "KimiLinearForCausalLM",
-                "KimiK3ForConditionalGeneration",
-            ):
-                raise ValueError("RecoverSSM is only supported for Kimi-K3 KDA")
             if self.mamba_config.enable_stochastic_rounding:
                 raise ValueError(
                     "RecoverSSM supports bfloat16/float32 "
@@ -3490,11 +3513,35 @@ class VllmConfig:
                 "pass --mamba-cache-mode align"
             )
         elif self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
-            if self.cache_config.mamba_cache_mode == "align":
+            if (
+                self.cache_config.mamba_cache_mode == "align"
+                and self.model_config is not None
+                and self.model_config.dtype != torch.bfloat16
+            ):
                 raise ValueError(
-                    "FlashInfer ReplaySSM does not support "
-                    "--mamba-cache-mode align yet; use none"
+                    "FlashInfer ReplaySSM align requires bfloat16 model inputs "
+                    "for its replay rings; SSM state cache dtype is independent"
                 )
+            if self.parallel_config.use_ubatching:
+                raise ValueError("FlashInfer ReplaySSM does not support microbatching")
+            if self.parallel_config.pipeline_parallel_size > 1:
+                raise ValueError(
+                    "FlashInfer ReplaySSM currently requires pipeline_parallel_size=1"
+                )
+            if use_mamba_replayssm_spec:
+                query_len = 1 + self.num_speculative_tokens
+                if self.cache_config.replayssm_buffer_len < query_len:
+                    raise ValueError(
+                        "FlashInfer ReplaySSM speculative decoding requires "
+                        "--replayssm-buffer-len >= 1 + num_speculative_tokens "
+                        f"({query_len}); got "
+                        f"{self.cache_config.replayssm_buffer_len}"
+                    )
+        elif use_mamba_replayssm_spec:
+            raise ValueError(
+                "Mamba2 ReplaySSM speculative decoding requires "
+                "--mamba-backend flashinfer"
+            )
         elif self.mamba_config.backend != MambaBackendEnum.TRITON:
             raise ValueError(
                 "--use-replayssm requires --mamba-backend triton or flashinfer"
