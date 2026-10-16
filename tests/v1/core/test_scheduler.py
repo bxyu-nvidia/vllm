@@ -7248,3 +7248,100 @@ def test_deferred_reasons_follow_lookup_then_remote_load_and_cleanup():
     scheduler.schedule()
     assert scheduler.make_stats().deferred_waiting_reasons == {}
     assert not scheduler._deferred_reasons
+
+
+def test_lookup_polling_and_ready_reason_do_not_require_compute_budget(monkeypatch):
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(32, True, num_defers_before_matching=1),
+    )
+    request = create_requests(num_requests=1, num_tokens=64)[0]
+    scheduler.add_request(request)
+    scheduler.schedule()
+    ready = [False]
+    monkeypatch.setattr(scheduler.connector, "is_lookup_ready", lambda req: ready[0])
+    monkeypatch.setattr(
+        scheduler.connector,
+        "poll_lookup_completions",
+        lambda: ready.__setitem__(0, True),
+    )
+    scheduler.max_num_scheduled_tokens = 0
+    output = scheduler.schedule()
+    assert output.total_num_scheduled_tokens == 0
+    assert scheduler.make_stats().deferred_waiting_reasons == {
+        "external_cache_lookup_ready": 1
+    }
+
+
+@pytest.mark.parametrize(
+    "limit,num_blocks,expected_loads", [(0, 100, 0), (1, 100, 1), (1, 6, 0)]
+)
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_budget_exhausted_prefetch_is_bounded_and_reserves_full_context(
+    monkeypatch,
+    limit,
+    num_blocks,
+    expected_loads,
+    async_scheduling,
+):
+    scheduler = create_scheduler(
+        async_scheduling=async_scheduling,
+        max_num_batched_tokens=16,
+        max_model_len=128,
+        max_num_seqs=8,
+        num_blocks=num_blocks,
+        block_size=16,
+        use_kv_connector=mock_kv(32, True),
+    )
+    active, first, second = create_requests(num_requests=3, num_tokens=64)
+    connector = scheduler.connector
+    monkeypatch.setattr(connector, "get_async_prefetch_limit", lambda **kw: limit)
+    monkeypatch.setattr(connector, "is_lookup_ready", lambda req: True)
+    monkeypatch.setattr(
+        connector,
+        "get_num_new_matched_tokens",
+        lambda req, computed: (0, False) if req is active else (32, True),
+    )
+    for request in (active, first, second):
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {active.request_id: 16}
+    loads = [
+        r for r in (first, second) if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    ]
+    assert len(loads) == expected_loads
+    assert second.num_computed_tokens == 0
+    if expected_loads:
+        assert first.num_computed_tokens == 32
+        assert scheduler.kv_cache_manager.get_blocks(first.request_id).get_block_ids()[
+            0
+        ]
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_recving={first.request_id})
+        )
+        assert scheduler.make_stats().deferred_waiting_reasons == {
+            "remote_kv_load_ready": 1
+        }
+        # The completed-but-not-admitted first load still occupies the one slot.
+        scheduler.schedule()
+        assert second.num_computed_tokens == 0
+        assert second.status == RequestStatus.WAITING
+
+
+def test_prefetch_scan_is_bounded_and_preserves_waiting_order(monkeypatch):
+    scheduler = create_scheduler(
+        max_num_batched_tokens=16,
+        max_model_len=128,
+        max_num_seqs=4,
+        use_kv_connector=mock_kv(0, False),
+    )
+    requests = create_requests(num_requests=20, num_tokens=64)
+    readiness = Mock(return_value=False)
+    monkeypatch.setattr(scheduler.connector, "is_lookup_ready", readiness)
+    monkeypatch.setattr(scheduler.connector, "get_async_prefetch_limit", lambda **kw: 4)
+    for request in requests:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {requests[0].request_id: 16}
+    assert readiness.call_count == scheduler.max_num_active_reqs
+    assert list(scheduler.waiting) == requests[1:]
+    assert not scheduler.deferred_waiting

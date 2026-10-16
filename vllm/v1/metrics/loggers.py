@@ -553,6 +553,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             for reason in (
                 "external_cache_lookup",
+                "external_cache_lookup_ready",
+                "remote_kv_load_ready",
                 "remote_kv_load",
                 "grammar",
                 "streaming_input",

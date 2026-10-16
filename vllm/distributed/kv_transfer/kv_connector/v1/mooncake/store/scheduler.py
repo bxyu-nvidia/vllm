@@ -5,6 +5,8 @@
 # (vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/).
 """Scheduler-side logic for MooncakeStoreConnector."""
 
+import time
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -31,6 +33,8 @@ from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
+
+from .pipeline import PipelineTracker
 
 logger = init_logger(__name__)
 
@@ -62,6 +66,16 @@ class MooncakeStoreScheduler:
         kvc_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
+        self.async_prefetch_limit = kvc_extra_config.get("async_prefetch_limit", 4)
+        if (
+            not isinstance(self.async_prefetch_limit, int)
+            or isinstance(self.async_prefetch_limit, bool)
+            or self.async_prefetch_limit < 0
+        ):
+            raise ValueError("async_prefetch_limit must be a non-negative integer")
+        self.load_pipeline = PipelineTracker("load", -1)
+        # Local receipt timestamps; never compare worker and scheduler clocks.
+        self._pending_loads: dict[str, float | None] = {}
         # Skips lookup CPU cost on instances that never load KV from the store.
         self.enable_lookup = kvc_extra_config.get("enable_lookup", True)
         self.save_decode_cache = kvc_extra_config.get("save_decode_cache", False)
@@ -179,6 +193,9 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
+        self.client.consume(request.request_id)
+        if num_external_tokens > 0 and self.load_async:
+            self._pending_loads[request.request_id] = None
         local_block_ids: tuple[list[int], ...] = ()
         if num_external_tokens > 0:
             local_block_ids = blocks.get_block_ids(
@@ -218,6 +235,7 @@ class MooncakeStoreScheduler:
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self.client.discard(finished_req_id)
+            self._pending_loads.pop(finished_req_id, None)
             self.load_specs.pop(finished_req_id, None)
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
@@ -225,6 +243,8 @@ class MooncakeStoreScheduler:
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         for req_id in preempted_ids:
+            self.client.discard(req_id)
+            self._pending_loads.pop(req_id, None)
             self.load_specs.pop(req_id, None)
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
@@ -610,6 +630,9 @@ class MooncakeStoreScheduler:
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Drop the block references of store jobs every rank has finished."""
+        for req_id in connector_output.finished_recving or ():
+            if req_id in self._pending_loads and self._pending_loads[req_id] is None:
+                self._pending_loads[req_id] = time.perf_counter()
         meta = connector_output.kv_connector_worker_meta
         if not isinstance(meta, MooncakeStoreWorkerMetadata):
             return
@@ -631,6 +654,11 @@ class MooncakeStoreScheduler:
             del self._pinned_saves[store_job_id]
             # Tail-first, as elsewhere, so the shared prefix is evicted last.
             pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
+
+    def record_load_consumed(self, request_id: str) -> None:
+        received_at = self._pending_loads.pop(request_id, None)
+        if received_at is not None:
+            self.load_pipeline.record_consumption(received_at)
 
     def has_pending_push_work(self) -> bool:
         """Keep the engine stepping while any store job still holds block refs.

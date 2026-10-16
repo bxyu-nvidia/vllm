@@ -36,13 +36,15 @@ class PipelineSnapshot(TypedDict):
     queue_wait_seconds: list[float]
     execution_seconds: list[float]
     consumption_wait_seconds: list[float]
+    ready_wait_seconds: list[float]
+    report_wait_seconds: list[float]
 
 
 class PipelineTracker:
     """Track jobs until completion, including cancelled queued jobs.
 
-    Lookup rank -1 denotes scheduler-side, engine-wide work. Load ranks are
-    worker ranks, not distinct logical requests across tensor-parallel workers.
+    Rank -1 denotes scheduler-side, engine-wide work. Nonnegative load ranks
+    identify workers, not distinct logical requests across TP workers.
     """
 
     def __init__(
@@ -61,6 +63,8 @@ class PipelineTracker:
         self._queue_wait: list[float] = []
         self._execution: list[float] = []
         self._consumption_wait: list[float] = []
+        self._ready_wait: list[float] = []
+        self._report_wait: list[float] = []
 
     def enqueue(self) -> int:
         with self._lock:
@@ -85,10 +89,22 @@ class PipelineTracker:
                 self._execution.append(now - pending[1])
             return now
 
-    def record_consumption(self, completed_at: float) -> None:
-        """Record the scheduler consuming a successful lookup result."""
+    def record_consumption(self, completed_at: float) -> float:
+        """Record scheduler consumption and return its local timestamp."""
         with self._lock:
-            self._consumption_wait.append(self._clock() - completed_at)
+            now = self._clock()
+            self._consumption_wait.append(now - completed_at)
+            return now
+
+    def record_ready_wait(self, ready_at: float) -> None:
+        """Record lookup result collection to successful KV allocation."""
+        with self._lock:
+            self._ready_wait.append(self._clock() - ready_at)
+
+    def record_report_wait(self, completed_at: float) -> None:
+        """Record load completion to worker reporting, on the worker clock."""
+        with self._lock:
+            self._report_wait.append(self._clock() - completed_at)
 
     def snapshot(self) -> PipelineSnapshot:
         """Read live gauges and drain timing samples exactly once."""
@@ -108,8 +124,12 @@ class PipelineTracker:
                 queue_wait_seconds=self._queue_wait,
                 execution_seconds=self._execution,
                 consumption_wait_seconds=self._consumption_wait,
+                ready_wait_seconds=self._ready_wait,
+                report_wait_seconds=self._report_wait,
             )
             self._queue_wait = []
             self._execution = []
             self._consumption_wait = []
+            self._ready_wait = []
+            self._report_wait = []
             return result

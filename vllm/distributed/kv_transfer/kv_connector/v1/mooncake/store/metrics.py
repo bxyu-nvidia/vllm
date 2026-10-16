@@ -63,6 +63,8 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
                         "queue_wait_seconds",
                         "execution_seconds",
                         "consumption_wait_seconds",
+                        "ready_wait_seconds",
+                        "report_wait_seconds",
                     ):
                         latest[field] = (
                             list(previous.get(field, [])) if previous else []
@@ -85,6 +87,8 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
                         "queue_wait_seconds",
                         "execution_seconds",
                         "consumption_wait_seconds",
+                        "ready_wait_seconds",
+                        "report_wait_seconds",
                     ):
                         samples = snapshot.get(name, [])
                         if samples:
@@ -163,6 +167,8 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
             "queue_wait_seconds",
             "execution_seconds",
             "consumption_wait_seconds",
+            "ready_wait_seconds",
+            "report_wait_seconds",
         ):
             self._pipeline_metrics[field] = self._histogram_cls(
                 name=f"vllm:mooncake_pipeline_{field}",
@@ -262,6 +268,8 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
             ("queue_wait_seconds", snapshot["queue_wait_seconds"]),
             ("execution_seconds", snapshot["execution_seconds"]),
             ("consumption_wait_seconds", snapshot.get("consumption_wait_seconds", [])),
+            ("ready_wait_seconds", snapshot.get("ready_wait_seconds", [])),
+            ("report_wait_seconds", snapshot.get("report_wait_seconds", [])),
         ):
             for value in samples:
                 self._pipeline_metrics[field].labels(*labels).observe(value)

@@ -4898,6 +4898,7 @@ def test_lookup_completion_wait_excludes_execution_and_drains_once(discard):
     client = worker.LookupKeyClient.__new__(worker.LookupKeyClient)
     client.pipeline = PipelineTracker("lookup", -1, clock=lambda: now[0])
     client.futures = {}
+    client.ready = {}
     future: Future[tuple[MooncakeLookupResult, float]] = Future()
     client.executor = MagicMock()
     client.executor.submit.return_value = future
@@ -4924,7 +4925,15 @@ def test_lookup_completion_wait_excludes_execution_and_drains_once(discard):
     stats = MooncakeStoreConnectorStats(data={PIPELINE_KEY: [completed]})
     now[0] = 18.0
     if not discard:
-        assert client.lookup("req", 256, [], non_block=True).hit_length == 128
+        # Collection must not depend on retrying admission for this request.
+        client.poll_completions()
+        assert client.is_ready("req") is True
+        for _ in range(2):
+            assert client.lookup("req", 256, [], non_block=True).hit_length == 128
+        client.executor.submit.assert_called_once()
+        now[0] = 22.0
+        client.consume("req")
+        assert client.is_ready("req") is None
     assert not client.futures
     stats.aggregate(
         MooncakeStoreConnectorStats(data={PIPELINE_KEY: [client.pipeline.snapshot()]})
@@ -4937,12 +4946,14 @@ def test_lookup_completion_wait_excludes_execution_and_drains_once(discard):
     )
     if not discard:
         assert stats.reduce()["lookup_rank-1_consumption_wait_seconds_avg"] == 5.0
+        assert stats.data[PIPELINE_KEY][0]["ready_wait_seconds"] == [4.0]
 
 
 def test_lookup_pipeline_cleans_up_cancelled_and_failed_jobs():
     client = worker.LookupKeyClient.__new__(worker.LookupKeyClient)
     client.pipeline = PipelineTracker("lookup", -1)
     client.futures = {}
+    client.ready = {}
     entered, release = threading.Event(), threading.Event()
 
     def lookup(num_tokens, hashes):
@@ -5044,9 +5055,20 @@ def test_pipeline_prometheus_exports_backlog_and_resets_to_zero():
     completed_at = tracker.finish(ticket)
     now[0] = 12.0
     tracker.record_consumption(completed_at)
+    tracker.record_ready_wait(11.0)
+    tracker.record_report_wait(10.5)
     metrics.observe({PIPELINE_KEY: [tracker.snapshot()]})
     metrics.observe({PIPELINE_KEY: [tracker.snapshot()]})
     assert registry.get_sample_value("vllm:mooncake_pipeline_active", labels) == 0
+    for field, expected in (("ready_wait_seconds", 1.0), ("report_wait_seconds", 1.5)):
+        assert (
+            registry.get_sample_value(f"vllm:mooncake_pipeline_{field}_sum", labels)
+            == expected
+        )
+        assert (
+            registry.get_sample_value(f"vllm:mooncake_pipeline_{field}_count", labels)
+            == 1
+        )
     assert (
         registry.get_sample_value(
             "vllm:mooncake_pipeline_execution_seconds_count", labels
@@ -5066,3 +5088,32 @@ def test_pipeline_prometheus_exports_backlog_and_resets_to_zero():
         )
         == 2.0
     )
+
+
+def test_completed_load_waits_for_worker_report_and_drains_once(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(worker.time, "perf_counter", lambda: now[0])
+    transfer = worker.KVTransferThread(
+        MagicMock(), [], 16, 0, threading.Event(), "test-load"
+    )
+    transfer.pipeline_tracker = PipelineTracker("load", 0, clock=lambda: now[0])
+    transfer.set_finished_request("req")
+    now[0] = 14.0
+    assert transfer.get_and_clear_finished_requests() == {"req"}
+    assert transfer.pipeline_tracker.snapshot()["report_wait_seconds"] == [4.0]
+    assert transfer.get_and_clear_finished_requests() == set()
+    assert transfer.pipeline_tracker.snapshot()["report_wait_seconds"] == []
+    assert not transfer._load_completed_at
+
+
+def test_discard_ready_lookup_does_not_reuse_it():
+    client = worker.LookupKeyClient.__new__(worker.LookupKeyClient)
+    client.pipeline = PipelineTracker("lookup", -1)
+    future: Future[tuple[MooncakeLookupResult, float]] = Future()
+    future.set_result((MooncakeLookupResult(16), 0.0))
+    client.futures = {"req": future}
+    client.ready = {}
+    client.poll_completions()
+    client.discard("req")
+    assert client.is_ready("req") is None
+    assert not client.ready

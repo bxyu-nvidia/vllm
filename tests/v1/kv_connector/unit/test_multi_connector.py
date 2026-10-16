@@ -1233,3 +1233,28 @@ def test_multi_connector_mixed_hma_disables_hybrid_kv_cache(monkeypatch):
             assert mc._all_support_hma is False
         finally:
             llm.llm_engine.engine_core.shutdown()
+
+
+@pytest.mark.parametrize("first_hit,expected_limit", [(0, 4), (32, 0)])
+def test_prefetch_requires_ready_children_and_selected_connector_opt_in(
+    mc,
+    first_hit,
+    expected_limit,
+):
+    first, mooncake = mc._connectors
+    first.get_async_prefetch_limit.return_value = 0
+    mooncake.get_async_prefetch_limit.return_value = 4
+    first.is_lookup_ready.return_value = True
+    mooncake.is_lookup_ready.return_value = False
+    request = MagicMock(request_id="req")
+    assert mc.get_async_prefetch_limit() == 4
+    assert mc.is_lookup_ready(request) is False
+    mooncake.is_lookup_ready.return_value = True
+    first.is_lookup_ready.return_value = None
+    assert mc.is_lookup_ready(request) is None
+    first.is_lookup_ready.return_value = True
+    assert mc.is_lookup_ready(request) is True
+    first.get_num_new_matched_tokens.return_value = (first_hit, bool(first_hit))
+    mooncake.get_num_new_matched_tokens.return_value = (32, True)
+    assert mc.get_num_new_matched_tokens(request, 0) == (32, True)
+    assert mc.get_async_prefetch_limit(request=request) == expected_limit

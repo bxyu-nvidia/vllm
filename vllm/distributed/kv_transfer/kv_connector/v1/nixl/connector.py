@@ -164,6 +164,10 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished_count(self) -> int | None:
         return None
 
+    def is_lookup_ready(self, request: "Request") -> bool | None:
+        # Both push and pull lookups use request metadata, without an async RPC.
+        return True
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:

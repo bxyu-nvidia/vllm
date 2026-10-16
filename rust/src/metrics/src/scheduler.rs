@@ -139,8 +139,10 @@ fn mooncake_pipeline_histogram() -> Histogram {
     )
 }
 
-pub const DEFERRED_REASONS: [&str; 7] = [
+pub const DEFERRED_REASONS: [&str; 9] = [
     "external_cache_lookup",
+    "external_cache_lookup_ready",
+    "remote_kv_load_ready",
     "remote_kv_load",
     "grammar",
     "streaming_input",
@@ -298,6 +300,8 @@ pub struct SchedulerMetrics {
     pub mooncake_pipeline_queue_wait_seconds: MooncakePipelineHistogramFamily,
     pub mooncake_pipeline_execution_seconds: MooncakePipelineHistogramFamily,
     pub mooncake_pipeline_consumption_wait_seconds: MooncakePipelineHistogramFamily,
+    pub mooncake_pipeline_report_wait_seconds: MooncakePipelineHistogramFamily,
+    pub mooncake_pipeline_ready_wait_seconds: MooncakePipelineHistogramFamily,
 
     // NIXL connector telemetry. Mirrors `NixlPromMetrics`.
     pub nixl_xfer_time_seconds: HistogramFamily,
@@ -503,8 +507,24 @@ impl SchedulerMetrics {
             Family::new_with_constructor(mooncake_pipeline_histogram as fn() -> Histogram);
         registry.register(
             "vllm:mooncake_pipeline_consumption_wait_seconds",
-            "Time from successful Mooncake lookup completion to scheduler consumption.",
+            "Time from lookup completion to collection, or load report receipt to scheduler consumption.",
             mooncake_pipeline_consumption_wait_seconds.clone(),
+        );
+
+        let mooncake_pipeline_ready_wait_seconds =
+            Family::new_with_constructor(mooncake_pipeline_histogram as fn() -> Histogram);
+        registry.register(
+            "vllm:mooncake_pipeline_ready_wait_seconds",
+            "Time from lookup collection to successful KV allocation.",
+            mooncake_pipeline_ready_wait_seconds.clone(),
+        );
+
+        let mooncake_pipeline_report_wait_seconds =
+            Family::new_with_constructor(mooncake_pipeline_histogram as fn() -> Histogram);
+        registry.register(
+            "vllm:mooncake_pipeline_report_wait_seconds",
+            "Time from load completion to reporting by its worker.",
+            mooncake_pipeline_report_wait_seconds.clone(),
         );
 
         // Mooncake store connector telemetry.
@@ -631,6 +651,8 @@ impl SchedulerMetrics {
             mooncake_pipeline_queue_wait_seconds,
             mooncake_pipeline_execution_seconds,
             mooncake_pipeline_consumption_wait_seconds,
+            mooncake_pipeline_report_wait_seconds,
+            mooncake_pipeline_ready_wait_seconds,
             mooncake_operation_time_seconds,
             mooncake_operation_total,
             mooncake_operation_keys_total,

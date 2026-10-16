@@ -1074,7 +1074,9 @@ def test_scheduler_pipeline_stats_are_available_before_lookup_completes():
     tracker = PipelineTracker("lookup", -1)
     connector.connector_worker = None
     connector.connector_scheduler = SimpleNamespace(
-        enable_lookup=True, client=SimpleNamespace(pipeline=tracker)
+        enable_lookup=True,
+        client=SimpleNamespace(pipeline=tracker),
+        load_pipeline=PipelineTracker("load", -1),
     )
     ticket = tracker.enqueue()
     stats = connector.get_kv_connector_stats()

@@ -562,6 +562,8 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if self.connector is not None:
+            self.connector.poll_lookup_completions()
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -885,10 +887,42 @@ class Scheduler(SchedulerInterface):
                 else:
                     step_skipped_waiting.appendleft(request_to_skip)
 
-            while token_budget > 0:
+            prefetch_limit = (
+                self.connector.get_async_prefetch_limit()
+                if self.connector is not None
+                else 0
+            )
+            # Include completed loads still waiting to run, so a busy compute
+            # queue cannot accumulate an unbounded set of prefetched KV blocks.
+            waiting_loads = (
+                sum(
+                    req.status != RequestStatus.RUNNING
+                    for req in self._inflight_prefills
+                )
+                if prefetch_limit
+                else 0
+            )
+
+            def park_request(from_queue: RequestQueue) -> None:
+                req = from_queue.pop_request()
+                target = (
+                    step_skipped_kv_holding
+                    if self._holds_kv_blocks(req)
+                    else step_skipped_waiting
+                )
+                target.appendleft(req)
+
+            # Bound extra CPU work too when most queued requests have no result.
+            prefetch_scan_budget = self.max_num_active_reqs
+            while True:
+                prefetch_only = token_budget <= 0 or input_budget <= draft_slots
+                if prefetch_only:
+                    if waiting_loads >= prefetch_limit or prefetch_scan_budget <= 0:
+                        break
+                    prefetch_scan_budget -= 1
                 # Requests holding KV blocks are always drained first.
                 request_queue = self.kv_holding_waiting or self.waiting
-                if not request_queue or input_budget <= draft_slots:
+                if not request_queue:
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
@@ -898,6 +932,16 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if prefetch_only:
+                    assert self.connector is not None
+                    if (
+                        request.status
+                        not in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                        or request.num_computed_tokens != 0
+                        or self.connector.is_lookup_ready(request) is not True
+                    ):
+                        park_request(request_queue)
+                        continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1052,6 +1096,16 @@ class Scheduler(SchedulerInterface):
 
                     if self._ec_transfer_pending(request, num_computed_tokens):
                         skip_request(request_queue, "encoder_cache_load")
+                        continue
+
+                if prefetch_only:
+                    assert self.connector is not None
+                    if (
+                        not load_kv_async
+                        or waiting_loads
+                        >= self.connector.get_async_prefetch_limit(request=request)
+                    ):
+                        park_request(request_queue)
                         continue
 
                 encoder_inputs_to_schedule = None
@@ -1277,6 +1331,7 @@ class Scheduler(SchedulerInterface):
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
                     self._inflight_prefills.add(request)
+                    waiting_loads += 1
                     if self.needs_kv_cache_zeroing:
                         # Skip zeroing of the blocks the async load will
                         # overwrite; the zeroing could race the write.
@@ -1291,6 +1346,8 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 request = request_queue.pop_request()
+                if prefetch_limit and request in self._inflight_prefills:
+                    waiting_loads -= 1
                 self.deferred_waiting.discard(request)
                 self._deferred_reasons.pop(request, None)
                 self.running.append(request)
@@ -2875,6 +2932,17 @@ class Scheduler(SchedulerInterface):
             reason = blocked_reasons.get(
                 request.status, self._deferred_reasons.get(request, "other")
             )
+            if (
+                reason == "external_cache_lookup"
+                and self.connector is not None
+                and self.connector.is_lookup_ready(request) is True
+            ):
+                reason = "external_cache_lookup_ready"
+            elif (
+                reason == "remote_kv_load"
+                and request.request_id in self.finished_recving_kv_req_ids
+            ):
+                reason = "remote_kv_load_ready"
             counts[reason] = counts.get(reason, 0) + 1
         return counts
 
@@ -3130,6 +3198,10 @@ class Scheduler(SchedulerInterface):
                 return False
             # Promote request to waiting or preempted.
             self._update_waiting_for_remote_kv(request)
+            if self.connector is not None:
+                self.connector.record_load_consumed(request_id)
+            if self.log_stats:
+                self._deferred_reasons[request] = "remote_kv_load_ready"
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
             else:

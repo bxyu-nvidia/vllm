@@ -257,6 +257,10 @@ pub mod kv_connector {
         pub execution_seconds: Vec<f64>,
         #[serde(default)]
         pub consumption_wait_seconds: Vec<f64>,
+        #[serde(default)]
+        pub report_wait_seconds: Vec<f64>,
+        #[serde(default)]
+        pub ready_wait_seconds: Vec<f64>,
     }
 
     /// Telemetry emitted by a `MultiConnector` with a flat child payload map.

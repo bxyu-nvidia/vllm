@@ -426,6 +426,28 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     # ==============================
     # Scheduler-side methods
     # ==============================
+    def poll_lookup_completions(self) -> None:
+        for connector in self._connectors:
+            connector.poll_lookup_completions()
+
+    def is_lookup_ready(self, request: "Request") -> bool | None:
+        states = [c.is_lookup_ready(request) for c in self._connectors]
+        if False in states:
+            return False
+        return None if None in states else True
+
+    def get_async_prefetch_limit(self, *, request: "Request | None" = None) -> int:
+        if request is not None:
+            chosen = self._requests_to_connector.get(request.request_id)
+            if chosen is None:
+                return 0
+            return self._connectors[chosen].get_async_prefetch_limit(request=request)
+        return max(c.get_async_prefetch_limit() for c in self._connectors)
+
+    def record_load_consumed(self, request_id: str) -> None:
+        for connector in self._connectors:
+            connector.record_load_consumed(request_id)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",

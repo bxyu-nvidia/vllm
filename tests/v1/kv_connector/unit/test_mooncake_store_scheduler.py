@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -14,6 +14,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     MooncakeStoreWorkerMetadata,
     ReqMeta,
     RequestTracker,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.pipeline import (
+    PipelineTracker,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (
     MooncakeStoreScheduler,
@@ -29,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
+from vllm.v1.outputs import KVConnectorOutput
 
 
 def _make_bare_scheduler(
@@ -43,6 +47,10 @@ def _make_bare_scheduler(
     scheduler.save_decode_cache = save_decode_cache
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
+    scheduler.load_async = True
+    scheduler.client = MagicMock()
+    scheduler._pending_loads = {}
+    scheduler.load_pipeline = PipelineTracker("load", -1)
     scheduler.enable_lookup = True
     scheduler._block_size = 16
     scheduler._hash_block_size = hash_block_size
@@ -182,8 +190,8 @@ def _make_preemption_scheduler_output():
     )
 
 
-def _make_worker_output(completed_saves: dict[int, int]) -> SimpleNamespace:
-    return SimpleNamespace(
+def _make_worker_output(completed_saves: dict[int, int]) -> KVConnectorOutput:
+    return KVConnectorOutput(
         kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
             completed_saves=completed_saves
         )
@@ -1518,3 +1526,20 @@ def test_worker_metadata_aggregates_completions_across_ranks():
         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+
+
+def test_load_report_receipt_to_scheduler_consumption_uses_local_clock(monkeypatch):
+    scheduler = _make_bare_scheduler()
+    now = [10.0]
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler.time.perf_counter",
+        lambda: now[0],
+    )
+    scheduler.load_pipeline = PipelineTracker("load", -1, clock=lambda: now[0])
+    scheduler._pending_loads = {"req": None}
+    scheduler.update_connector_output(KVConnectorOutput(finished_recving={"req"}))
+    now[0] = 13.0
+    scheduler.record_load_consumed("req")
+    scheduler.record_load_consumed("req")
+    assert scheduler.load_pipeline.snapshot()["consumption_wait_seconds"] == [3.0]
+    assert not scheduler._pending_loads

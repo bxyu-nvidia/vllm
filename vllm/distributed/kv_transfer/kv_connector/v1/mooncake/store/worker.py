@@ -331,6 +331,7 @@ class KVTransferThread(threading.Thread):
         self.done_task_lock = threading.Lock()
         self.request_queue: queue.Queue[Any] = request_queue or queue.Queue()
         self.finished_requests: set[str] = set()
+        self._load_completed_at: dict[str, float] = {}
         self.kv_event_lock = threading.Lock()
         self.kv_events: list[BlockStored] = []
 
@@ -341,11 +342,18 @@ class KVTransferThread(threading.Thread):
         with self.done_task_lock:
             finished = self.finished_requests.copy()
             self.finished_requests.clear()
+            if self.pipeline_tracker is not None:
+                for req_id in finished:
+                    completed_at = self._load_completed_at.pop(req_id, None)
+                    if completed_at is not None:
+                        self.pipeline_tracker.record_report_wait(completed_at)
         return finished
 
     def set_finished_request(self, req_id: str):
         with self.done_task_lock:
             self.finished_requests.add(req_id)
+            if self.pipeline_tracker is not None:
+                self._load_completed_at.setdefault(req_id, time.perf_counter())
 
     def run(self):
         self.ready_event.set()
@@ -2533,6 +2541,7 @@ class LookupKeyClient:
             max_workers=1, thread_name_prefix="MooncakeLookupClient"
         )
         self.futures: dict[str, Future[tuple[MooncakeLookupResult, float]]] = {}
+        self.ready: dict[str, tuple[MooncakeLookupResult, float]] = {}
         self.pipeline = PipelineTracker("lookup", -1)
 
     def _lookup(
@@ -2568,6 +2577,8 @@ class LookupKeyClient:
     ) -> MooncakeLookupResult | None:
         """If non_block is True, will return None until the result is ready,
         so the caller retries on a later step."""
+        if req_id in self.ready:
+            return self.ready[req_id][0]
         future = self.futures.get(req_id)
         if future is None:
             ticket = self.pipeline.enqueue()
@@ -2584,18 +2595,41 @@ class LookupKeyClient:
             self.futures[req_id] = future
         if non_block and not future.done():
             return None
+        self._collect(req_id)
+        return self.ready[req_id][0]
+
+    def _collect(self, req_id: str) -> None:
+        future = self.futures.pop(req_id)
         try:
             result, completed_at = future.result()
-            self.pipeline.record_consumption(completed_at)
-            return result
+            ready_at = self.pipeline.record_consumption(completed_at)
         except Exception as e:
             logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
-            return MooncakeLookupResult(0)
-        finally:
-            del self.futures[req_id]
+            result, ready_at = MooncakeLookupResult(0), time.perf_counter()
+        self.ready[req_id] = result, ready_at
+
+    def poll_completions(self) -> None:
+        """Collect only finished futures, independently of admission capacity."""
+        for req_id, future in list(self.futures.items()):
+            if future.done():
+                self._collect(req_id)
+
+    def is_ready(self, req_id: str) -> bool | None:
+        if req_id in self.ready:
+            return True
+        future = self.futures.get(req_id)
+        return future.done() if future is not None else None
+
+    def consume(self, req_id: str) -> None:
+        """Release a result only after the scheduler has allocated its blocks."""
+        result = self.ready.pop(req_id, None)
+        if result is not None:
+            self.pipeline.record_ready_wait(result[1])
+        self.discard(req_id)
 
     def discard(self, req_id: str) -> None:
         """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort)."""
+        self.ready.pop(req_id, None)
         future = self.futures.pop(req_id, None)
         if future is not None:
             future.cancel()
@@ -2613,6 +2647,9 @@ class LookupKeyClient:
         return bytes(resp) == RESP_OK
 
     def reset(self) -> bool:
+        for req_id in list(self.futures):
+            self.discard(req_id)
+        self.ready.clear()
         return self.executor.submit(self._reset).result()
 
     def close(self):

@@ -275,10 +275,43 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread so it never blocks the scheduler step. The request is held until the in-flight lookup completes, then resumed on a later step. Default: `false`.
+- `async_prefetch_limit` (int): With `lookup_async=true` and `load_async=true`, allow ready Mooncake hits to start loading even after the scheduler exhausts its compute-token budget. Default: `4` waiting loads per engine; `0` disables this extra prefetching. Both in-flight loads and completed loads awaiting compute admission count toward the limit. Normal budgeted admission is unchanged. Prefetching retains sequence-slot, LoRA, and full-context KV reservation checks. With `MultiConnector`, all child lookups must report readiness, and the selected loading connector must opt in; NIXL + Mooncake supports this.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `cache_prefix` (str): Namespace prepended to every store key. Lets separate deployments share one Mooncake master without polluting each other — instances configured with different prefixes never see each other's cached blocks, even for identical prompts. All instances that should share a prefix cache must use the same value. Default: `""` (no prefix; keys are byte-identical to the unprefixed format).
 - `save_decode_cache` (bool): Enable offloading decode tokens' KV cache. A `kv_consumer` does not save during prefill; when decode starts, it fills any missing block-aligned prompt prefix before appending completed decode blocks. Default: `false`.
 - `store_tp_size` (int): Common Store TP for endpoints with different local TP sizes. It supports LBHNC and LBNHC local KV caches, with `store_tp_size >= local_tp_size` and `store_tp_size % local_tp_size == 0`. The current topology is one full-attention cache group, PCP/DCP disabled, and cross-layer blocks disabled. For GQA and MHA, the total KV-head count must be divisible by `store_tp_size`. Store shards contain fixed global KV-head ranges in the local layout. Shared endpoints use the same KV cache layout, pipeline-parallel size, and Store TP. The Store namespace includes the layout and PP size. Unsupported configurations use a topology-specific rank-local namespace.
+
+Lookup futures are collected at the start of every scheduler step, even when
+there is no admission budget. Their results are retained until KV allocation
+succeeds, preventing repeated RPCs on allocation retries. Abort, preemption,
+and connector reset discard retained results.
+
+The Python and Rust frontends export these timing boundaries:
+
+| Metric suffix (under `vllm:mooncake_pipeline_`) | Stage / rank | Interval |
+| --- | --- | --- |
+| `queue_wait_seconds` | `lookup` / `-1`, or `load` / worker rank | Enqueue → execution starts |
+| `execution_seconds` | `lookup` / `-1`, or `load` / worker rank | Execution starts → completes |
+| `consumption_wait_seconds` | `lookup` / `-1` | Lookup completes → scheduler collects its result |
+| `ready_wait_seconds` | `lookup` / `-1` | Result collected → successful KV allocation |
+| `report_wait_seconds` | `load` / worker rank | Load completes → worker drains its completion for reporting |
+| `consumption_wait_seconds` | `load` / `-1` | Scheduler receives completion → promotes request out of remote-load waiting |
+
+All timings use a monotonic clock within one process. The load timings exclude
+worker-to-scheduler transport and cross-worker aggregation delay. Scheduler
+consumption also does not imply the request has started GPU computation.
+Each histogram exports `_bucket`, `_sum`, and `_count`; divide the rate of
+`_sum` by the rate of `_count` to obtain mean seconds per completed observation.
+
+`vllm:num_requests_deferred_by_reason` separates `external_cache_lookup` from
+`external_cache_lookup_ready`, and `remote_kv_load` from
+`remote_kv_load_ready`. Ready requests are waiting for scheduler admission,
+not the corresponding external operation. Ready labels only cover deferred
+requests; other capacity wait remains in the existing capacity gauge.
+The lookup `consumption_wait_seconds` metric now measures collection outside
+the admission loop; compare it together with `ready_wait_seconds` against
+older runs. Queue and execution histograms describe completed observations,
+so also inspect queued/active gauges while work is outstanding.
 
 LBHNC/HND is strongly recommended for TP-sharded Store when supported. LBNHC/NHD
 creates many transfer segments and may significantly reduce PUT/GET performance.

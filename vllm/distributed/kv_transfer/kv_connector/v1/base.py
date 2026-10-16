@@ -482,6 +482,30 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def poll_lookup_completions(self) -> None:
+        """Drain ready lookup results without admitting requests or blocking."""
+        return
+
+    def is_lookup_ready(self, request: "Request") -> bool | None:
+        """Return False for pending lookup, True for a nonblocking result.
+
+        None means readiness is unknown or no lookup has been submitted.
+        """
+        return None
+
+    def get_async_prefetch_limit(self, *, request: "Request | None" = None) -> int:
+        """Maximum waiting loads allowed when the compute budget is exhausted.
+
+        Zero disables extra prefetching. Completed loads waiting for admission
+        count toward this limit too; normal budgeted admission is unchanged.
+        With request set, apply the selected child connector's limit.
+        """
+        return 0
+
+    def record_load_consumed(self, request_id: str) -> None:
+        """Record the scheduler promoting a request after an async load."""
+        return
+
     @abstractmethod
     def get_num_new_matched_tokens(
         self,

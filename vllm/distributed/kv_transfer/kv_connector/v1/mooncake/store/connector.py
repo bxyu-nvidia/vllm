@@ -214,6 +214,25 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
     # Scheduler-side methods
     # ============================================================
 
+    def poll_lookup_completions(self) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.client.poll_completions()
+
+    def is_lookup_ready(self, request: Request) -> bool | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.client.is_ready(request.request_id)
+
+    def get_async_prefetch_limit(self, *, request: "Request | None" = None) -> int:
+        assert self.connector_scheduler is not None
+        scheduler = self.connector_scheduler
+        if scheduler.enable_lookup and scheduler.lookup_async and scheduler.load_async:
+            return scheduler.async_prefetch_limit
+        return 0
+
+    def record_load_consumed(self, request_id: str) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.record_load_consumed(request_id)
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
@@ -412,7 +431,8 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
                 return MooncakeStoreConnectorStats(
                     data={
                         PIPELINE_KEY: [
-                            self.connector_scheduler.client.pipeline.snapshot()
+                            self.connector_scheduler.client.pipeline.snapshot(),
+                            self.connector_scheduler.load_pipeline.snapshot(),
                         ]
                     }
                 )

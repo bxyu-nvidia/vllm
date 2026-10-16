@@ -95,6 +95,8 @@ struct SchedulerStatsHandles {
     mooncake_pipeline_queue_wait_seconds: MooncakePipelineHistogramFamily,
     mooncake_pipeline_execution_seconds: MooncakePipelineHistogramFamily,
     mooncake_pipeline_consumption_wait_seconds: MooncakePipelineHistogramFamily,
+    mooncake_pipeline_report_wait_seconds: MooncakePipelineHistogramFamily,
+    mooncake_pipeline_ready_wait_seconds: MooncakePipelineHistogramFamily,
 
     // NIXL connector telemetry, decoded from `kv_connector_stats`.
     nixl_xfer_time_seconds: HistogramMetric,
@@ -211,6 +213,10 @@ fn resolve_scheduler_stats_handles(
             .clone(),
         mooncake_pipeline_queue_wait_seconds: metrics.mooncake_pipeline_queue_wait_seconds.clone(),
         mooncake_pipeline_execution_seconds: metrics.mooncake_pipeline_execution_seconds.clone(),
+        mooncake_pipeline_ready_wait_seconds: metrics.mooncake_pipeline_ready_wait_seconds.clone(),
+        mooncake_pipeline_report_wait_seconds: metrics
+            .mooncake_pipeline_report_wait_seconds
+            .clone(),
         mooncake_pipeline_consumption_wait_seconds: metrics
             .mooncake_pipeline_consumption_wait_seconds
             .clone(),
@@ -365,6 +371,18 @@ fn record_mooncake_stats(handles: &SchedulerStatsHandles, stats: &MooncakeStats)
         for value in &snapshot.execution_seconds {
             handles
                 .mooncake_pipeline_execution_seconds
+                .get_or_create(&labels)
+                .observe(*value);
+        }
+        for value in &snapshot.ready_wait_seconds {
+            handles
+                .mooncake_pipeline_ready_wait_seconds
+                .get_or_create(&labels)
+                .observe(*value);
+        }
+        for value in &snapshot.report_wait_seconds {
+            handles
+                .mooncake_pipeline_report_wait_seconds
                 .get_or_create(&labels)
                 .observe(*value);
         }
@@ -548,10 +566,10 @@ mod tests {
                     {"stage": "lookup", "rank": -1, "queued": 2, "active": 1,
                      "oldest_pending_seconds": 7.0,
                      "queue_wait_seconds": [2.0], "execution_seconds": [3.0],
-                     "consumption_wait_seconds": [0.25]},
+                     "consumption_wait_seconds": [0.25], "ready_wait_seconds": [1.5]},
                     {"stage": "load", "rank": 0, "queued": 0, "active": 1,
                      "oldest_pending_seconds": 4.0,
-                     "queue_wait_seconds": [], "execution_seconds": []},
+                     "queue_wait_seconds": [], "execution_seconds": [], "report_wait_seconds": [0.5]},
                     {"stage": "load", "rank": 1, "queued": 1, "active": 0,
                      "oldest_pending_seconds": 4.0,
                      "queue_wait_seconds": [], "execution_seconds": []}
@@ -569,6 +587,8 @@ mod tests {
             num_skipped_waiting_reqs: 3,
             deferred_waiting_reasons: BTreeMap::from([
                 ("external_cache_lookup".to_string(), 2),
+                ("external_cache_lookup_ready".to_string(), 3),
+                ("remote_kv_load_ready".to_string(), 4),
                 ("remote_kv_load".to_string(), 1),
             ]),
             kv_connector_stats: Some(connector),
@@ -582,6 +602,10 @@ mod tests {
             "vllm:mooncake_pipeline_queued{model_name=\"model\",engine=\"0\",stage=\"load\",rank=\"1\"} 1",
             "vllm:mooncake_pipeline_execution_seconds_sum{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 3",
             "vllm:mooncake_pipeline_consumption_wait_seconds_sum{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 0.25",
+            "vllm:mooncake_pipeline_ready_wait_seconds_sum{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 1.5",
+            "vllm:mooncake_pipeline_report_wait_seconds_sum{model_name=\"model\",engine=\"0\",stage=\"load\",rank=\"0\"} 0.5",
+            "vllm:num_requests_deferred_by_reason{model_name=\"model\",engine=\"0\",reason=\"external_cache_lookup_ready\"} 3",
+            "vllm:num_requests_deferred_by_reason{model_name=\"model\",engine=\"0\",reason=\"remote_kv_load_ready\"} 4",
             "vllm:num_requests_deferred_by_reason{model_name=\"model\",engine=\"0\",reason=\"external_cache_lookup\"} 2",
         ] {
             assert!(rendered.contains(expected), "missing metric: {expected}");
@@ -599,6 +623,8 @@ mod tests {
             snapshot.queue_wait_seconds.clear();
             snapshot.execution_seconds.clear();
             snapshot.consumption_wait_seconds.clear();
+            snapshot.ready_wait_seconds.clear();
+            snapshot.report_wait_seconds.clear();
         }
         super::record_scheduler_stats_with_handles(
             &handles,
