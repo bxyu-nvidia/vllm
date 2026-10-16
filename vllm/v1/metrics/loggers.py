@@ -26,6 +26,8 @@ from vllm.v1.metrics.buckets import histogram_buckets
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
+    ADMISSION_BLOCK_REASONS,
+    PREFETCH_EVENTS,
     CachingMetrics,
     IterationStats,
     MultiModalCacheStats,
@@ -537,6 +539,40 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             multiprocess_mode="mostrecent",
             labelnames=labelnames + ["reason"],
         )
+        admission_blocked_counter = self._counter_cls(
+            name="vllm:scheduler_admission_blocked",
+            documentation=(
+                "Failed waiting admission checks; events, not unique requests."
+            ),
+            labelnames=labelnames + ["reason"],
+        )
+        self.counter_admission_blocked = {
+            reason: create_metric_per_engine(
+                admission_blocked_counter,
+                {
+                    idx: values + [reason]
+                    for idx, values in per_engine_labelvalues.items()
+                },
+            )
+            for reason in ADMISSION_BLOCK_REASONS
+        }
+        prefetch_events_counter = self._counter_cls(
+            name="vllm:kv_prefetch_events",
+            documentation=(
+                "Extra async prefetch events after compute budget exhaustion."
+            ),
+            labelnames=labelnames + ["reason"],
+        )
+        self.counter_prefetch_events = {
+            reason: create_metric_per_engine(
+                prefetch_events_counter,
+                {
+                    idx: values + [reason]
+                    for idx, values in per_engine_labelvalues.items()
+                },
+            )
+            for reason in PREFETCH_EVENTS
+        }
         deferred_gauge = self._gauge_cls(
             name="vllm:num_requests_deferred_by_reason",
             documentation="Deferred requests by last observed scheduler dependency.",
@@ -1073,6 +1109,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_waiting_by_reason[WAITING_REASON_DEFERRED][engine_idx].set(
                 scheduler_stats.num_skipped_waiting_reqs
             )
+            for reason, counters in self.counter_admission_blocked.items():
+                counters[engine_idx].inc(
+                    scheduler_stats.admission_blocked.get(reason, 0)
+                )
+            for reason, counters in self.counter_prefetch_events.items():
+                counters[engine_idx].inc(scheduler_stats.prefetch_events.get(reason, 0))
             for reason, gauges in self.gauge_deferred_by_reason.items():
                 gauges[engine_idx].set(
                     scheduler_stats.deferred_waiting_reasons.get(reason, 0)

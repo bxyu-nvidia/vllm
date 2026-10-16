@@ -218,6 +218,8 @@ class Scheduler(SchedulerInterface):
         # scan or enqueued in a blocked status.
         self.deferred_waiting: set[Request] = set()
         self._deferred_reasons: dict[Request, str] = {}
+        self._admission_blocked: dict[str, int] = {}
+        self._prefetch_events: dict[str, int] = {}
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -873,6 +875,11 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
+        if self.kv_holding_waiting or self.waiting:
+            if preempted_reqs:
+                self._record_admission_blocked("preemption")
+            elif self._pause_state != PauseState.UNPAUSED:
+                self._record_admission_blocked("paused")
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
@@ -914,34 +921,51 @@ class Scheduler(SchedulerInterface):
 
             # Bound extra CPU work too when most queued requests have no result.
             prefetch_scan_budget = self.max_num_active_reqs
+            budget_block_recorded = False
             while True:
-                prefetch_only = token_budget <= 0 or input_budget <= draft_slots
-                if prefetch_only:
-                    if waiting_loads >= prefetch_limit or prefetch_scan_budget <= 0:
-                        break
-                    prefetch_scan_budget -= 1
                 # Requests holding KV blocks are always drained first.
                 request_queue = self.kv_holding_waiting or self.waiting
                 if not request_queue:
                     break
+                prefetch_only = token_budget <= 0 or input_budget <= draft_slots
+                if prefetch_only:
+                    if not budget_block_recorded:
+                        self._record_admission_blocked(
+                            "token_budget" if token_budget <= 0 else "input_budget"
+                        )
+                        budget_block_recorded = True
+                    if waiting_loads >= prefetch_limit:
+                        if self.connector is not None:
+                            self._record_prefetch_event(
+                                "disabled" if prefetch_limit == 0 else "limit"
+                            )
+                        break
+                    if prefetch_scan_budget <= 0:
+                        self._record_prefetch_event("scan_limit")
+                        break
+                    prefetch_scan_budget -= 1
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_active_reqs:
+                    self._record_admission_blocked("max_active_requests")
                     break
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
                 if prefetch_only:
                     assert self.connector is not None
+                    self._record_prefetch_event("scanned")
                     if (
                         request.status
                         not in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
                         or request.num_computed_tokens != 0
                         or self.connector.is_lookup_ready(request) is not True
                     ):
+                        self._record_prefetch_event("ineligible")
                         park_request(request_queue)
                         continue
+                    self._record_prefetch_event("attempted")
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -952,6 +976,7 @@ class Scheduler(SchedulerInterface):
                     # Deliverable stale output still in flight: resuming now
                     # could resample a position that output later delivers.
                     # It drains within the pipeline depth.
+                    self._record_admission_blocked("stale_output")
                     skip_request(request_queue)
                     continue
 
@@ -965,6 +990,7 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    self._record_admission_blocked("lora_limit")
                     skip_request(request_queue, "lora_limit")
                     continue
 
@@ -1100,11 +1126,14 @@ class Scheduler(SchedulerInterface):
 
                 if prefetch_only:
                     assert self.connector is not None
-                    if (
-                        not load_kv_async
-                        or waiting_loads
-                        >= self.connector.get_async_prefetch_limit(request=request)
+                    if not load_kv_async:
+                        self._record_prefetch_event("no_async_load")
+                        park_request(request_queue)
+                        continue
+                    if waiting_loads >= self.connector.get_async_prefetch_limit(
+                        request=request
                     ):
+                        self._record_prefetch_event("connector_limit")
                         park_request(request_queue)
                         continue
 
@@ -1125,6 +1154,7 @@ class Scheduler(SchedulerInterface):
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
+                    self._record_admission_blocked("prefill_cadence")
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
@@ -1160,6 +1190,7 @@ class Scheduler(SchedulerInterface):
                         ):
                             if padded_num_tokens > request_token_budget:
                                 # Prefer to not schedule than schedule un-padded.
+                                self._record_admission_blocked("spec_padding")
                                 break
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
@@ -1175,6 +1206,7 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        self._record_admission_blocked("unchunked_prefill")
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
@@ -1189,6 +1221,7 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
+                            self._record_admission_blocked("mamba_alignment")
                             break
                         if (
                             pad_spec_decode
@@ -1226,6 +1259,7 @@ class Scheduler(SchedulerInterface):
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
+                        self._record_admission_blocked("encoder_or_lookahead")
                         break
 
                 # During async KV load, no forward pass is run yet.
@@ -1278,6 +1312,9 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
+                    self._record_admission_blocked("kv_allocation")
+                    if prefetch_only:
+                        self._record_prefetch_event("kv_allocation")
                     # The request cannot be scheduled.
 
                     # NOTE: we need to untouch the request from the encode cache
@@ -1313,6 +1350,8 @@ class Scheduler(SchedulerInterface):
                     )
 
                 if load_kv_async:
+                    if prefetch_only:
+                        self._record_prefetch_event("admitted")
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
@@ -2946,6 +2985,14 @@ class Scheduler(SchedulerInterface):
             counts[reason] = counts.get(reason, 0) + 1
         return counts
 
+    def _record_admission_blocked(self, reason: str) -> None:
+        if self.log_stats:
+            self._admission_blocked[reason] = self._admission_blocked.get(reason, 0) + 1
+
+    def _record_prefetch_event(self, event: str) -> None:
+        if self.log_stats:
+            self._prefetch_events[event] = self._prefetch_events.get(event, 0) + 1
+
     def make_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,
@@ -2976,11 +3023,15 @@ class Scheduler(SchedulerInterface):
         )
         num_running, num_waiting = self.get_request_counts()
         num_deferred = len(self.deferred_waiting)
+        admission_blocked, self._admission_blocked = self._admission_blocked, {}
+        prefetch_events, self._prefetch_events = self._prefetch_events, {}
         return SchedulerStats(
             num_running_reqs=num_running,
             num_waiting_reqs=num_waiting - num_deferred,
             num_skipped_waiting_reqs=num_deferred,
             deferred_waiting_reasons=self._get_deferred_waiting_reasons(),
+            admission_blocked=admission_blocked,
+            prefetch_events=prefetch_events,
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,

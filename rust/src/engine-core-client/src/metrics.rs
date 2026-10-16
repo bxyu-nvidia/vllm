@@ -55,6 +55,8 @@ struct SchedulerStatsHandles {
     scheduler_waiting: U64Gauge,
     scheduler_waiting_capacity: U64Gauge,
     scheduler_waiting_deferred: U64Gauge,
+    admission_blocked: Family<WaitingReasonLabels, U64Counter>,
+    prefetch_events: Family<WaitingReasonLabels, U64Counter>,
     scheduler_deferred_by_reason: Family<WaitingReasonLabels, U64Gauge>,
     kv_cache_usage: F64Gauge,
 
@@ -162,6 +164,8 @@ fn resolve_scheduler_stats_handles(
     };
 
     SchedulerStatsHandles {
+        admission_blocked: metrics.admission_blocked.clone(),
+        prefetch_events: metrics.prefetch_events.clone(),
         scheduler_deferred_by_reason: metrics.scheduler_deferred_by_reason.clone(),
         scheduler_running: metrics.scheduler_running.get_or_create_owned(&labels),
         scheduler_waiting: metrics.scheduler_waiting.get_or_create_owned(&labels),
@@ -242,6 +246,51 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
         .set(stats.num_waiting_reqs + stats.num_skipped_waiting_reqs);
     handles.scheduler_waiting_capacity.set(stats.num_waiting_reqs);
     handles.scheduler_waiting_deferred.set(stats.num_skipped_waiting_reqs);
+    for reason in [
+        "token_budget",
+        "input_budget",
+        "max_active_requests",
+        "kv_allocation",
+        "prefill_cadence",
+        "spec_padding",
+        "unchunked_prefill",
+        "mamba_alignment",
+        "encoder_or_lookahead",
+        "lora_limit",
+        "stale_output",
+        "preemption",
+        "paused",
+    ] {
+        handles
+            .admission_blocked
+            .get_or_create(&WaitingReasonLabels {
+                model_name: handles.labels.model_name.clone(),
+                engine: handles.labels.engine,
+                reason,
+            })
+            .inc_by(stats.admission_blocked.get(reason).copied().unwrap_or(0));
+    }
+    for reason in [
+        "disabled",
+        "limit",
+        "scan_limit",
+        "scanned",
+        "ineligible",
+        "attempted",
+        "no_async_load",
+        "connector_limit",
+        "kv_allocation",
+        "admitted",
+    ] {
+        handles
+            .prefetch_events
+            .get_or_create(&WaitingReasonLabels {
+                model_name: handles.labels.model_name.clone(),
+                engine: handles.labels.engine,
+                reason,
+            })
+            .inc_by(stats.prefetch_events.get(reason).copied().unwrap_or(0));
+    }
     for reason in DEFERRED_REASONS {
         handles
             .scheduler_deferred_by_reason
@@ -585,6 +634,11 @@ mod tests {
         assert_eq!(multi.mooncake.as_ref().unwrap().pipeline.len(), 3);
         let stats = SchedulerStats {
             num_skipped_waiting_reqs: 3,
+            admission_blocked: BTreeMap::from([("token_budget".to_string(), 2)]),
+            prefetch_events: BTreeMap::from([
+                ("attempted".to_string(), 3),
+                ("admitted".to_string(), 1),
+            ]),
             deferred_waiting_reasons: BTreeMap::from([
                 ("external_cache_lookup".to_string(), 2),
                 ("external_cache_lookup_ready".to_string(), 3),
@@ -610,6 +664,12 @@ mod tests {
         ] {
             assert!(rendered.contains(expected), "missing metric: {expected}");
         }
+        assert!(rendered.contains(
+            "vllm:scheduler_admission_blocked_total{model_name=\"model\",engine=\"0\",reason=\"token_budget\"} 2"
+        ));
+        assert!(rendered.contains(
+            "vllm:kv_prefetch_events_total{model_name=\"model\",engine=\"0\",reason=\"admitted\"} 1"
+        ));
         let mut drained = stats.kv_connector_stats.unwrap();
         let KvConnectorStats::Multi(ref mut multi) = drained else {
             unreachable!()
@@ -645,6 +705,12 @@ mod tests {
         ));
         assert!(rendered.contains(
             "vllm:mooncake_pipeline_consumption_wait_seconds_count{model_name=\"model\",engine=\"0\",stage=\"lookup\",rank=\"-1\"} 1"
+        ));
+        assert!(rendered.contains(
+            "vllm:scheduler_admission_blocked_total{model_name=\"model\",engine=\"0\",reason=\"token_budget\"} 2"
+        ));
+        assert!(rendered.contains(
+            "vllm:kv_prefetch_events_total{model_name=\"model\",engine=\"0\",reason=\"admitted\"} 1"
         ));
     }
 

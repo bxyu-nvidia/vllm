@@ -258,6 +258,8 @@ pub struct SchedulerMetrics {
     pub scheduler_running: Family<EngineLabels, U64Gauge>,
     pub scheduler_waiting: Family<EngineLabels, U64Gauge>,
     pub scheduler_waiting_by_reason: Family<WaitingReasonLabels, U64Gauge>,
+    pub admission_blocked: Family<WaitingReasonLabels, U64Counter>,
+    pub prefetch_events: Family<WaitingReasonLabels, U64Counter>,
     pub scheduler_deferred_by_reason: Family<WaitingReasonLabels, U64Gauge>,
     pub kv_cache_usage: Family<EngineLabels, F64Gauge>,
 
@@ -464,6 +466,18 @@ impl SchedulerMetrics {
             kv_block_reuse_gap_seconds.clone(),
         );
 
+        let admission_blocked = Family::default();
+        registry.register(
+            "vllm:scheduler_admission_blocked",
+            "Failed waiting admission checks; events, not unique requests.",
+            admission_blocked.clone(),
+        );
+        let prefetch_events = Family::default();
+        registry.register(
+            "vllm:kv_prefetch_events",
+            "Extra async prefetch events after compute budget exhaustion.",
+            prefetch_events.clone(),
+        );
         let scheduler_deferred_by_reason = Family::default();
         registry.register(
             "vllm:num_requests_deferred_by_reason",
@@ -628,6 +642,8 @@ impl SchedulerMetrics {
             scheduler_running,
             scheduler_waiting,
             scheduler_waiting_by_reason,
+            admission_blocked,
+            prefetch_events,
             scheduler_deferred_by_reason,
             kv_cache_usage,
             lora_info,

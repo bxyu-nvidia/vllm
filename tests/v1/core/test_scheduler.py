@@ -7309,6 +7309,27 @@ def test_budget_exhausted_prefetch_is_bounded_and_reserves_full_context(
         r for r in (first, second) if r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
     ]
     assert len(loads) == expected_loads
+    stats = scheduler.make_stats()
+    assert stats.admission_blocked["token_budget"] == 1
+    if limit == 0:
+        assert stats.prefetch_events == {"disabled": 1}
+    elif expected_loads:
+        assert stats.prefetch_events == {
+            "scanned": 1,
+            "attempted": 1,
+            "admitted": 1,
+            "limit": 1,
+        }
+    else:
+        assert stats.prefetch_events == {
+            "scanned": 1,
+            "attempted": 1,
+            "kv_allocation": 1,
+        }
+        assert stats.admission_blocked["kv_allocation"] == 1
+    drained = scheduler.make_stats()
+    assert drained.admission_blocked == {}
+    assert drained.prefetch_events == {}
     assert second.num_computed_tokens == 0
     if expected_loads:
         assert first.num_computed_tokens == 32
@@ -7343,5 +7364,45 @@ def test_prefetch_scan_is_bounded_and_preserves_waiting_order(monkeypatch):
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {requests[0].request_id: 16}
     assert readiness.call_count == scheduler.max_num_active_reqs
+    assert scheduler.make_stats().prefetch_events == {
+        "scanned": 4,
+        "ineligible": 4,
+        "scan_limit": 1,
+    }
     assert list(scheduler.waiting) == requests[1:]
     assert not scheduler.deferred_waiting
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize(
+    "constraint",
+    ["token_budget", "input_budget", "max_active_requests", "kv_allocation"],
+)
+def test_admission_block_metrics_accumulate_until_stats_emission(
+    constraint, async_scheduling
+):
+    scheduler = create_scheduler(async_scheduling=async_scheduling)
+    request = create_requests(num_requests=1, num_tokens=64)[0]
+    scheduler.add_request(request)
+    if constraint == "token_budget":
+        scheduler.max_num_scheduled_tokens = 0
+    elif constraint == "input_budget":
+        scheduler.scheduler_config.max_num_batched_tokens = 0
+    elif constraint == "max_active_requests":
+        scheduler.max_num_active_reqs = 0
+    else:
+        scheduler.kv_cache_manager.allocate_slots = Mock(return_value=None)
+    for _ in range(2):
+        assert scheduler.schedule().total_num_scheduled_tokens == 0
+    stats = scheduler.make_stats()
+    assert stats.admission_blocked == {constraint: 2}
+    assert stats.prefetch_events == {}
+    assert scheduler.make_stats().admission_blocked == {}
+    assert request in scheduler.waiting
+
+
+def test_empty_queue_does_not_report_admission_block():
+    scheduler = create_scheduler()
+    scheduler.max_num_scheduled_tokens = 0
+    scheduler.schedule()
+    assert scheduler.make_stats().admission_blocked == {}

@@ -309,6 +309,12 @@ pub struct SchedulerStats {
     /// Last observed dependency for each deferred request.
     #[serde(default)]
     pub deferred_waiting_reasons: std::collections::BTreeMap<String, u64>,
+    /// Admission check failures since the previous stats emission.
+    #[serde(default)]
+    pub admission_blocked: std::collections::BTreeMap<String, u64>,
+    /// Extra async prefetch events since the previous stats emission.
+    #[serde(default)]
+    pub prefetch_events: std::collections::BTreeMap<String, u64>,
     /// Internal DP load-balancing step counter.
     pub step_counter: u64,
     /// Internal DP load-balancing wave number.

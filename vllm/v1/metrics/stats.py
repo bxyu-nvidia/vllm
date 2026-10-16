@@ -182,6 +182,35 @@ class SchedulerIterationDetails:
     is_dummy: bool = False
 
 
+ADMISSION_BLOCK_REASONS = (
+    "token_budget",
+    "input_budget",
+    "max_active_requests",
+    "kv_allocation",
+    "prefill_cadence",
+    "spec_padding",
+    "unchunked_prefill",
+    "mamba_alignment",
+    "encoder_or_lookahead",
+    "lora_limit",
+    "stale_output",
+    "preemption",
+    "paused",
+)
+PREFETCH_EVENTS = (
+    "disabled",
+    "limit",
+    "scan_limit",
+    "scanned",
+    "ineligible",
+    "attempted",
+    "no_async_load",
+    "connector_limit",
+    "kv_allocation",
+    "admitted",
+)
+
+
 @dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
@@ -192,6 +221,9 @@ class SchedulerStats:
     # waiting requests deferred by transient constraints or a blocked status
     num_skipped_waiting_reqs: int = 0
     deferred_waiting_reasons: dict[str, int] = field(default_factory=dict)
+    # Event deltas accumulated across schedule calls since the last stats emission.
+    admission_blocked: dict[str, int] = field(default_factory=dict)
+    prefetch_events: dict[str, int] = field(default_factory=dict)
 
     # These are used for internal DP load-balancing.
     step_counter: int = 0

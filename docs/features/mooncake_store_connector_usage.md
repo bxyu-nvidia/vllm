@@ -313,6 +313,43 @@ the admission loop; compare it together with `ready_wait_seconds` against
 older runs. Queue and execution histograms describe completed observations,
 so also inspect queued/active gauges while work is outstanding.
 
+Two event counters help diagnose admission delays. Both Python and Rust
+frontends export them with `model_name`, `engine`, and `reason` labels:
+
+- `vllm:scheduler_admission_blocked_total`: observed failed waiting-admission
+  checks. `token_budget` and `input_budget` count at most once per scheduler
+  step with an unvisited waiting queue (token budget takes precedence when
+  both are exhausted). `max_active_requests` counts the request-slot gate.
+  `kv_allocation` counts a candidate's failed allocation, including full-sequence,
+  reservation, and watermark checks; it does not distinguish those subcauses.
+  Other reasons are `prefill_cadence`, `spec_padding`, `unchunked_prefill`,
+  `mamba_alignment`, `encoder_or_lookahead`, `lora_limit`, `stale_output`,
+  `preemption`, and `paused`.
+- `vllm:kv_prefetch_events_total`: only the **extra** prefetch path after compute
+  budget exhaustion; ordinary budgeted async loads are excluded. `scanned`
+  counts inspected candidates; `ineligible` means a candidate is not a fresh
+  waiting/preempted request with a ready lookup. `attempted` counts candidates
+  that pass that gate. `no_async_load` means lookup did not select an async load;
+  `connector_limit` means the selected connector does not opt in or is at its
+  limit; `kv_allocation` means allocation failed. `admitted` means KV blocks
+  were allocated and the request entered remote-load waiting, **not** that the
+  transfer completed. `disabled`, `limit`, and `scan_limit` count loop stops
+  with queued work. They count stops, not rejected requests.
+
+These counters accumulate across scheduler calls and drain once into each stats
+update. They count events, not unique requests or time spent waiting; a request
+can fail on multiple steps. Only checks actually reached are counted. A budget
+or request-slot gate does not establish whether each request behind it is ready,
+and a head-of-queue allocation failure is not attributed to the whole queue.
+Attempts can also be deferred by existing dependency checks before allocation,
+so outcome counts need not sum to `attempted`. Scheduling behavior is unchanged.
+
+Plot counter rates alongside the ready-request gauges and admission timing
+histograms. For example, frequent `token_budget` events with few `admitted`
+events explain why increasing the prefetch limit may not help; inspect the
+prefetch `reason` breakdown to see which gates were reached. A high budget-block
+rate alone can simply mean the engine is fully utilized.
+
 LBHNC/HND is strongly recommended for TP-sharded Store when supported. LBNHC/NHD
 creates many transfer segments and may significantly reduce PUT/GET performance.
 

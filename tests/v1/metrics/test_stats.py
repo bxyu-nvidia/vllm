@@ -33,6 +33,8 @@ def test_scheduler_iteration_details_serialization():
     outputs = EngineCoreOutputs(
         scheduler_stats=SchedulerStats(
             kv_cache_usage=0.5,
+            admission_blocked={"token_budget": 2},
+            prefetch_events={"admitted": 1},
             iteration_details=iteration_details,
         )
     )
@@ -42,6 +44,8 @@ def test_scheduler_iteration_details_serialization():
 
     assert decoded.scheduler_stats is not None
     assert decoded.scheduler_stats.kv_cache_usage == 0.5
+    assert decoded.scheduler_stats.admission_blocked == {"token_budget": 2}
+    assert decoded.scheduler_stats.prefetch_events == {"admitted": 1}
     assert decoded.scheduler_stats.iteration_details == iteration_details
 
 
@@ -288,3 +292,43 @@ def test_prompt_token_stats_full_external_transfer_recompute():
     assert stats.external_kv_transfer == 999
     assert stats.cached_tokens == 999
     assert stats.total == 1000
+
+
+def test_admission_event_export_accumulates_deltas_and_keeps_engine_labels():
+    from prometheus_client import REGISTRY
+
+    from tests.v1.core.utils import create_scheduler
+    from vllm.v1.metrics.loggers import PrometheusStatLogger
+    from vllm.v1.metrics.prometheus import unregister_vllm_metrics
+
+    config = create_scheduler().vllm_config
+    logger = PrometheusStatLogger(config, engine_indexes=[0, 1])
+    try:
+        for stats in (
+            SchedulerStats(
+                admission_blocked={"kv_allocation": 2}, prefetch_events={"admitted": 1}
+            ),
+            SchedulerStats(),
+            SchedulerStats(admission_blocked={"kv_allocation": 1}),
+        ):
+            logger.record(stats, None, engine_idx=1)
+        for engine, blocked, admitted in ((0, 0, 0), (1, 3, 1)):
+            labels = {
+                "model_name": config.model_config.served_model_name,
+                "engine": str(engine),
+            }
+            assert (
+                REGISTRY.get_sample_value(
+                    "vllm:scheduler_admission_blocked_total",
+                    {**labels, "reason": "kv_allocation"},
+                )
+                == blocked
+            )
+            assert (
+                REGISTRY.get_sample_value(
+                    "vllm:kv_prefetch_events_total", {**labels, "reason": "admitted"}
+                )
+                == admitted
+            )
+    finally:
+        unregister_vllm_metrics()
