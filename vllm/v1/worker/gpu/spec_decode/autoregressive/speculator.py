@@ -27,6 +27,9 @@ logger = init_logger(__name__)
 
 
 class AutoRegressiveSpeculator(DraftModelSpeculator):
+    # Preserve draft KV for future chunks/transfers without generating drafts.
+    prefill_only: bool = False
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
 
@@ -95,7 +98,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self._configure_fused_multi_step_decode()
 
     def _configure_fused_multi_step_decode(self) -> None:
-        if self.num_speculative_steps == 1:
+        if self.num_speculative_steps == 1 or self.prefill_only:
             self.use_fused_multi_step_decode = False
             return
 
@@ -171,7 +174,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         self.on_prefill_end(self.max_num_reqs)
 
-        if self.num_speculative_steps == 1:
+        if self.num_speculative_steps == 1 or self.prefill_only:
             return
 
         self.on_multi_step_decode_begin(self.max_num_reqs)
@@ -321,6 +324,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 mm_inputs=mm_inputs,
             )
         self.on_prefill_end(num_reqs)
+
+        if self.prefill_only:
+            # Keep the configured width for the runner's persistent buffers.
+            # Async scheduling consumes zero drafts for this constant schedule.
+            return self.draft_tokens[:num_reqs].fill_(-1)
 
         if self.num_speculative_steps == 1:
             # Early exit.
@@ -480,6 +488,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             last_hidden_states, hidden_states = self.pcp_manager.restore_draft_prefill(
                 last_hidden_states, hidden_states
             )
+
+        if self.prefill_only:
+            return
 
         sample_hidden_states = last_hidden_states[last_token_indices]
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(

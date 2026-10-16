@@ -1,16 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import torch
 import torch.nn as nn
 
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
+logger = init_logger(__name__)
+
 
 class MTPSpeculator(AutoRegressiveSpeculator):
     share_mtp_topk_indices: bool = False
+
+    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        super().__init__(vllm_config, device)
+        schedule = self.speculative_config.num_speculative_tokens_per_batch_size
+        if schedule is not None and self.scheduler_config.async_scheduling:
+            lookup = build_dynamic_sd_schedule_lookup(
+                schedule, self.max_num_reqs, self.num_speculative_steps
+            )
+            # A config-wide decision also applies to idle DP ranks' dummy runs.
+            # Per-batch decisions would require another cross-rank agreement.
+            self.prefill_only = all(k == 0 for k in lookup[1:])
+        if self.prefill_only:
+            logger.info_once(
+                "MTP constant K=0 schedule: retaining draft KV prefill, skipping "
+                "draft sampling, autoregressive draft steps, and their CUDA graphs."
+            )
 
     def load_draft_model(
         self,
@@ -45,7 +67,11 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         # Step 0 (prefill) wrote topk indices for every query token in the
         # multi-token batch. Compact them down to each request's last token so
         # steps 1+ can reuse them from the shared buffer.
-        if self.share_mtp_topk_indices and self.num_speculative_steps > 1:
+        if (
+            self.share_mtp_topk_indices
+            and self.num_speculative_steps > 1
+            and not self.prefill_only
+        ):
             self.model.model.compact_topk_indices(self.last_token_indices[:num_reqs])
 
     def on_multi_step_decode_begin(self, num_reqs: int) -> None:
