@@ -98,6 +98,7 @@ class MambaHybridModelState(DefaultModelState):
             self._is_prefilling_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.bool, device=self.device
             )
+            self._is_prefill_tail_gpu = torch.zeros_like(self._is_prefilling_gpu)
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
@@ -128,9 +129,15 @@ class MambaHybridModelState(DefaultModelState):
             # smaller block (e.g. DFlash) pulls it below mamba_block_size.
             mamba_block_size = self.cache_config.mamba_block_size
             assert mamba_block_size is not None
-            self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // mamba_block_size
+            # ReplaySSM's scheduler copies the canonical checkpoint into the
+            # live slot. Mark new/resumed ownership so preprocess resets the
+            # slot's cursors: remote transfers do not populate replay history.
+            state_idx = (
+                -1
+                if self._use_flashinfer_replayssm
+                else (new_req_data.num_computed_tokens - 1) // mamba_block_size
             )
+            self._mamba_state_idx_gpu[req_index].fill_(state_idx)
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -326,6 +333,14 @@ class MambaHybridModelState(DefaultModelState):
             async_tensor_h2d(
                 replayssm_prefilling, out=self._is_prefilling_gpu[:num_reqs]
             )
+            # Retain logical prefill status before padded tails were classified
+            # as decode. Those rows still need canonical checkpoints for export.
+            prefill_tail = torch.zeros_like(replayssm_prefilling)
+            prefill_tail[: input_batch.num_reqs] = (
+                torch.from_numpy(input_batch.is_prefilling_np)
+                & ~replayssm_prefilling[: input_batch.num_reqs]
+            )
+            async_tensor_h2d(prefill_tail, out=self._is_prefill_tail_gpu[:num_reqs])
 
         if self._align_mode:
             mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
@@ -469,6 +484,7 @@ class MambaHybridModelState(DefaultModelState):
                 else self.num_accepted_tokens_gpu
             ),
             is_prefilling=self._is_prefilling_gpu[:num_reqs],
+            is_prefill_tail=self._is_prefill_tail_gpu[:num_reqs],
             live_cols=(self._mamba_state_idx_gpu if self._align_mode else None),
             num_reqs=num_reqs,
         )
