@@ -1082,13 +1082,13 @@ class VllmConfig:
                 vllm_num_speculative_tokens=speculative_config.num_speculative_tokens,
             )
             # Constant schedules cannot select different K on different ranks.
-            # MRV2 retains the static drafter on real and dummy batches; async
-            # scheduling applies this K to target verification placeholders.
+            # MRV2 uses the same draft execution path on real and dummy batches;
+            # async scheduling applies this K to target verification placeholders.
             if len(set(schedule[1:])) == 1:
                 logger.info_once(
                     "Keeping constant speculative-token schedule K=%d with data "
-                    "parallelism and V2 async scheduling. The drafter retains "
-                    "static num_speculative_tokens=%d.",
+                    "parallelism and V2 async scheduling. Retaining "
+                    "static draft capacity num_speculative_tokens=%d.",
                     schedule[1],
                     speculative_config.num_speculative_tokens,
                 )

@@ -495,7 +495,9 @@ class SpeculativeConfig:
     inclusive batch-size range. With data parallelism, only schedules that resolve
     to a constant count across supported batch sizes are kept, and only with the
     V2 model runner and async scheduling. These control target verification;
-    the V2 drafter still uses the static ``num_speculative_tokens``.
+    draft capacity stays at ``num_speculative_tokens``. For a constant zero
+    schedule, the V2 single-module MTP proposer only populates draft KV, skipping
+    draft sampling and subsequent autoregressive draft steps.
     """
 
     # params generated in the post-init stage

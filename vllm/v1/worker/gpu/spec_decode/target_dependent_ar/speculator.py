@@ -30,6 +30,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
     hidden states (and, for Gemma4, its KV cache) at each draft step.
     """
 
+    # Preserve draft KV for future chunks/transfers without generating drafts.
+    prefill_only: bool = False
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
 
@@ -81,7 +84,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
     def _configure_decode_metadata_update(self) -> None:
         # With one speculative step there are no draft decode steps to update.
-        if self.num_speculative_steps == 1:
+        if self.num_speculative_steps == 1 or self.prefill_only:
             self.supports_decode_metadata_update = False
             return
         super()._configure_decode_metadata_update()
@@ -137,7 +140,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         )
         self.on_prefill_end(self.max_num_reqs)
 
-        if self.num_speculative_steps == 1:
+        if self.num_speculative_steps == 1 or self.prefill_only:
             return
 
         self.on_multi_step_decode_begin(self.max_num_reqs)
@@ -293,8 +296,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             )
         self.on_prefill_end(num_reqs)
 
-        if num_speculative_tokens <= 1:
-            if num_speculative_tokens == 0:
+        if self.prefill_only or num_speculative_tokens <= 1:
+            if self.prefill_only or num_speculative_tokens == 0:
                 self.draft_tokens[:num_reqs].fill_(-1)
             return self.draft_tokens[:num_reqs]
 
@@ -459,6 +462,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             last_hidden_states, hidden_states = self.pcp_manager.restore_draft_prefill(
                 last_hidden_states, hidden_states
             )
+
+        if self.prefill_only:
+            return
 
         sample_hidden_states = last_hidden_states[last_token_indices]
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(
