@@ -718,6 +718,39 @@ def test_free_kv_cache_block_queue_initialization():
     assert queue.fake_free_list_tail.prev_free_block is block
 
 
+@pytest.mark.parametrize("empty_queue", [False, True])
+def test_free_kv_cache_block_queue_restore_order(empty_queue: bool):
+    # Queue order must not depend on IDs or asynchronous completion order.
+    blocks = [KVCacheBlock(block_id=10 - i) for i in range(10)]
+    queue = FreeKVCacheBlockQueue(blocks)
+    if empty_queue:
+        removed = queue.popleft_n(10)
+        queue.restore_n(removed[::2])
+        queue.restore_n(removed[1::2])
+        expected = blocks
+    else:
+        queue.remove(blocks[3])
+        queue.remove(blocks[5])
+        queue.prepend_n([queue.popleft()])
+        queue.remove(blocks[8])
+        queue.append(blocks[8])
+        queue.restore_n([blocks[5], blocks[3]])
+        expected = [*blocks[:8], blocks[9], blocks[8]]
+    assert queue.num_free_blocks == len(expected)
+    assert queue.get_all_free_blocks() == expected
+    previous = queue.fake_free_list_head
+    for block in expected:
+        assert block.prev_free_block is previous
+        assert previous.next_free_block is block
+        previous = block
+    assert previous.next_free_block is queue.fake_free_list_tail
+    assert queue.fake_free_list_tail.prev_free_block is previous
+    assert queue.popleft_n(10) == expected
+    assert queue.num_free_blocks == 0
+    assert queue.fake_free_list_head.next_free_block is queue.fake_free_list_tail
+    assert queue.fake_free_list_tail.prev_free_block is queue.fake_free_list_head
+
+
 def test_free_kv_cache_block_queue_operations():
     # Create a list of KVCacheBlock objects
     blocks = [KVCacheBlock(block_id=i) for i in range(5)]

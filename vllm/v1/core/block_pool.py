@@ -728,16 +728,16 @@ class BlockPool:
         blocks: Iterable[KVCacheBlock],
         on_reuse: Callable[[KVCacheBlock], None],
         *,
-        to_front: bool = False,
+        restore_order: bool = False,
     ) -> None:
         """Release references to blocks that stay readable until reused.
 
-        The blocks become last-resort eviction candidates regardless of prefix
-        caching: they join the tail of the free queue and count as free.
+        By default, blocks become last-resort eviction candidates regardless of
+        prefix caching: they join the tail of the free queue and count as free.
         ``on_reuse`` fires when ``get_new_blocks`` hands a block out (or the
         cache is reset), so the caller can stop reading it.
-        ``to_front`` returns cold eviction-save sources to the eviction end
-        instead of promoting them merely because an external save completed.
+        ``restore_order`` restores untouched eviction-save sources to their
+        original queue order. Only real prefix accesses refresh their recency.
         """
         released: list[KVCacheBlock] = []
         accessed: list[KVCacheBlock] = []
@@ -747,12 +747,12 @@ class BlockPool:
             self._reuse_watchers[block.block_id] = on_reuse
             was_accessed = self._eviction_save_accessed.pop(block.block_id, False)
             if block.ref_cnt == 0:
-                if to_front and was_accessed:
+                if restore_order and was_accessed:
                     accessed.append(block)
                 else:
                     released.append(block)
-        if to_front:
-            self.free_block_queue.prepend_n(released)
+        if restore_order:
+            self.free_block_queue.restore_n(released)
             self.free_block_queue.append_n(accessed)
         else:
             self.free_block_queue.append_n(released)

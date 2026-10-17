@@ -500,7 +500,14 @@ class MooncakeStoreScheduler:
         entries: list[EvictionSaveBlock] = []
         queue = pool.free_block_queue
         block = queue.fake_free_list_head.next_free_block
-        for _ in range(self.eviction_save_lookahead_blocks):
+        # Small hybrid pools must not turn a large configured lookahead into
+        # eager saving of the entire cache. Count pins still outside the queue
+        # so pending jobs do not advance the scan into hotter blocks.
+        lookahead = min(
+            self.eviction_save_lookahead_blocks,
+            (pool.num_gpu_blocks - 1) // 4,
+        )
+        for _ in range(max(0, lookahead - pending)):
             if block is None or block is queue.fake_free_list_tail:
                 break
             key = block.block_hash
@@ -761,7 +768,7 @@ class MooncakeStoreScheduler:
                 pool.unpin_blocks(
                     (pool.blocks[bid] for bid in block_ids),
                     self._forget_eviction_save,
-                    to_front=True,
+                    restore_order=True,
                 )
             else:
                 # Tail-first, as elsewhere, so the shared prefix is evicted last.

@@ -198,6 +198,9 @@ class KVCacheBlock:
     prev_free_block: "KVCacheBlock | None" = None
     next_free_block: "KVCacheBlock | None" = None
 
+    # Retained while detached so asynchronous pins can restore eviction order.
+    _free_queue_order: int = field(default=0, repr=False, compare=False, kw_only=True)
+
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
@@ -250,8 +253,8 @@ class FreeKVCacheBlockQueue:
     list of free blocks. We implement this class instead of using Python
     builtin deque to support removing a block in the middle of the queue
     in O(1) time. To close the performance gap to the builtin deque which is
-    implemented in C++, this class does not allocate any Python objects when
-    manipulating the linked list. Instead, this class manipulates the
+    implemented in C++, this class reuses the block objects when
+    manipulating the linked list. This class manipulates the
     prev_free_block and next_free_block attributes of the given blocks.
 
     The queue is ordered by block ID in the beginning. When a block is allocated
@@ -270,9 +273,12 @@ class FreeKVCacheBlockQueue:
 
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
         self.num_free_blocks = len(blocks)
+        self._head_order = 0
+        self._tail_order = len(blocks)
 
         # Initialize doubly links of consecutive blocks
         for i in range(self.num_free_blocks):
+            blocks[i]._free_queue_order = i
             if i > 0:
                 blocks[i].prev_free_block = blocks[i - 1]
             if i < self.num_free_blocks - 1:
@@ -405,6 +411,8 @@ class FreeKVCacheBlockQueue:
             )
         last_block: KVCacheBlock = self.fake_free_list_tail.prev_free_block
 
+        block._free_queue_order = self._tail_order
+        self._tail_order += 1
         # Connect the new block after the last block.
         last_block.next_free_block = block
         block.prev_free_block = last_block
@@ -425,8 +433,10 @@ class FreeKVCacheBlockQueue:
             "next_free_block of fake_free_list_head should always exist"
         )
 
+        self._head_order -= len(blocks)
         prev_block = self.fake_free_list_head
-        for block in blocks:
+        for i, block in enumerate(blocks):
+            block._free_queue_order = self._head_order + i
             block.prev_free_block = prev_block
             prev_block.next_free_block = block
             prev_block = block
@@ -452,6 +462,8 @@ class FreeKVCacheBlockQueue:
         )
         # Add inter-connections between consecutive blocks
         for block in blocks:
+            block._free_queue_order = self._tail_order
+            self._tail_order += 1
             block.prev_free_block = last_block
             last_block.next_free_block = block
             last_block = block
@@ -461,6 +473,32 @@ class FreeKVCacheBlockQueue:
         self.fake_free_list_tail.prev_free_block = last_block
 
         self.num_free_blocks += len(blocks)
+
+    def restore_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Restore detached blocks without changing their eviction priority.
+
+        Blocks must have been removed from this queue without being reinserted.
+        Freshly prepended or appended blocks retain their new priority, even when
+        asynchronous pins complete out of order. Cost is O(F + B log B) for F
+        traversed free blocks and B restored blocks.
+        """
+        cursor = self.fake_free_list_head.next_free_block
+        for block in sorted(blocks, key=lambda b: b._free_queue_order):
+            assert block.prev_free_block is None and block.next_free_block is None
+            assert cursor is not None
+            while (
+                cursor is not self.fake_free_list_tail
+                and cursor._free_queue_order < block._free_queue_order
+            ):
+                cursor = cursor.next_free_block
+                assert cursor is not None
+            previous = cursor.prev_free_block
+            assert previous is not None
+            previous.next_free_block = block
+            block.prev_free_block = previous
+            block.next_free_block = cursor
+            cursor.prev_free_block = block
+            self.num_free_blocks += 1
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.

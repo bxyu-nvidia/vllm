@@ -281,7 +281,7 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 - `save_decode_cache` (bool): Enable offloading decode tokens' KV cache. A `kv_consumer` does not save during prefill; when decode starts, it fills any missing block-aligned prompt prefix before appending completed decode blocks. Default: `false`.
 - `save_on_eviction` (bool): Opt into asynchronous saves of cold GPU prefix-cache blocks ahead of their reuse, instead of eagerly saving ordinary attention blocks during each forward. Default: `false`. Requires prefix caching and `kv_producer` or `kv_both`. See the eviction-save policy below.
 - `eviction_save_max_blocks` (positive int): Maximum physical GPU blocks pinned by outstanding eviction-save jobs **per engine**, across all groups. Default: `256`.
-- `eviction_save_lookahead_blocks` (positive int): Maximum slots inspected from the eviction end of the free list per scheduling step, including unused and previously attempted slots. Default: `2048`.
+- `eviction_save_lookahead_blocks` (positive int): Maximum slots inspected from the eviction end of the free list per scheduling step, including unused and previously attempted slots. Capped at one quarter of the pool's non-null blocks; outstanding eviction-save pins count toward this window. Default: `2048`.
 - `store_tp_size` (int): Common Store TP for endpoints with different local TP sizes. It supports LBHNC and LBNHC local KV caches, with `store_tp_size >= local_tp_size` and `store_tp_size % local_tp_size == 0`. The current topology is one full-attention cache group, PCP/DCP disabled, and cross-layer blocks disabled. For GQA and MHA, the total KV-head count must be divisible by `store_tp_size`. Store shards contain fixed global KV-head ranges in the local layout. Shared endpoints use the same KV cache layout, pipeline-parallel size, and Store TP. The Store namespace includes the layout and PP size. Unsupported configurations use a topology-specific rank-local namespace.
 
 Lookup futures are collected at the start of every scheduler step, even when
@@ -476,12 +476,17 @@ to the existing background store thread. Existence checks, CUDA event waits and
 Mooncake writes run on that thread, not in the scheduler or GPU allocator.
 Other available blocks remain allocatable. Blocks stay pinned until **every
 worker rank** reports completion, including failure or a deduplication hit.
-They then return to the eviction end rather than becoming recently used.
-A concurrent prefix-cache reader keeps its own reference.
+On completion, untouched blocks return to their original eviction order,
+even when saves finish out of order. They cannot jump ahead of unused slots
+or older cached blocks. A real prefix-cache access refreshes recency, and a
+concurrent reader keeps its own reference.
 
 Outstanding eviction-save pins are bounded by `eviction_save_max_blocks`.
 New jobs also leave at least three quarters of the currently free-plus-pinned
-slots unpinned by eviction saves. This is a best-effort lookahead policy:
+slots unpinned by eviction saves. The lookahead is capped at one quarter of
+the pool's non-null blocks, including outstanding eviction-save pins. For a
+1,353-block pool, a configured lookahead of 2,048 therefore covers at most 338
+slots, avoiding a sweep of the whole cache. This is a best-effort lookahead policy:
 a large allocation can overtake the lookahead, or bounded pin capacity/storage
 failure can prevent a save. Such blocks may be evicted without a stored copy
 and recomputed on a later miss. The allocator never waits for an upload.

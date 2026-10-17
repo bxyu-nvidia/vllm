@@ -1562,6 +1562,8 @@ def test_eviction_save_pins_until_all_ranks_complete(concurrent_hit):
     key = make_block_hash_with_group_id(b"cold", 0)
     pool._insert_block_hash(key, block, num_tokens=16)
     pool.free_blocks([block])
+    # Move the cold block into the bounded lookahead window.
+    pool.get_new_blocks(pool.get_num_free_blocks() - 8)
 
     meta = scheduler.build_connector_meta(_make_offload_only_output([]))
     job = meta.requests[0].store_job_id
@@ -1670,6 +1672,8 @@ def test_access_during_eviction_save_refreshes_recency_after_reader_finishes(
         make_block_hash_with_group_id(b"hot-again", 0), block, num_tokens=16
     )
     pool.free_blocks([block])
+    # Move the cold block into the bounded lookahead window.
+    pool.get_new_blocks(pool.get_num_free_blocks() - 8)
     meta = scheduler.build_connector_meta(_make_offload_only_output([]))
     if access_kind == "prefix_hit":
         pool.touch([block])
@@ -1709,3 +1713,82 @@ def test_eviction_save_rejects_invalid_configuration(
     )
     with pytest.raises(ValueError, match=match):
         MooncakeStoreScheduler(config, _make_qsa_hybrid_cache_config())
+
+
+@pytest.mark.parametrize("reverse_completion", [False, True])
+def test_eviction_save_restores_queue_order_across_jobs(reverse_completion):
+    """Save completion must not move prefixes ahead of unused/older slots."""
+    scheduler = _make_bare_scheduler()
+    scheduler.save_on_eviction = True
+    scheduler.eviction_save_max_blocks = 2
+    pool = scheduler._gpu_block_pool
+    blocks = pool.get_new_blocks(pool.get_num_free_blocks())
+    for i, block in enumerate(blocks[:32]):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(bytes([i]), 0), block, num_tokens=16
+        )
+    pool.free_blocks(blocks[:32])
+    # Keep the oldest prefix eligible for allocation but skip its store job.
+    scheduler._eviction_save_attempts[blocks[0].block_id] = blocks[0].block_hash
+    empty = _make_offload_only_output([])
+    first = scheduler.build_connector_meta(empty).requests[0].store_job_id
+    scheduler.eviction_save_max_blocks = 4
+    second = scheduler.build_connector_meta(empty).requests[0].store_job_id
+    # An unrelated allocation becomes free while the saves are pending.
+    pool.free_blocks([blocks[32]])
+    for job in [second, first] if reverse_completion else [first, second]:
+        scheduler.update_connector_output(_make_worker_output({job: 1}))
+    expected = [blocks[32], *blocks[:32]]
+    assert [b.block_id for b in pool.free_block_queue.get_all_free_blocks()] == [
+        b.block_id for b in expected
+    ]
+    assert pool.get_num_free_blocks() == len(expected)
+    assert pool.get_new_blocks(1) == [blocks[32]]
+    assert pool.get_cached_block(bytes([0]), [0]) == [blocks[0]]
+
+
+def test_eviction_lookahead_does_not_sweep_small_pool():
+    scheduler = _make_bare_scheduler()
+    scheduler.save_on_eviction = True
+    pool = scheduler._gpu_block_pool
+    blocks = pool.get_new_blocks(pool.get_num_free_blocks())
+    for i, block in enumerate(blocks):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(bytes([i]), 0), block, num_tokens=16
+        )
+    pool.free_blocks(blocks)
+    empty = _make_offload_only_output([])
+    first = scheduler.build_connector_meta(empty).requests[0]
+    assert len(first.eviction_blocks) == len(blocks) // 4
+    scheduler.update_connector_output(_make_worker_output({first.store_job_id: 1}))
+    # The configured 2048-slot scan must not sweep this 63-slot pool as
+    # successive jobs finish. It covers only the oldest quarter of the pool.
+    assert scheduler.build_connector_meta(empty).requests == []
+    pool.get_new_blocks(1)
+    next_job = scheduler.build_connector_meta(empty).requests[0]
+    assert [b.block_id for b in next_job.eviction_blocks] == [
+        blocks[len(blocks) // 4].block_id
+    ]
+
+
+def test_pending_eviction_saves_count_toward_lookahead():
+    scheduler = _make_bare_scheduler()
+    scheduler.save_on_eviction = True
+    scheduler.eviction_save_lookahead_blocks = 2
+    pool = scheduler._gpu_block_pool
+    blocks = pool.get_new_blocks(pool.get_num_free_blocks())
+    for i, block in enumerate(blocks):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(bytes([i]), 0), block, num_tokens=16
+        )
+    pool.free_blocks(blocks)
+    scheduler._eviction_save_attempts[blocks[0].block_id] = blocks[0].block_hash
+    empty = _make_offload_only_output([])
+    first = scheduler.build_connector_meta(empty).requests[0]
+    assert [entry.block_id for entry in first.eviction_blocks] == [blocks[1].block_id]
+    # There is spare pin capacity, but the in-flight block still occupies the
+    # second slot of the lookahead. Do not save the next, hotter prefix yet.
+    assert scheduler.build_connector_meta(empty).requests == []
+    pool.get_new_blocks(1)
+    second = scheduler.build_connector_meta(empty).requests[0]
+    assert [entry.block_id for entry in second.eviction_blocks] == [blocks[2].block_id]
