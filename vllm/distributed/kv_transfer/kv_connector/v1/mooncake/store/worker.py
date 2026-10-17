@@ -424,6 +424,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         supports_group_ids: bool = False,
         record_operation: Callable[..., None] | None = None,
         group_participates: Sequence[bool] | None = None,
+        *,
+        external_cache_only: bool = False,
     ):
         super().__init__(
             store,
@@ -453,6 +455,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # store_job_id -> times this rank finished with it, drained every step
         # so the scheduler can release the blocks it referenced for those jobs.
         self._completed_saves: dict[int, int] = {}
+        self.external_cache_only = external_cache_only
+        self._store_error: str | None = None
         self.enable_kv_event = enable_kv_event
         # Caller always passes a non-None ReplicateConfig — see
         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
@@ -515,6 +519,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
     def take_completed_saves(self) -> dict[int, int]:
         with self.done_task_lock:
+            if self._store_error is not None:
+                raise RuntimeError(self._store_error)
             completed = self._completed_saves
             self._completed_saves = {}
         return completed
@@ -828,8 +834,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         return True
 
     def _handle_request(self, req_meta: ReqMeta):
-        # The single `finally` is the only way out, so the scheduler releases
-        # this job's GPU block references however the job ends.
+        # External-only mode must not release the only copy after a failed
+        # PUT. Surface the error on the worker's next completion poll instead.
         save_completed = False
         token_len = 0
         req_id = req_meta.req_id
@@ -844,6 +850,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             current_event = req_meta.current_event
 
             if not self.is_live_store_job(req_meta):
+                save_completed = True
                 return
 
             if self.enable_kv_event:
@@ -854,7 +861,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         event_token_ids = retry_ids + event_token_ids
                         token_ids_start = retry_start
 
-            if self._should_skip_request(req_id):
+            if not self.external_cache_only and self._should_skip_request(req_id):
                 logger.debug(
                     "Skipping Mooncake store for request %s while CPU/disk "
                     "offloading is under pressure",
@@ -870,6 +877,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 return
 
             if token_len == 0:
+                save_completed = True
                 return
 
             # Resume from where this rank left off; only the new suffix is saved.
@@ -1146,7 +1154,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     token_ids_start,
                     event_token_ids,
                 )
-            self.finish_store_job(req_meta)
+            if self.external_cache_only and not save_completed:
+                with self.done_task_lock:
+                    self._store_error = (
+                        "Mooncake external_cache_only save failed for request "
+                        f"{req_id}, job {req_meta.store_job_id}; GPU blocks remain "
+                        "pinned. Check Mooncake capacity and transfer errors."
+                    )
+            else:
+                self.finish_store_job(req_meta)
             self.request_queue.task_done()
 
 
@@ -1499,6 +1515,7 @@ class MooncakeStoreWorker:
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
             extra_config.get("save_decode_cache", False)
         )
+        self.external_cache_only = extra_config.get("external_cache_only", False)
         self.load_async = extra_config.get("load_async", True)
         # Mirrors MooncakeStoreConnector._capacity_only.
         self._capacity_only = (
@@ -2028,6 +2045,7 @@ class MooncakeStoreWorker:
                     group.kv_cache_spec.prefix_cacheable
                     for group in self._kv_cache_groups
                 ],
+                external_cache_only=self.external_cache_only,
             )
             self.kv_send_thread.start()
 

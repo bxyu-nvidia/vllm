@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import ctypes
 import itertools
 import json
 import logging
@@ -153,6 +154,7 @@ def _make_store_sending_thread(
     replicate_config: object | None = None,
     enable_group_semantics: bool = False,
     supports_group_ids: bool = False,
+    external_cache_only: bool = False,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
         coord = _default_send_coord()
@@ -173,6 +175,7 @@ def _make_store_sending_thread(
         replicate_config=replicate_config,
         enable_group_semantics=enable_group_semantics,
         supports_group_ids=supports_group_ids,
+        external_cache_only=external_cache_only,
     )
     thread.request_queue.task_done = MagicMock()
     return thread
@@ -3513,6 +3516,7 @@ def _make_bare_worker(
     worker.store.register_buffer.return_value = 0
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
+    worker.external_cache_only = False
     worker._capacity_only = False
     worker.block_size = block_size
     worker._is_hma_required = False
@@ -5066,3 +5070,123 @@ def test_pipeline_prometheus_exports_backlog_and_resets_to_zero():
         )
         == 2.0
     )
+
+
+@pytest.mark.parametrize(
+    "failure", ["lookup", "put", "partial", "pressure", "boundary"]
+)
+def test_external_only_save_failure_is_fatal_and_does_not_release_blocks(failure):
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0, 0]
+    store.batch_put_from_multi_buffers.return_value = [0, 0]
+    if failure in ("lookup", "put"):
+        method = (
+            "batch_is_exist" if failure == "lookup" else "batch_put_from_multi_buffers"
+        )
+        getattr(store, method).side_effect = RuntimeError("store unavailable")
+    elif failure == "partial":
+        store.batch_put_from_multi_buffers.return_value = [0, -500]
+    elif failure == "pressure":
+        store.batch_put_from_multi_buffers.return_value = [
+            mooncake_store_worker.MOONCAKE_NO_AVAILABLE_HANDLE
+        ] * 2
+    thread = _make_store_sending_thread(store, external_cache_only=True)
+    req = _make_store_req("req-a", [b"a0", b"a1"])
+    if failure == "boundary":
+        req.boundary_state_offloads = [(0, 1, 16)]
+        thread._maybe_offload_boundary_states = MagicMock(return_value=False)
+    with contextlib.suppress(RuntimeError):
+        _run_store_req(thread, req)
+    assert thread.is_live_store_job(req)
+    assert thread._completed_saves == {}
+    with pytest.raises(RuntimeError, match="external_cache_only save failed"):
+        thread.take_completed_saves()
+
+
+@pytest.mark.parametrize("already_stored", [False, True])
+def test_external_only_success_or_dedup_releases_job(already_stored):
+    store = MagicMock()
+    store.batch_is_exist.return_value = [int(already_stored)] * 2
+    store.batch_put_from_multi_buffers.return_value = [0, 0]
+    thread = _make_store_sending_thread(store, external_cache_only=True)
+    req = _make_store_req("req-a", [b"a0", b"a1"])
+    # External-only mode must never silently skip a live save under pressure.
+    thread._store_pressure_active = True
+    thread._skip_store_requests.add(req.req_id)
+    _run_store_req(thread, req)
+    assert thread.take_completed_saves() == {req.store_job_id: 1}
+    assert store.batch_put_from_multi_buffers.call_count == int(not already_stored)
+
+
+def test_external_only_empty_job_is_not_a_store_failure():
+    thread = _make_store_sending_thread(MagicMock(), external_cache_only=True)
+    req = _make_store_req("short", [])
+    req.token_len_chunk = 0
+    _run_store_req(thread, req)
+    assert thread.take_completed_saves() == {req.store_job_id: 1}
+
+
+def test_external_only_saved_kv_survives_local_reuse_and_reloads():
+    """Exercise real key/transfer logic with byte-copying CPU store I/O."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    data = torch.arange(3 * 256, dtype=torch.int64).to(torch.uint8)
+    expected = data[256:].clone()
+    stored = {}
+    store = MagicMock()
+
+    def put(keys, addresses, sizes, *_args):
+        for key, addrs, lengths in zip(keys, addresses, sizes):
+            stored[key] = [
+                ctypes.string_at(addr, length) for addr, length in zip(addrs, lengths)
+            ]
+        return [0] * len(keys)
+
+    def get(keys, addresses, sizes):
+        for key, addrs, lengths in zip(keys, addresses, sizes):
+            for addr, length, value in zip(addrs, lengths, stored[key]):
+                assert length == len(value)
+                ctypes.memmove(addr, value, length)
+        return [0] * len(keys)
+
+    store.batch_is_exist.side_effect = lambda keys: [int(k in stored) for k in keys]
+    store.batch_put_from_multi_buffers.side_effect = put
+    store.batch_get_into_multi_buffers.side_effect = get
+    worker = _make_bare_worker(num_gpu_blocks=3)
+    worker.store = store
+    db = worker.token_dbs[0]
+    db.set_kv_caches_base_addr([data.data_ptr()])
+    db.set_block_len([256])
+    sender = _make_store_sending_thread(
+        store,
+        token_databases=[db],
+        external_cache_only=True,
+    )
+    pool = BlockPool(3, enable_caching=True, hash_block_size=16)
+    pool.enable_local_cache = False
+    blocks = pool.get_new_blocks(2)
+    req = _make_store_req("first", [b"h0", b"h1"])
+    pool.cache_full_blocks(req, blocks, 0, 2, 16, 0)
+    pool.touch(blocks)  # Async store ownership.
+    pool.free_blocks(blocks)  # The prefill request finished.
+    _run_store_req(sender, req)
+    assert sender.take_completed_saves() == {req.store_job_id: 1}
+    pool.free_blocks(blocks)
+    assert pool.get_num_free_blocks() == 2
+    assert len(pool.cached_block_hash_to_block) == 0
+    assert pool.get_cached_block(b"h0", [0]) is None
+    data.zero_()  # Reusing GPU pages cannot destroy the external copy.
+    assert worker.lookup(33, req.block_hashes).hit_length == 32
+    reused = pool.get_new_blocks(2)
+    receiver = _make_store_recving_thread(store)
+    receiver.token_databases = [db]
+    load = _make_load_req("second", req.block_hashes, token_len=32)
+    load.block_ids = ([block.block_id for block in reused],)
+    receiver._handle_request(load)
+    assert receiver.get_and_clear_finished_requests() == {"second"}
+    assert not receiver.get_and_clear_block_ids_with_load_errors()
+    for index, block in enumerate(reused):
+        torch.testing.assert_close(
+            data[block.block_id * 256 : (block.block_id + 1) * 256],
+            expected[index * 256 : (index + 1) * 256],
+        )

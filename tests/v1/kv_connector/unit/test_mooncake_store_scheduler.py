@@ -40,6 +40,7 @@ def _make_bare_scheduler(
 ) -> MooncakeStoreScheduler:
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = kv_role
+    scheduler.external_cache_only = False
     scheduler.save_decode_cache = save_decode_cache
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
@@ -266,10 +267,12 @@ def _make_qsa_hybrid_cache_config():
     )
 
 
-def test_scheduler_projects_nonprefix_groups_and_mamba_ids():
+@pytest.mark.parametrize("external_cache_only", [False, True])
+def test_scheduler_projects_nonprefix_groups_and_mamba_ids(external_cache_only):
     vllm_config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
-            kv_role="kv_both", kv_connector_extra_config={}
+            kv_role="kv_both",
+            kv_connector_extra_config={"external_cache_only": external_cache_only},
         ),
         kv_events_config=None,
         cache_config=SimpleNamespace(
@@ -284,6 +287,9 @@ def test_scheduler_projects_nonprefix_groups_and_mamba_ids():
     ):
         scheduler = MooncakeStoreScheduler(vllm_config, _make_qsa_hybrid_cache_config())
 
+    pool = BlockPool(4, enable_caching=True, hash_block_size=800)
+    scheduler.bind_gpu_block_pool(pool)
+    assert pool.enable_local_cache != external_cache_only
     assert scheduler._store_group_ids == (0, 2)
     assert scheduler._boundary_state_group_ids == frozenset({1})
 
@@ -1518,3 +1524,179 @@ def test_worker_metadata_aggregates_completions_across_ranks():
         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+
+
+@pytest.mark.parametrize("external_cache_only", [False, True])
+@pytest.mark.parametrize("store_finishes_first", [False, True])
+@pytest.mark.parametrize("unpin_request", [False, True])
+def test_external_only_reclaims_blocks_after_request_and_all_transfers(
+    external_cache_only, store_finishes_first, unpin_request
+):
+    """No cross-request hits; request/P2P and all store ranks retain safe refs."""
+    scheduler = _make_bare_scheduler(hash_block_size=8)
+    scheduler.external_cache_only = external_cache_only
+    scheduler._num_workers = 2
+    pool = scheduler._gpu_block_pool
+    scheduler.bind_gpu_block_pool(pool)
+    blocks = pool.get_new_blocks(1)
+    request = SimpleNamespace(block_hashes=[b"partial", b"full"])
+    pool.cache_full_blocks(request, blocks, 0, 1, 16, 0)
+    pool.cache_partial_block(request, blocks[0], 8, 0, 16)
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    meta.add_request(
+        ReqMeta(
+            req_id="req",
+            token_len_chunk=16,
+            block_ids=([blocks[0].block_id],),
+            block_hashes=request.block_hashes,
+            can_save=True,
+        )
+    )
+    scheduler._reference_save_blocks(meta)
+    job_id = meta.requests[0].store_job_id
+    expected = None if external_cache_only else blocks
+    assert pool.get_cached_block(b"full", [0]) == expected
+    assert pool.get_cached_block(b"partial", [0]) == expected
+    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 2
+    reused: list[KVCacheBlock] = []
+
+    def release_request():
+        if unpin_request:
+            pool.unpin_blocks(blocks, on_reuse=reused.append)
+        else:
+            pool.free_blocks(blocks)
+
+    if not store_finishes_first:
+        release_request()
+    scheduler.update_connector_output(_make_worker_output({job_id: 1}))
+    assert blocks[0].ref_cnt > 0
+    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 2
+    scheduler.update_connector_output(_make_worker_output({job_id: 1}))
+    if store_finishes_first:
+        assert blocks[0].ref_cnt == 1
+        release_request()
+    assert blocks[0].ref_cnt == 0
+    assert pool.get_num_free_blocks() == pool.num_gpu_blocks - 1
+    assert pool.get_cached_block(b"full", [0]) == expected
+    assert pool.get_cached_block(b"partial", [0]) == expected
+    assert (blocks[0].block_hash is None) == external_cache_only
+    assert bool(pool.cached_block_hashes_by_block) != external_cache_only
+    assert not scheduler.has_pending_push_work()
+    assert not reused
+    pool.get_new_blocks(pool.get_num_free_blocks())
+    assert reused == (blocks if unpin_request else [])
+
+
+@pytest.mark.parametrize(
+    "kv_role, extra",
+    [
+        ("kv_consumer", {"external_cache_only": True}),
+        ("kv_producer", {"external_cache_only": True}),
+        ("kv_both", {"external_cache_only": True, "enable_lookup": False}),
+        ("kv_both", {"external_cache_only": "true"}),
+    ],
+)
+def test_external_only_rejects_configs_that_cannot_save_and_reload(kv_role, extra):
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_role=kv_role,
+            kv_connector_extra_config=extra,
+        )
+    )
+    with pytest.raises(ValueError, match="external_cache_only"):
+        MooncakeStoreScheduler(config, _make_qsa_hybrid_cache_config())
+
+
+@pytest.mark.parametrize("token_budget", [32, 64])
+def test_external_only_core_scheduler_prefill_release_and_repeat(token_budget):
+    """Exercise real scheduling, delayed save completion, and async reload."""
+    from tests.v1.kv_connector.unit.utils import (
+        create_model_runner_output,
+        create_request,
+        create_scheduler,
+        create_vllm_config,
+    )
+
+    config = create_vllm_config(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={"external_cache_only": True},
+        max_num_batched_tokens=token_budget,
+    )
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
+        "scheduler.LookupKeyClient"
+    ) as client_cls:
+        client = client_cls.return_value
+        client.lookup.return_value = MooncakeLookupResult(0)
+        scheduler = create_scheduler(config, num_blocks=16)
+    pool = scheduler.kv_cache_manager.block_pool
+    free_before = pool.get_num_free_blocks()
+    first = create_request(num_tokens=33, common_prefix_len=33, max_tokens=1)
+    scheduler.add_request(first)
+    saves = {}
+    computed = 0
+    while not first.is_finished():
+        output = scheduler.schedule()
+        computed += output.num_scheduled_tokens[first.request_id]
+        for meta in output.kv_connector_metadata.requests:
+            if meta.can_save:
+                saves[meta.store_job_id] = 1
+        model_output = create_model_runner_output([first])
+        if computed < first.num_prompt_tokens:
+            model_output.sampled_token_ids = [[]]
+        scheduler.update_from_output(output, model_output)
+    assert computed == 33
+    assert saves
+    assert pool.get_num_free_blocks() < free_before
+    assert scheduler.has_requests()  # Drain writes even after the request ends.
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        create_model_runner_output(
+            [],
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves=saves,
+            ),
+        ),
+    )
+    assert pool.get_num_free_blocks() == free_before
+    assert len(pool.cached_block_hash_to_block) == 0
+    assert not scheduler.has_requests()
+
+    client.lookup.return_value = MooncakeLookupResult(32)
+    repeated = create_request(num_tokens=33, common_prefix_len=33, max_tokens=1)
+    scheduler.add_request(repeated)
+    load_output = scheduler.schedule()
+    assert load_output.total_num_scheduled_tokens == 0
+    load = load_output.kv_connector_metadata.requests[0].load_spec
+    assert load is not None and load.can_load
+    assert load.vllm_cached_tokens == 0
+    assert load.kvpool_cached_tokens == 32
+    scheduler.update_from_output(
+        load_output,
+        create_model_runner_output([], finished_recving={repeated.request_id}),
+    )
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {repeated.request_id: 1}
+    assert repeated.prefill_stats is not None
+    assert repeated.prefill_stats.num_local_cached_tokens == 0
+    assert repeated.prefill_stats.num_external_cached_tokens == 32
+    scheduler.update_from_output(output, create_model_runner_output([repeated]))
+    assert repeated.is_finished()
+    saves = {
+        meta.store_job_id: 1
+        for meta in output.kv_connector_metadata.requests
+        if meta.can_save
+    }
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        create_model_runner_output(
+            [],
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves=saves,
+            ),
+        ),
+    )
+    assert pool.get_num_free_blocks() == free_before
+    assert len(pool.cached_block_hash_to_block) == 0
+    assert not scheduler.has_requests()

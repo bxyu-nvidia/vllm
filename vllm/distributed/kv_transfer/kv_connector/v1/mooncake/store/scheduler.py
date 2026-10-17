@@ -60,6 +60,15 @@ class MooncakeStoreScheduler:
         assert vllm_config.kv_transfer_config is not None
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         kvc_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.external_cache_only = kvc_extra_config.get("external_cache_only", False)
+        if not isinstance(self.external_cache_only, bool):
+            raise ValueError("external_cache_only must be a boolean")
+        if self.external_cache_only and (
+            self.kv_role != "kv_both" or not kvc_extra_config.get("enable_lookup", True)
+        ):
+            raise ValueError(
+                "external_cache_only requires kv_role='kv_both' and enable_lookup=true"
+            )
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
         # Skips lookup CPU cost on instances that never load KV from the store.
@@ -114,6 +123,8 @@ class MooncakeStoreScheduler:
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
+        if self.external_cache_only:
+            gpu_block_pool.enable_local_cache = False
 
     def get_num_new_matched_tokens(
         self,

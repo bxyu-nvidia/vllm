@@ -83,6 +83,59 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
     --kv-transfer-config '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both"}'
 ```
 
+### External-only prefix caching on a prefiller
+
+Set `external_cache_only` on the prefiller's **MooncakeStoreConnector** to use
+Mooncake as the reusable prefix tier:
+
+```json
+{
+    "kv_connector": "MooncakeStoreConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+        "external_cache_only": true
+    }
+}
+```
+
+With `MultiConnector`, put this option inside the MooncakeStoreConnector child
+entry and keep the P2P MooncakeConnector child configured as `kv_producer`.
+Keep prefix caching enabled (the default): live block hashes and hybrid-state
+snapshots are still needed for safe external storage.
+
+Every computed prefill chunk is submitted to the Store. Existing keys are
+reused; missing keys are written. New requests bypass all local prefix hits,
+including blocks still held by another request. GPU blocks remain pinned until
+all Store ranks finish reading them, and until their owning request and any P2P
+transfer finish. When the last reference is released, local hash entries
+(including partial-block aliases) are removed and the pages become reusable.
+This also applies to prefixes loaded from Mooncake.
+
+On a disaggregated prefiller, finish the request after prefill (`max_tokens=1`
+in the usual P/D flow). An instance that continues decoding must keep that
+request's active KV until decoding finishes. This option releases pages into
+vLLM's preallocated GPU pool; it does not shrink the CUDA allocation reported by
+`nvidia-smi`, or overwrite freed bytes with zeros.
+
+Store failures, including capacity pressure, are fatal in this mode: the worker
+raises an error on its next completion poll and does not release the failed
+save's references. This avoids silently discarding unsaved KV. Resolve the
+reported Store/transfer failure before restarting the instance. The default
+mode keeps its existing best-effort save behavior.
+
+Reuse follows the connector's existing hash/block boundaries. Uncacheable tail
+tokens and the token needed for logits are recomputed. A cold, evicted, or
+not-yet-written prefix is an external miss; disabling local hits cannot make
+such a prefix an external hit.
+
+To validate a deployment, submit the same long prompt with `max_tokens=1`, wait
+for its Store writes and GPU usage to settle, and submit it again. Verify that
+`vllm:prefix_cache_hits_total` stays flat while
+`vllm:external_prefix_cache_hits_total` increases on the repeat. Check that
+`vllm:kv_cache_usage_perc` returns to its idle level after transfers drain.
+Repeat with concurrent requests and prompts spanning multiple prefill chunks;
+compare deterministic generated tokens against the default configuration.
+
 ### Disaggregated Prefill-Decode (XpYd)
 
 In disaggregated prefill-decode mode, use `MultiConnector` to combine `MooncakeConnector` (point-to-point KV transfer) with `MooncakeStoreConnector` (shared KV cache pool). This enables both direct P2P transfer between prefiller and decoder, and cross-instance prefix cache sharing via the distributed store.
@@ -273,6 +326,7 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 
 ### kv_connector_extra_config
 
+- `external_cache_only` (bool): Disable local prefix reuse and evict idle GPU cache entries after Store/request/P2P references drain. Requires `kv_role="kv_both"` and lookup enabled. Store write failures are fatal in this mode. Default: `false`. See [external-only prefix caching](#external-only-prefix-caching-on-a-prefiller).
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread so it never blocks the scheduler step. The request is held until the in-flight lookup completes, then resumed on a later step. Default: `false`.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.

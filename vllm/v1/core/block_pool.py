@@ -167,6 +167,9 @@ class BlockPool:
         self.num_gpu_blocks = num_gpu_blocks
         self.medium = medium
         self.enable_caching = enable_caching
+        # External-only caches still need live block hashes for immutable
+        # snapshots/CoW, but must neither serve local hits nor retain idle KV.
+        self.enable_local_cache = True
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
@@ -210,6 +213,8 @@ class BlockPool:
             The cached blocks if exists, or None.
 
         """
+        if not self.enable_local_cache:
+            return None
         cached_blocks = []
         for group_id in kv_cache_group_ids:
             block_hash_with_group_id = make_block_hash_with_group_id(
@@ -726,6 +731,8 @@ class BlockPool:
             block.ref_cnt -= 1
             self._reuse_watchers[block.block_id] = on_reuse
             if block.ref_cnt == 0:
+                if not self.enable_local_cache:
+                    self._maybe_evict_cached_block(block)
                 released.append(block)
         self.free_block_queue.append_n(released)
 
@@ -793,6 +800,8 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
+                if not self.enable_local_cache:
+                    self._maybe_evict_cached_block(block)
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
