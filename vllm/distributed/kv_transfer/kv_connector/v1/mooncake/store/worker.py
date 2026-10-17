@@ -660,6 +660,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         for g_idx, db in enumerate(self.token_databases):
             if not self.group_participates[g_idx]:
                 continue
+            if req_meta.boundary_only and g_idx not in mamba_offloads:
+                continue
             group_blocks = req_meta.block_ids[g_idx]
             # Distribute across ranks by the same rule as normal chunks.
             put_step = self.group_put_steps[g_idx]
@@ -738,6 +740,44 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if sub_block and self.coord.enable_partial_hash_hits:
             puts.extend(self._sub_block_tail_puts(req_meta, sub_block))
 
+        return self._put_pinned_blocks(req_meta, puts)
+
+    def _offload_eviction_blocks(self, req_meta: ReqMeta) -> bool:
+        puts: list[tuple[str, list[int], list[int], KeyMetadata]] = []
+        for entry in req_meta.eviction_blocks or ():
+            group = entry.group_id
+            if not self.group_participates[group]:
+                continue
+            db = self.token_databases[group]
+            put_step = self.group_put_steps[group]
+            chunk_id = cdiv(entry.num_tokens, db.block_size) - 1
+            if chunk_id % put_step != (self.tp_rank + group) % put_step:
+                continue
+            # The cached hash identifies this physical block. Use a one-block
+            # local table; no request table or token history survives eviction.
+            layout = db.store_layout
+            for shard in layout.local_shard_ids:
+                addrs, sizes, _ = layout.prepare_values(
+                    [(0, db.block_size)], [entry.block_id], [shard]
+                )
+                puts.append(
+                    (
+                        layout.key_for(shard, entry.block_hash),
+                        addrs[0],
+                        sizes[0],
+                        db.metadata,
+                    )
+                )
+        return self._put_pinned_blocks(req_meta, puts, operation="eviction_save")
+
+    def _put_pinned_blocks(
+        self,
+        req_meta: ReqMeta,
+        puts: list[tuple[str, list[int], list[int], KeyMetadata]],
+        *,
+        operation: str = "save",
+    ) -> bool:
+        """Run deduplication and fenced writes on the background send thread."""
         if not puts:
             return True
         keys = [key for key, _, _, _ in puts]
@@ -754,21 +794,23 @@ class KVCacheStoreSendingThread(KVTransferThread):
         exists_start = time.perf_counter()
         try:
             exists = self.store.batch_is_exist(keys)
+            if len(exists) != len(keys):
+                raise RuntimeError("Mooncake returned an incomplete existence result")
         except Exception as e:
             self._record_operation(
-                "save_exists",
+                f"{operation}_exists",
                 exists_start,
                 len(keys),
                 status="error",
                 num_failed_keys=len(keys),
             )
             logger.error(
-                "Failed to check boundary-state keys for request %s: %s",
+                "Failed to check pinned-block keys for request %s: %s",
                 req_meta.req_id,
                 e,
             )
             return False
-        self._record_operation("save_exists", exists_start, len(keys))
+        self._record_operation(f"{operation}_exists", exists_start, len(keys))
         missing = [i for i, e in enumerate(exists) if e != 1]
         if not missing:
             return True
@@ -789,9 +831,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             res = self.store.batch_put_from_multi_buffers(
                 keys, addrs, sizes, self.replicate_config
             )
+            if len(res) != len(keys):
+                raise RuntimeError("Mooncake returned an incomplete put result")
         except Exception as e:
             self._record_operation(
-                "save_put",
+                f"{operation}_put",
                 put_start,
                 len(keys),
                 num_bytes=batch_bytes,
@@ -799,7 +843,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 num_failed_keys=len(keys),
             )
             logger.error(
-                "Failed to put boundary-state keys for request %s: %s",
+                "Failed to put pinned-block keys for request %s: %s",
                 req_meta.req_id,
                 e,
             )
@@ -807,7 +851,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         failed = [i for i, value in enumerate(res) if value < 0]
         self._record_operation(
-            "save_put",
+            f"{operation}_put",
             put_start,
             len(keys),
             num_bytes=batch_bytes,
@@ -817,8 +861,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if failed:
             failed_codes = {res[i] for i in failed}
             logger.warning(
-                "Boundary-state put failed for request %s: %d/%d keys failed "
-                "(codes=%s)",
+                "Pinned-block put failed for request %s: %d/%d keys failed (codes=%s)",
                 req_meta.req_id,
                 len(failed),
                 len(keys),
@@ -831,7 +874,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if self._clear_store_pressure():
             logger.info(
                 "Mooncake CPU/disk offloading pressure cleared after a "
-                "successful boundary-state batch"
+                "successful pinned-block batch"
             )
         return True
 
@@ -852,6 +895,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             current_event = req_meta.current_event
 
             if not self.is_live_store_job(req_meta):
+                return
+            if req_meta.eviction_blocks is not None:
+                self._offload_eviction_blocks(req_meta)
                 return
 
             if self.enable_kv_event:
@@ -1155,6 +1201,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     event_token_ids,
                 )
             self.finish_store_job(req_meta)
+            if req_meta.eviction_blocks is not None:
+                self.delete_finished_stored_request(req_meta.req_id)
             self.request_queue.task_done()
 
 

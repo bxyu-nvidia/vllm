@@ -739,6 +739,16 @@ class RequestTracker:
                 existing.extend(new)
 
 
+@dataclass(frozen=True)
+class EvictionSaveBlock:
+    """Immutable identity and physical source for a cold-cache save."""
+
+    group_id: int
+    block_id: int
+    block_hash: BlockHash
+    num_tokens: int
+
+
 @dataclass
 class ReqMeta:
     """Per-request metadata for store put/get operations."""
@@ -765,6 +775,8 @@ class ReqMeta:
     # a non-aligned entry is the sub-block CoW tail. The store-job reference
     # keeps each exact block alive until every worker rank finishes the job.
     boundary_state_offloads: list[tuple[int, int, int]] | None = None
+    eviction_blocks: list[EvictionSaveBlock] | None = None
+    boundary_only: bool = False
 
     @staticmethod
     def from_request_tracker(

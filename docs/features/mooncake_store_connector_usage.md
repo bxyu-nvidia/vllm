@@ -279,6 +279,9 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `cache_prefix` (str): Namespace prepended to every store key. Lets separate deployments share one Mooncake master without polluting each other — instances configured with different prefixes never see each other's cached blocks, even for identical prompts. All instances that should share a prefix cache must use the same value. Default: `""` (no prefix; keys are byte-identical to the unprefixed format).
 - `save_decode_cache` (bool): Enable offloading decode tokens' KV cache. A `kv_consumer` does not save during prefill; when decode starts, it fills any missing block-aligned prompt prefix before appending completed decode blocks. Default: `false`.
+- `save_on_eviction` (bool): Opt into asynchronous saves of cold GPU prefix-cache blocks ahead of their reuse, instead of eagerly saving ordinary attention blocks during each forward. Default: `false`. Requires prefix caching and `kv_producer` or `kv_both`. See the eviction-save policy below.
+- `eviction_save_max_blocks` (positive int): Maximum physical GPU blocks pinned by outstanding eviction-save jobs **per engine**, across all groups. Default: `256`.
+- `eviction_save_lookahead_blocks` (positive int): Maximum slots inspected from the eviction end of the free list per scheduling step, including unused and previously attempted slots. Default: `2048`.
 - `store_tp_size` (int): Common Store TP for endpoints with different local TP sizes. It supports LBHNC and LBNHC local KV caches, with `store_tp_size >= local_tp_size` and `store_tp_size % local_tp_size == 0`. The current topology is one full-attention cache group, PCP/DCP disabled, and cross-layer blocks disabled. For GQA and MHA, the total KV-head count must be divisible by `store_tp_size`. Store shards contain fixed global KV-head ranges in the local layout. Shared endpoints use the same KV cache layout, pipeline-parallel size, and Store TP. The Store namespace includes the layout and PP size. Unsupported configurations use a topology-specific rank-local namespace.
 
 Lookup futures are collected at the start of every scheduler step, even when
@@ -453,3 +456,56 @@ To use a custom shared seed, set the same `PYTHONHASHSEED` on every instance tha
 ```bash
 PYTHONHASHSEED=<shared-value> vllm serve ...
 ```
+
+### Asynchronous saves ahead of GPU eviction
+
+For a prefill engine, add these settings to the **MooncakeStoreConnector child's**
+`kv_connector_extra_config` when using MultiConnector:
+
+```json
+{
+  "save_on_eviction": true,
+  "eviction_save_max_blocks": 256,
+  "eviction_save_lookahead_blocks": 2048
+}
+```
+
+The scheduler scans the cold end of the GPU free list after scheduling each
+batch. It pins selected cached blocks and sends immutable block/hash descriptors
+to the existing background store thread. Existence checks, CUDA event waits and
+Mooncake writes run on that thread, not in the scheduler or GPU allocator.
+Other available blocks remain allocatable. Blocks stay pinned until **every
+worker rank** reports completion, including failure or a deduplication hit.
+They then return to the eviction end rather than becoming recently used.
+A concurrent prefix-cache reader keeps its own reference.
+
+Outstanding eviction-save pins are bounded by `eviction_save_max_blocks`.
+New jobs also leave at least three quarters of the currently free-plus-pinned
+slots unpinned by eviction saves. This is a best-effort lookahead policy:
+a large allocation can overtake the lookahead, or bounded pin capacity/storage
+failure can prevent a save. Such blocks may be evicted without a stored copy
+and recomputed on a later miss. The allocator never waits for an upload.
+Each physical block/hash gets one save attempt before reuse; failed writes do
+not cause an endless retry loop or permanently pin GPU memory. Increase the
+lookahead or pin budget only after measuring the memory and throughput tradeoff.
+
+Mamba boundary-state handoffs still save asynchronously when those snapshots
+are produced, because some states are overwritten or discarded before normal
+LRU eviction. In eviction mode those handoffs save only the Mamba snapshots;
+attention blocks are handled by the cold-cache path. Cold cached blocks can
+include decode-produced blocks even with `save_decode_cache=false`: this mode
+operates on the shared GPU cache, after request ownership has ended. It stores
+the primary cached hash of each physical block, not every partial-prefix alias.
+
+Loads do not remove shared Mooncake entries. The same writes work with the
+shared RAM pool and Mooncake-managed disk offload; storage placement and SSD
+migration remain Mooncake's responsibility. This policy reduces eager GPU/store
+duplication but does not make the tiers strictly exclusive.
+
+Existing `vllm:mooncake_store_operation_*` metrics report these jobs with
+`operation="eviction_save_exists"` and `operation="eviction_save_put"`, including
+latency, bytes and failed keys, through both Python and Rust frontends.
+Rebuild the Rust frontend with the matching protocol changes before enabling
+this option; older frontends do not recognize the two new operation names.
+GPU prefix-cache events are unchanged; eviction saves do not reconstruct
+request/token lineage for external `BlockStored` events.

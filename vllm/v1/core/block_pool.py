@@ -194,6 +194,8 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        # Whether a cold save source was accessed again while its DMA was pinned.
+        self._eviction_save_accessed: dict[int, bool] = {}
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -714,10 +716,19 @@ class BlockPool:
             if watcher is not None:
                 watcher(block)
 
+    def pin_eviction_candidates(self, blocks: Sequence[KVCacheBlock]) -> None:
+        """Keep cold blocks readable until an asynchronous save completes."""
+        assert all(block.ref_cnt == 0 and not block.is_null for block in blocks)
+        self.touch(blocks)
+        for block in blocks:
+            self._eviction_save_accessed[block.block_id] = False
+
     def unpin_blocks(
         self,
         blocks: Iterable[KVCacheBlock],
         on_reuse: Callable[[KVCacheBlock], None],
+        *,
+        to_front: bool = False,
     ) -> None:
         """Release references to blocks that stay readable until reused.
 
@@ -725,15 +736,26 @@ class BlockPool:
         caching: they join the tail of the free queue and count as free.
         ``on_reuse`` fires when ``get_new_blocks`` hands a block out (or the
         cache is reset), so the caller can stop reading it.
+        ``to_front`` returns cold eviction-save sources to the eviction end
+        instead of promoting them merely because an external save completed.
         """
         released: list[KVCacheBlock] = []
+        accessed: list[KVCacheBlock] = []
         for block in blocks:
             assert block.ref_cnt > 0 and not block.is_null
             block.ref_cnt -= 1
             self._reuse_watchers[block.block_id] = on_reuse
+            was_accessed = self._eviction_save_accessed.pop(block.block_id, False)
             if block.ref_cnt == 0:
-                released.append(block)
-        self.free_block_queue.append_n(released)
+                if to_front and was_accessed:
+                    accessed.append(block)
+                else:
+                    released.append(block)
+        if to_front:
+            self.free_block_queue.prepend_n(released)
+            self.free_block_queue.append_n(accessed)
+        else:
+            self.free_block_queue.append_n(released)
 
     def _maybe_evict_cached_block(
         self, block: KVCacheBlock, *, record_turnover: bool = False
@@ -775,6 +797,10 @@ class BlockPool:
 
         """
         for block in blocks:
+            if self._eviction_save_accessed and (
+                block.block_id in self._eviction_save_accessed
+            ):
+                self._eviction_save_accessed[block.block_id] = True
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
@@ -849,6 +875,8 @@ class BlockPool:
         # Transfer the duplicate's recency to the surviving copies. Do this
         # after inserting releases: a survivor may occur in this same batch.
         for block in refresh_blocks.values():
+            if block.block_id in self._eviction_save_accessed:
+                self._eviction_save_accessed[block.block_id] = True
             if block.ref_cnt == 0:
                 self.free_block_queue.remove(block)
                 self.free_block_queue.append(block)

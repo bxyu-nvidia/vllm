@@ -739,6 +739,32 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn eviction_save_stats_decode_and_export() {
+        let metrics = Metrics::new();
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        for operation in ["eviction_save_exists", "eviction_save_put"] {
+            let mooncake: MooncakeStats = serde_json::from_value(serde_json::json!({
+                operation: [{
+                    "duration_seconds": 0.01,
+                    "num_keys": 2,
+                    "num_bytes": 512,
+                    "status": "partial_failure",
+                    "num_failed_keys": 1
+                }]
+            }))
+            .unwrap();
+            let stats = SchedulerStats {
+                kv_connector_stats: Some(KvConnectorStats::Mooncake(mooncake)),
+                ..Default::default()
+            };
+            super::record_scheduler_stats_with_handles(&handles, &stats);
+            assert!(metrics.render().unwrap().contains(&format!(
+                "vllm:mooncake_store_operation_failed_keys_total{{model_name=\"model\",engine=\"0\",operation=\"{operation}\",status=\"partial_failure\"}} 1"
+            )));
+        }
+    }
+
     fn nixl_stats() -> NixlStats {
         NixlStats {
             transfer_duration: vec![0.01, 0.02],

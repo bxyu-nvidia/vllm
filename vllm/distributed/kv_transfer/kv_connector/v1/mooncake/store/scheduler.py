@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
     partial_hash_hits_enabled,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
+    EvictionSaveBlock,
     LoadSpec,
     MooncakeStoreConnectorMetadata,
     MooncakeStoreWorkerMetadata,
@@ -28,7 +29,13 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+from vllm.v1.core.kv_cache_utils import (
+    BlockHashWithGroupId,
+    KVCacheBlock,
+    get_block_hash,
+    get_group_id,
+    resolve_kv_cache_block_sizes,
+)
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
@@ -79,6 +86,26 @@ class MooncakeStoreScheduler:
         # Skips lookup CPU cost on instances that never load KV from the store.
         self.enable_lookup = kvc_extra_config.get("enable_lookup", True)
         self.save_decode_cache = kvc_extra_config.get("save_decode_cache", False)
+        self.save_on_eviction = kvc_extra_config.get("save_on_eviction", False)
+        self.eviction_save_max_blocks = kvc_extra_config.get(
+            "eviction_save_max_blocks", 256
+        )
+        self.eviction_save_lookahead_blocks = kvc_extra_config.get(
+            "eviction_save_lookahead_blocks", 2048
+        )
+        for name in ("eviction_save_max_blocks", "eviction_save_lookahead_blocks"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.save_on_eviction, bool):
+            raise ValueError("save_on_eviction must be a boolean")
+        if self.save_on_eviction:
+            if self.kv_role == "kv_consumer":
+                raise ValueError("save_on_eviction requires a producer or kv_both")
+            if not vllm_config.cache_config.enable_prefix_caching:
+                raise ValueError("save_on_eviction requires prefix caching")
+        self._eviction_save_jobs: set[int] = set()
+        self._eviction_save_attempts: dict[int, BlockHashWithGroupId] = {}
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = bool(
             kv_event_config and kv_event_config.enable_kv_cache_events
@@ -291,7 +318,7 @@ class MooncakeStoreScheduler:
                 load_spec=load_spec,
                 # A consumer may write decode KV without becoming a prefill
                 # producer. Loads are still carried by the same metadata.
-                skip_save=is_consumer,
+                skip_save=is_consumer or self.save_on_eviction,
                 block_hashes=request_real.block_hashes,
             )
             if req_meta is not None:
@@ -341,7 +368,7 @@ class MooncakeStoreScheduler:
                         request_tracker,
                         self._block_size,
                         load_spec=load_spec,
-                        skip_save=is_consumer,
+                        skip_save=is_consumer or self.save_on_eviction,
                         block_hashes=request_real.block_hashes,
                     )
                 else:
@@ -382,7 +409,7 @@ class MooncakeStoreScheduler:
                         request_tracker,
                         self._block_size,
                         load_spec=None,
-                        skip_save=False,
+                        skip_save=self.save_on_eviction,
                         block_hashes=unfinished_req.block_hashes,
                     )
 
@@ -441,8 +468,82 @@ class MooncakeStoreScheduler:
             meta.add_request(req_meta)
         self._finished_partial_tail_metas.clear()
 
+        if self.save_on_eviction:
+            for request_meta in meta.requests:
+                request_meta.boundary_only = True
         self._reference_save_blocks(meta)
+        if self.save_on_eviction:
+            self._schedule_eviction_saves(meta)
         return meta
+
+    def _forget_eviction_save(self, block: KVCacheBlock) -> None:
+        self._eviction_save_attempts.pop(block.block_id, None)
+
+    def _schedule_eviction_saves(self, meta: MooncakeStoreConnectorMetadata) -> None:
+        """Pin a bounded lookahead at the eviction end, without doing any I/O.
+
+        This runs after allocation, so the next scheduling pass sees the pins
+        in its capacity checks. Never pin more than a quarter of free slots:
+        storage pressure must not consume all compute admission headroom.
+        """
+        pool = self._gpu_block_pool
+        assert pool is not None
+        pending = sum(
+            len(self._pinned_saves[job][0]) for job in self._eviction_save_jobs
+        )
+        budget = min(
+            self.eviction_save_max_blocks - pending,
+            (pool.get_num_free_blocks() + pending) // 4 - pending,
+        )
+        if budget <= 0:
+            return
+        entries: list[EvictionSaveBlock] = []
+        queue = pool.free_block_queue
+        block = queue.fake_free_list_head.next_free_block
+        for _ in range(self.eviction_save_lookahead_blocks):
+            if block is None or block is queue.fake_free_list_tail:
+                break
+            key = block.block_hash
+            boundary = block.block_hash_num_tokens
+            group = (
+                self._store_group_id_by_kv_cache_group_id.get(get_group_id(key))
+                if key is not None
+                else None
+            )
+            if (
+                key is not None
+                and boundary is not None
+                and group is not None
+                and self._eviction_save_attempts.get(block.block_id) != key
+            ):
+                entries.append(
+                    EvictionSaveBlock(
+                        group, block.block_id, get_block_hash(key), boundary
+                    )
+                )
+                self._eviction_save_attempts[block.block_id] = key
+                if len(entries) == budget:
+                    break
+            block = block.next_free_block
+        if not entries:
+            return
+        job = self._next_store_job_id
+        self._next_store_job_id += 1
+        block_ids = [entry.block_id for entry in entries]
+        pool.pin_eviction_candidates([pool.blocks[bid] for bid in block_ids])
+        self._pinned_saves[job] = (block_ids, self._num_workers)
+        self._eviction_save_jobs.add(job)
+        meta.add_request(
+            ReqMeta(
+                req_id=f"__mooncake_eviction_{job}",
+                token_len_chunk=0,
+                block_ids=(),
+                block_hashes=[],
+                can_save=True,
+                store_job_id=job,
+                eviction_blocks=entries,
+            )
+        )
 
     def _apply_current_save_block_ids(
         self,
@@ -501,7 +602,8 @@ class MooncakeStoreScheduler:
             block_ids.extend(
                 block_id
                 for group_id, group in enumerate(req_meta.block_ids)
-                if group_id not in self._boundary_state_group_ids
+                if not req_meta.boundary_only
+                and group_id not in self._boundary_state_group_ids
                 for block_id in group
                 if block_id != NULL_BLOCK_ID
             )
@@ -652,8 +754,18 @@ class MooncakeStoreScheduler:
                 f"store job {store_job_id} reported by too many ranks"
             )
             del self._pinned_saves[store_job_id]
-            # Tail-first, as elsewhere, so the shared prefix is evicted last.
-            pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
+            if store_job_id in self._eviction_save_jobs:
+                self._eviction_save_jobs.remove(store_job_id)
+                # Save completion is not a cache access. Keep cold blocks cold,
+                # but a concurrent prefix hit still owns its reference.
+                pool.unpin_blocks(
+                    (pool.blocks[bid] for bid in block_ids),
+                    self._forget_eviction_save,
+                    to_front=True,
+                )
+            else:
+                # Tail-first, as elsewhere, so the shared prefix is evicted last.
+                pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
 
     def record_load_consumed(self, request_id: str) -> None:
         received_at = self._pending_loads.pop(request_id, None)
@@ -689,6 +801,7 @@ class MooncakeStoreScheduler:
         try:
             ok = self.client.reset()
             if ok:
+                self._eviction_save_attempts.clear()
                 logger.info("Mooncake store reset via remove_all succeeded.")
             else:
                 logger.warning("Mooncake store reset returned NACK from worker.")

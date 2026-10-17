@@ -23,7 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler impor
 )
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, make_block_hash_with_group_id
 from vllm.v1.core.sched.output import KVConnectorBlockState
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -45,6 +45,11 @@ def _make_bare_scheduler(
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = kv_role
     scheduler.save_decode_cache = save_decode_cache
+    scheduler.save_on_eviction = False
+    scheduler.eviction_save_max_blocks = 256
+    scheduler.eviction_save_lookahead_blocks = 2048
+    scheduler._eviction_save_jobs = set()
+    scheduler._eviction_save_attempts = {}
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
     scheduler.load_async = True
@@ -1543,3 +1548,164 @@ def test_load_report_receipt_to_scheduler_consumption_uses_local_clock(monkeypat
     scheduler.record_load_consumed("req")
     assert scheduler.load_pipeline.snapshot()["consumption_wait_seconds"] == [3.0]
     assert not scheduler._pending_loads
+
+
+@pytest.mark.parametrize("concurrent_hit", [False, True])
+def test_eviction_save_pins_until_all_ranks_complete(concurrent_hit):
+    """A delayed DMA cannot read reused storage; saving is not an LRU hit."""
+    scheduler = _make_bare_scheduler()
+    scheduler.save_on_eviction = True
+    scheduler.eviction_save_max_blocks = 1
+    scheduler._num_workers = 2
+    pool = scheduler._gpu_block_pool
+    block = pool.get_new_blocks(1)[0]
+    key = make_block_hash_with_group_id(b"cold", 0)
+    pool._insert_block_hash(key, block, num_tokens=16)
+    pool.free_blocks([block])
+
+    meta = scheduler.build_connector_meta(_make_offload_only_output([]))
+    job = meta.requests[0].store_job_id
+    assert meta.requests[0].eviction_blocks[0].block_hash == b"cold"
+    assert block.ref_cnt == 1
+    assert scheduler.has_pending_push_work()
+    # Other allocations still progress while this block is pinned.
+    allocated = pool.get_new_blocks(pool.get_num_free_blocks())
+    assert block not in allocated
+    if concurrent_hit:
+        pool.touch([block])
+    scheduler.update_connector_output(_make_worker_output({job: 1}))
+    assert block.ref_cnt == 1 + concurrent_hit
+    assert scheduler.has_pending_push_work()
+    scheduler.update_connector_output(_make_worker_output({job: 1}))
+    assert block.ref_cnt == concurrent_hit
+    assert not scheduler.has_pending_push_work()
+    if concurrent_hit:
+        assert pool.get_num_free_blocks() == 0
+        pool.free_blocks([block])
+    assert pool.get_new_blocks(1) == [block]
+    assert block.block_id not in scheduler._eviction_save_attempts
+
+
+def test_eviction_save_budget_lookahead_and_lru_order():
+    scheduler = _make_bare_scheduler()
+    scheduler.save_on_eviction = True
+    scheduler.eviction_save_max_blocks = 2
+    scheduler.eviction_save_lookahead_blocks = 4
+    pool = scheduler._gpu_block_pool
+    blocks = pool.get_new_blocks(12)
+    for i, block in enumerate(blocks):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(bytes([i]), 0), block, num_tokens=16
+        )
+    pool.free_blocks(blocks)
+    empty = _make_offload_only_output([])
+    # Unused slots precede the cold cache: don't eagerly save the whole cache.
+    assert scheduler.build_connector_meta(empty).requests == []
+    unused = pool.get_new_blocks(pool.get_num_free_blocks() - len(blocks))
+    assert unused
+    first = scheduler.build_connector_meta(empty)
+    assert len(first.requests[0].eviction_blocks) == 2
+    assert scheduler.build_connector_meta(empty).requests == []
+    assert pool.get_num_free_blocks() == 10
+    job = first.requests[0].store_job_id
+    scheduler.update_connector_output(_make_worker_output({job: 1}))
+    assert pool.free_block_queue.get_all_free_blocks()[0] is blocks[0]
+    # No repeat save for the same physical contents, even after completion.
+    third = scheduler.build_connector_meta(empty)
+    assert third.requests[0].eviction_blocks[0].block_id == blocks[2].block_id
+
+
+def test_eviction_mode_preserves_mamba_handoff_without_pinning_attention():
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    scheduler.save_on_eviction = True
+    scheduler._store_group_ids = (0, 1)
+    _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
+    out = _make_offload_only_output([(1, 7, 16)], block_ids=([8], [7]))
+    meta = scheduler.build_connector_meta(out)
+    assert meta.requests[0].boundary_only
+    assert meta.requests[0].boundary_state_offloads == [(1, 7, 16)]
+    assert scheduler._pinned_saves[meta.requests[0].store_job_id][0] == [7]
+    assert scheduler._gpu_block_pool.blocks[8].ref_cnt == 0
+
+
+def test_eviction_mode_does_not_eagerly_save_running_attention():
+    scheduler = _make_bare_scheduler()
+    scheduler.save_on_eviction = True
+    _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
+    scheduler._request_trackers["req-0"].num_saved_tokens = 0
+    out = _make_scheduler_output(scheduled_spec_tokens=None)
+    assert scheduler.build_connector_meta(out).requests == []
+    assert not scheduler._pinned_saves
+
+
+def test_eviction_save_reserves_headroom_across_steps():
+    scheduler = _make_bare_scheduler()
+    scheduler.save_on_eviction = True
+    pool = scheduler._gpu_block_pool
+    blocks = pool.get_new_blocks(pool.get_num_free_blocks())
+    for i, block in enumerate(blocks):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(bytes([i]), 0), block, num_tokens=16
+        )
+    pool.free_blocks(blocks)
+    first = scheduler.build_connector_meta(_make_offload_only_output([]))
+    assert len(first.requests[0].eviction_blocks) == len(blocks) // 4
+    for _ in range(3):
+        assert (
+            scheduler.build_connector_meta(_make_offload_only_output([])).requests == []
+        )
+    assert pool.get_num_free_blocks() == len(blocks) - len(blocks) // 4
+
+
+@pytest.mark.parametrize("access_kind", ["prefix_hit", "duplicate_release"])
+def test_access_during_eviction_save_refreshes_recency_after_reader_finishes(
+    access_kind,
+):
+    scheduler = _make_bare_scheduler()
+    scheduler.save_on_eviction = True
+    scheduler.eviction_save_max_blocks = 1
+    pool = scheduler._gpu_block_pool
+    block = pool.get_new_blocks(1)[0]
+    pool._insert_block_hash(
+        make_block_hash_with_group_id(b"hot-again", 0), block, num_tokens=16
+    )
+    pool.free_blocks([block])
+    meta = scheduler.build_connector_meta(_make_offload_only_output([]))
+    if access_kind == "prefix_hit":
+        pool.touch([block])
+        pool.free_blocks([block])
+    else:
+        duplicate = pool.get_new_blocks(1)[0]
+        pool._insert_block_hash(block.block_hash, duplicate, num_tokens=16)
+        pool.free_blocks([duplicate])
+        assert duplicate.block_hash is None
+    assert block.ref_cnt == 1
+    scheduler.update_connector_output(
+        _make_worker_output({meta.requests[0].store_job_id: 1})
+    )
+    assert pool.free_block_queue.get_all_free_blocks()[-1] is block
+    assert pool._eviction_save_accessed == {}
+
+
+@pytest.mark.parametrize(
+    "extra,role,prefix_enabled,match",
+    [
+        ({"save_on_eviction": "true"}, "kv_both", True, "must be a boolean"),
+        ({"save_on_eviction": True}, "kv_consumer", True, "requires a producer"),
+        ({"save_on_eviction": True}, "kv_both", False, "requires prefix caching"),
+        ({"eviction_save_max_blocks": 0}, "kv_both", True, "positive integer"),
+        ({"eviction_save_max_blocks": True}, "kv_both", True, "positive integer"),
+        ({"eviction_save_lookahead_blocks": -1}, "kv_both", True, "positive integer"),
+    ],
+)
+def test_eviction_save_rejects_invalid_configuration(
+    extra, role, prefix_enabled, match
+):
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_role=role, kv_connector_extra_config=extra
+        ),
+        cache_config=SimpleNamespace(enable_prefix_caching=prefix_enabled),
+    )
+    with pytest.raises(ValueError, match=match):
+        MooncakeStoreScheduler(config, _make_qsa_hybrid_cache_config())

@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     BlobBlockHashes,
     ChunkedTokenDatabase,
+    EvictionSaveBlock,
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
@@ -1190,7 +1191,9 @@ def test_partial_tail_offload_honors_active_pressure_gate():
 def test_partial_tail_put_failure_activates_pressure_gate():
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
-    store.batch_put_from_multi_buffers.return_value = [256, -200, 256]
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [
+        -200 if i == 1 else 256 for i in range(len(keys))
+    ]
     thread = _make_partial_tail_send_thread(store)
 
     _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
@@ -5117,3 +5120,170 @@ def test_discard_ready_lookup_does_not_reuse_it():
     client.discard("req")
     assert client.is_ready("req") is None
     assert not client.ready
+
+
+@pytest.mark.parametrize("failure", [None, "exists", "put", "pressure"])
+def test_eviction_save_releases_job_on_success_and_failure(failure):
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0]
+    store.batch_put_from_multi_buffers.return_value = [
+        -200 if failure == "pressure" else 0
+    ]
+    if failure == "exists":
+        store.batch_is_exist.side_effect = RuntimeError("lookup unavailable")
+    if failure == "put":
+        store.batch_put_from_multi_buffers.side_effect = RuntimeError(
+            "store unavailable"
+        )
+    thread = _make_store_sending_thread(store)
+    req = ReqMeta(
+        req_id="eviction",
+        token_len_chunk=0,
+        block_ids=(),
+        block_hashes=[],
+        can_save=True,
+        current_event=MagicMock(),
+        eviction_blocks=[EvictionSaveBlock(0, 3, b"cold", 48)],
+    )
+    _run_store_req(thread, req)
+    assert thread.take_completed_saves() == {req.store_job_id: 1}
+    assert thread.stored_requests == {}
+    assert thread._skip_store_requests == set()
+    if failure != "exists":
+        req.current_event.synchronize.assert_called_once()
+        keys, addrs, sizes, _ = store.batch_put_from_multi_buffers.call_args.args
+        assert keys == [thread.token_databases[0].key_for(b"cold")]
+        assert addrs == [[0x1300]]
+        assert sizes == [[256]]
+
+
+def test_eviction_save_enqueue_does_not_wait_for_store():
+    """Submission returns before any RPC; completion waits for the DMA."""
+    entered, release = threading.Event(), threading.Event()
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0]
+
+    def delayed_put(*args):
+        entered.set()
+        assert release.wait(5)
+        return [0]
+
+    store.batch_put_from_multi_buffers.side_effect = delayed_put
+    sender = _make_store_sending_thread(store)
+    worker_instance = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
+    worker_instance._capacity_only = False
+    worker_instance.can_put = True
+    worker_instance.kv_send_thread = sender
+    req = ReqMeta(
+        req_id="eviction",
+        token_len_chunk=0,
+        block_ids=(),
+        block_hashes=[],
+        can_save=True,
+        store_job_id=42,
+        eviction_blocks=[EvictionSaveBlock(0, 1, b"cold", 16)],
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MooncakeStoreConnectorMetadata,
+    )
+
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    meta.add_request(req)
+    with patch.object(torch.cuda, "Event"):
+        worker_instance.wait_for_save(meta)
+    store.batch_is_exist.assert_not_called()
+    assert sender.take_completed_saves() == {}
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(sender._handle_request, sender.request_queue.get())
+        try:
+            assert entered.wait(5)
+            assert not future.done()
+            assert sender.take_completed_saves() == {}
+        finally:
+            release.set()
+        future.result(timeout=5)
+    assert sender.take_completed_saves() == {42: 1}
+
+
+def test_eviction_save_deduplicates_existing_keys_without_waiting_on_gpu():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [1]
+    thread = _make_store_sending_thread(store)
+    req = ReqMeta(
+        req_id="eviction",
+        token_len_chunk=0,
+        block_ids=(),
+        block_hashes=[],
+        can_save=True,
+        current_event=MagicMock(),
+        eviction_blocks=[EvictionSaveBlock(0, 1, b"cold", 16)],
+    )
+    _run_store_req(thread, req)
+    store.batch_put_from_multi_buffers.assert_not_called()
+    req.current_event.synchronize.assert_not_called()
+    assert thread.take_completed_saves() == {req.store_job_id: 1}
+
+
+def test_eviction_save_uses_tp_shared_layout_shards():
+    db, tensor = _make_tp_shared_db()
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [0] * len(keys)
+    sender = _make_store_sending_thread(store, token_databases=[db])
+    req = ReqMeta(
+        req_id="eviction",
+        token_len_chunk=0,
+        block_ids=(),
+        block_hashes=[],
+        can_save=True,
+        eviction_blocks=[EvictionSaveBlock(0, 1, b"cold", 32)],
+    )
+    _run_store_req(sender, req)
+    keys, addrs, sizes, _ = store.batch_put_from_multi_buffers.call_args.args
+    layout = db.store_layout
+    shards = layout.local_shard_ids
+    assert keys == [layout.key_for(shard, b"cold") for shard in shards]
+    expected_addrs, expected_sizes, _ = layout.prepare_values(
+        [(0, 16)] * len(shards), [1], shards
+    )
+    assert addrs == expected_addrs
+    assert sizes == expected_sizes
+    assert addrs[0][0] >= tensor.data_ptr()
+
+
+def test_eviction_mode_partial_tail_only_saves_mamba_snapshot():
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0]
+    store.batch_put_from_multi_buffers.return_value = [0]
+    sender = _make_partial_tail_send_thread(store)
+    req = _make_partial_tail_req([1, 2, 3])
+    req.boundary_only = True
+    _run_store_req(sender, req)
+    keys, addrs, _, _ = store.batch_put_from_multi_buffers.call_args.args
+    assert keys == ["test-model@tp_rank:0@pcp0@dcp0@pp_rank:0@group:1@6132"]
+    assert addrs == [[0x2000 + 7 * 256]]
+
+
+@pytest.mark.parametrize("tp_rank,expected_ids", [(0, [1, 3]), (1, [2])])
+def test_eviction_save_stripes_by_absolute_chunk_not_local_batch(tp_rank, expected_ids):
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [0] * len(keys)
+    sender = _make_store_sending_thread(store, tp_rank=tp_rank, put_step=2)
+    req = ReqMeta(
+        req_id="eviction",
+        token_len_chunk=0,
+        block_ids=(),
+        block_hashes=[],
+        can_save=True,
+        eviction_blocks=[
+            EvictionSaveBlock(0, i, bytes([i]), 16 * i) for i in [3, 2, 1]
+        ],
+    )
+    _run_store_req(sender, req)
+    keys, addrs, sizes, _ = store.batch_put_from_multi_buffers.call_args.args
+    assert set(keys) == {
+        sender.token_databases[0].key_for(bytes([i])) for i in expected_ids
+    }
+    assert sorted(addrs) == [[0x1000 + i * 256] for i in expected_ids]
+    assert sizes == [[256]] * len(expected_ids)
