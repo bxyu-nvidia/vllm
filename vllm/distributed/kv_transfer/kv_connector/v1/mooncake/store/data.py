@@ -847,6 +847,9 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
     """Maps ``ReqMeta.store_job_id`` to the number of ranks done with that job."""
 
     completed_saves: dict[int, int] = field(default_factory=dict)
+    # Failed eviction jobs -> retry delay in seconds. Durations, not absolute
+    # monotonic timestamps, cross process boundaries. Any rank can fail a job.
+    failed_saves: dict[int, float] = field(default_factory=dict)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -855,6 +858,10 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
         for store_job_id, count in other.completed_saves.items():
             self.completed_saves[store_job_id] = (
                 self.completed_saves.get(store_job_id, 0) + count
+            )
+        for store_job_id, delay in other.failed_saves.items():
+            self.failed_saves[store_job_id] = max(
+                self.failed_saves.get(store_job_id, 0.0), delay
             )
         return self
 

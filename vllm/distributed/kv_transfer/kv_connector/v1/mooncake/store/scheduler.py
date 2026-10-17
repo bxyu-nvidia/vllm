@@ -106,6 +106,10 @@ class MooncakeStoreScheduler:
                 raise ValueError("save_on_eviction requires prefix caching")
         self._eviction_save_jobs: set[int] = set()
         self._eviction_save_attempts: dict[int, BlockHashWithGroupId] = {}
+        self._eviction_save_retry_counts: dict[int, int] = {}
+        self._eviction_save_retry_at: dict[int, float] = {}
+        self._failed_eviction_save_jobs: dict[int, float] = {}
+        self._eviction_save_backoff_until = 0.0
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = bool(
             kv_event_config and kv_event_config.enable_kv_cache_events
@@ -478,6 +482,8 @@ class MooncakeStoreScheduler:
 
     def _forget_eviction_save(self, block: KVCacheBlock) -> None:
         self._eviction_save_attempts.pop(block.block_id, None)
+        self._eviction_save_retry_counts.pop(block.block_id, None)
+        self._eviction_save_retry_at.pop(block.block_id, None)
 
     def _schedule_eviction_saves(self, meta: MooncakeStoreConnectorMetadata) -> None:
         """Pin a bounded lookahead at the eviction end, without doing any I/O.
@@ -488,6 +494,9 @@ class MooncakeStoreScheduler:
         """
         pool = self._gpu_block_pool
         assert pool is not None
+        now = time.monotonic()
+        if now < self._eviction_save_backoff_until:
+            return
         pending = sum(
             len(self._pinned_saves[job][0]) for job in self._eviction_save_jobs
         )
@@ -521,13 +530,31 @@ class MooncakeStoreScheduler:
                 key is not None
                 and boundary is not None
                 and group is not None
-                and self._eviction_save_attempts.get(block.block_id) != key
+                and (
+                    self._eviction_save_attempts.get(block.block_id) != key
+                    or (
+                        self._eviction_save_retry_counts.get(block.block_id, 0) < 3
+                        and self._eviction_save_retry_at.get(
+                            block.block_id, float("inf")
+                        )
+                        <= now
+                    )
+                )
             ):
                 entries.append(
                     EvictionSaveBlock(
                         group, block.block_id, get_block_hash(key), boundary
                     )
                 )
+                # Only retry the same cached contents. Allocation/reuse clears
+                # this state; changed hashes start a new residency's budget.
+                attempts = (
+                    self._eviction_save_retry_counts.get(block.block_id, 0)
+                    if self._eviction_save_attempts.get(block.block_id) == key
+                    else 0
+                )
+                self._eviction_save_retry_counts[block.block_id] = attempts + 1
+                self._eviction_save_retry_at.pop(block.block_id, None)
                 self._eviction_save_attempts[block.block_id] = key
                 if len(entries) == budget:
                     break
@@ -753,6 +780,17 @@ class MooncakeStoreScheduler:
                 # The job referenced no blocks, so nothing was recorded for it.
                 continue
             block_ids, remaining = pinned
+            if (
+                store_job_id in self._eviction_save_jobs
+                and store_job_id in meta.failed_saves
+            ):
+                retry_at = time.monotonic() + meta.failed_saves[store_job_id]
+                self._failed_eviction_save_jobs[store_job_id] = max(
+                    self._failed_eviction_save_jobs.get(store_job_id, 0.0), retry_at
+                )
+                self._eviction_save_backoff_until = max(
+                    self._eviction_save_backoff_until, retry_at
+                )
             remaining -= count
             if remaining > 0:
                 self._pinned_saves[store_job_id] = (block_ids, remaining)
@@ -763,6 +801,15 @@ class MooncakeStoreScheduler:
             del self._pinned_saves[store_job_id]
             if store_job_id in self._eviction_save_jobs:
                 self._eviction_save_jobs.remove(store_job_id)
+                failed_retry_at = self._failed_eviction_save_jobs.pop(
+                    store_job_id, None
+                )
+                if failed_retry_at is not None:
+                    for bid in block_ids:
+                        # Blocks remain pinned until every rank stops reading.
+                        # Releasing pins preserves LRU order; allocation can
+                        # reclaim these blocks at any time during the backoff.
+                        self._eviction_save_retry_at[bid] = failed_retry_at
                 # Save completion is not a cache access. Keep cold blocks cold,
                 # but a concurrent prefix hit still owns its reference.
                 pool.unpin_blocks(
@@ -809,6 +856,10 @@ class MooncakeStoreScheduler:
             ok = self.client.reset()
             if ok:
                 self._eviction_save_attempts.clear()
+                self._eviction_save_retry_counts.clear()
+                self._eviction_save_retry_at.clear()
+                self._failed_eviction_save_jobs.clear()
+                self._eviction_save_backoff_until = 0.0
                 logger.info("Mooncake store reset via remove_all succeeded.")
             else:
                 logger.warning("Mooncake store reset returned NACK from worker.")

@@ -712,7 +712,9 @@ class _ReplicaDesc:
         return self.tier == "disk"
 
 
-def test_store_sending_thread_skips_request_during_cpu_pressure():
+def test_store_sending_thread_skips_request_during_cpu_pressure(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
     store = MagicMock()
     store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
     store.batch_put_from_multi_buffers.side_effect = [
@@ -732,15 +734,28 @@ def test_store_sending_thread_skips_request_during_cpu_pressure():
 
     assert store.batch_put_from_multi_buffers.call_count == 1
 
+    # New request IDs cannot bypass the worker-wide pressure gate.
     _run_store_req(thread, _make_store_req("req-b", [b"b0", b"b1"]))
+    assert store.batch_put_from_multi_buffers.call_count == 1
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [256] * len(
+        keys
+    )
+    # Recovery probes are spaced out; one success must not reopen the floodgate.
+    for i in range(3):
+        now[0] += 1
+        _run_store_req(thread, _make_store_req(f"probe-{i}", [b"b0", b"b1"]))
+        assert thread._store_pressure_active is (i < 2)
+        if i < 2:
+            _run_store_req(thread, _make_store_req(f"skipped-{i}", [b"c0", b"c1"]))
+        assert store.batch_put_from_multi_buffers.call_count == 2 + i
 
     assert thread._store_pressure_active is False
     assert "req-a" not in thread._skip_store_requests
-    assert store.batch_put_from_multi_buffers.call_count == 2
+    assert store.batch_put_from_multi_buffers.call_count == 4
 
     _run_store_req(thread, _make_store_req("req-a", [b"a4", b"a5"]))
 
-    assert store.batch_put_from_multi_buffers.call_count == 3
+    assert store.batch_put_from_multi_buffers.call_count == 5
 
 
 def test_store_sending_thread_records_mooncake_metrics():
@@ -906,6 +921,7 @@ def test_store_sending_thread_retries_skipped_range_after_pressure():
     # Under pressure the request is skipped without persisting anything, so the
     # saved offset stays at 0.
     thread._store_pressure_active = True
+    thread._store_retry_at = float("inf")
     thread._skip_store_requests.add("req-a")
 
     _run_store_req(
@@ -1180,6 +1196,7 @@ def test_partial_tail_offload_honors_active_pressure_gate():
     store = MagicMock()
     thread = _make_partial_tail_send_thread(store)
     thread._store_pressure_active = True
+    thread._store_retry_at = float("inf")
     thread._skip_store_requests.add("req-a")
 
     _run_store_req(thread, _make_partial_tail_req([1, 2, 3]))
@@ -5146,7 +5163,11 @@ def test_eviction_save_releases_job_on_success_and_failure(failure):
         eviction_blocks=[EvictionSaveBlock(0, 3, b"cold", 48)],
     )
     _run_store_req(thread, req)
-    assert thread.take_completed_saves() == {req.store_job_id: 1}
+    outcome = thread.take_store_metadata()
+    assert outcome.completed_saves == {req.store_job_id: 1}
+    assert (req.store_job_id in outcome.failed_saves) is (failure is not None)
+    assert thread.take_store_metadata().completed_saves == {}
+    assert thread.take_store_metadata().failed_saves == {}
     assert thread.stored_requests == {}
     assert thread._skip_store_requests == set()
     if failure != "exists":
@@ -5287,3 +5308,54 @@ def test_eviction_save_stripes_by_absolute_chunk_not_local_batch(tp_rank, expect
     }
     assert sorted(addrs) == [[0x1000 + i * 256] for i in expected_ids]
     assert sizes == [[256]] * len(expected_ids)
+
+
+def test_eviction_save_backoff_is_global_and_bounded(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    store = MagicMock()
+    store.batch_is_exist.return_value = [0]
+    store.batch_put_from_multi_buffers.return_value = [-200]
+    sender = _make_store_sending_thread(store)
+
+    def send(i):
+        req = ReqMeta(
+            req_id=f"eviction-{i}",
+            token_len_chunk=0,
+            block_ids=(),
+            block_hashes=[],
+            can_save=True,
+            current_event=MagicMock(),
+            eviction_blocks=[EvictionSaveBlock(0, 1, b"cold", 16)],
+        )
+        _run_store_req(sender, req)
+        result = sender.take_store_metadata()
+        assert result.completed_saves == {req.store_job_id: 1}
+        return req, result.failed_saves[req.store_job_id]
+
+    for i, delay in enumerate([1, 2, 4, 8, 8]):
+        _, retry_after = send(i)
+        assert retry_after == delay
+        calls = store.batch_put_from_multi_buffers.call_count
+        skipped, retry_after = send(i + 100)
+        assert retry_after == delay
+        skipped.current_event.synchronize.assert_not_called()
+        assert store.batch_put_from_multi_buffers.call_count == calls
+        assert sender.stored_requests == {}
+        now[0] += delay
+
+
+def test_deduplicated_probe_does_not_clear_store_pressure(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.return_value = [-200, -200]
+    sender = _make_store_sending_thread(store)
+    _run_store_req(sender, _make_store_req("failed", [b"a", b"b"]))
+    store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+    for i in range(4):
+        now[0] += 1
+        _run_store_req(sender, _make_store_req(f"existing-{i}", [b"a", b"b"]))
+    assert sender._store_pressure_active
+    assert store.batch_put_from_multi_buffers.call_count == 1

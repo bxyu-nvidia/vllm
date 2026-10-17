@@ -50,6 +50,10 @@ def _make_bare_scheduler(
     scheduler.eviction_save_lookahead_blocks = 2048
     scheduler._eviction_save_jobs = set()
     scheduler._eviction_save_attempts = {}
+    scheduler._eviction_save_retry_counts = {}
+    scheduler._eviction_save_retry_at = {}
+    scheduler._failed_eviction_save_jobs = {}
+    scheduler._eviction_save_backoff_until = 0.0
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
     scheduler.load_async = True
@@ -1792,3 +1796,97 @@ def test_pending_eviction_saves_count_toward_lookahead():
     pool.get_new_blocks(1)
     second = scheduler.build_connector_meta(empty).requests[0]
     assert [entry.block_id for entry in second.eviction_blocks] == [blocks[2].block_id]
+
+
+@pytest.mark.parametrize("outcome", ["exhausted", "reused", "success"])
+def test_failed_eviction_save_retries_without_holding_pins(monkeypatch, outcome):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
+        scheduler as module,
+    )
+
+    now = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: now[0])
+    scheduler = _make_bare_scheduler()
+    scheduler.save_on_eviction = True
+    scheduler._num_workers = 2
+    scheduler.eviction_save_lookahead_blocks = 1
+    pool = scheduler._gpu_block_pool
+    blocks = pool.get_new_blocks(pool.get_num_free_blocks())
+    for i, cached in enumerate(blocks):
+        pool._insert_block_hash(
+            make_block_hash_with_group_id(bytes([i]), 0), cached, num_tokens=16
+        )
+    block = blocks[0]
+    pool.free_blocks(blocks)
+
+    def schedule():
+        return scheduler.build_connector_meta(_make_offload_only_output([]))
+
+    for attempt in range(3):
+        job = schedule().requests[0].store_job_id
+        # Failure may arrive before the last rank's successful completion.
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                    completed_saves={job: 1}, failed_saves={job: 2.0}
+                )
+            )
+        )
+        assert block.ref_cnt == 1
+        scheduler.update_connector_output(_make_worker_output({job: 1}))
+        assert block.ref_cnt == 0
+        assert not scheduler.has_pending_push_work()
+        assert pool.free_block_queue.get_all_free_blocks()[0] is block
+        assert schedule().requests == []
+        if outcome == "reused":
+            # Allocation may reuse the slot immediately during the retry delay.
+            assert pool.get_new_blocks(1) == [block]
+            pool.free_blocks([block])
+            now[0] += 2
+            assert schedule().requests == []
+            # The reused slot's new contents get a fresh attempt budget.
+            assert pool.get_new_blocks(1) == [block]
+            pool._insert_block_hash(
+                make_block_hash_with_group_id(b"replacement", 0),
+                block,
+                num_tokens=32,
+            )
+            pool.free_blocks([block])
+            # Move this now-hot block back into the cold window.
+            pool.get_new_blocks(pool.get_num_free_blocks() - 8)
+            scheduler.eviction_save_lookahead_blocks = 8
+            scheduler._eviction_save_attempts.update(
+                (cached.block_id, cached.block_hash) for cached in blocks[1:]
+            )
+            replacement = schedule().requests[0]
+            assert replacement.eviction_blocks[0].block_hash == b"replacement"
+            assert scheduler._eviction_save_retry_counts[block.block_id] == 1
+            scheduler.update_connector_output(
+                _make_worker_output({replacement.store_job_id: 2})
+            )
+            assert block.ref_cnt == 0
+            return
+        now[0] += 2
+        if outcome == "success":
+            retry = schedule().requests[0].store_job_id
+            scheduler.update_connector_output(_make_worker_output({retry: 2}))
+            assert block.ref_cnt == 0
+            assert not scheduler.has_pending_push_work()
+            assert schedule().requests == []
+            assert scheduler._failed_eviction_save_jobs == {}
+            return
+    # Three failed attempts exhaust the budget for this cached residency.
+    assert schedule().requests == []
+    assert scheduler._failed_eviction_save_jobs == {}
+
+
+def test_save_outcome_aggregation_preserves_failure_and_longest_backoff():
+    result = MooncakeStoreWorkerMetadata(
+        completed_saves={1: 1}, failed_saves={1: 1.0}
+    ).aggregate(
+        MooncakeStoreWorkerMetadata(
+            completed_saves={1: 1, 2: 1}, failed_saves={1: 4.0, 2: 2.0}
+        )
+    )
+    assert result.completed_saves == {1: 2, 2: 1}
+    assert result.failed_saves == {1: 4.0, 2: 2.0}

@@ -461,6 +461,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # store_job_id -> times this rank finished with it, drained every step
         # so the scheduler can release the blocks it referenced for those jobs.
         self._completed_saves: dict[int, int] = {}
+        self._failed_saves: dict[int, float] = {}
         self.enable_kv_event = enable_kv_event
         # Caller always passes a non-None ReplicateConfig — see
         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
@@ -470,6 +471,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         # Pause store requests when CPU/disk offloading is under pressure.
         self._store_pressure_active = False
+        self._store_retry_at = 0.0
+        self._store_backoff_seconds = 0.0
+        self._store_recovery_successes = 0
         self._skip_store_requests: set[str] = set()
 
         # Per-request high-water mark of tokens actually persisted; the next
@@ -502,7 +506,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._saved_offset.pop(req_id, None)
             self._retry_token_ids.pop(req_id, None)
 
-    def finish_store_job(self, req_meta: ReqMeta) -> None:
+    def finish_store_job(
+        self, req_meta: ReqMeta, *, save_completed: bool = True
+    ) -> None:
         """Retire a job from the ledger and report its blocks as no longer read.
 
         Every path out of a job must reach this, skips and failures included: a
@@ -521,11 +527,24 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self._completed_saves.get(store_job_id, 0) + 1
             )
 
-    def take_completed_saves(self) -> dict[int, int]:
+            if req_meta.eviction_blocks is not None and not save_completed:
+                self._failed_saves[store_job_id] = max(
+                    1.0, self._store_retry_at - time.monotonic()
+                )
+
+    def take_store_metadata(self) -> MooncakeStoreWorkerMetadata:
+        """Drain completions and outcomes atomically with respect to the sender."""
         with self.done_task_lock:
-            completed = self._completed_saves
+            result = MooncakeStoreWorkerMetadata(
+                completed_saves=self._completed_saves,
+                failed_saves=self._failed_saves,
+            )
             self._completed_saves = {}
-        return completed
+            self._failed_saves = {}
+        return result
+
+    def take_completed_saves(self) -> dict[int, int]:
+        return self.take_store_metadata().completed_saves
 
     def _record_saved(self, req_meta: ReqMeta, token_len: int) -> None:
         # Guard on job liveness so neither a concurrent finish/preempt pop nor a
@@ -566,24 +585,44 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
     def _should_skip_request(self, req_id: str) -> bool:
         with self.done_task_lock:
-            return self._store_pressure_active and req_id in self._skip_store_requests
+            if not self._store_pressure_active:
+                return False
+            now = time.monotonic()
+            if now < self._store_retry_at:
+                return True
+            # The single sender admits at most one recovery job per second.
+            # Never sleep: skipped jobs immediately release their GPU pins.
+            self._store_retry_at = now + 1.0
+            return False
 
     def _mark_request_skipped_for_pressure(self, req_meta: ReqMeta) -> bool:
         req_id = req_meta.req_id
         with self.done_task_lock:
-            already_skipped = req_id in self._skip_store_requests
+            already_skipped = self._store_pressure_active
             self._store_pressure_active = True
-            # The pressure itself is global, but only a live job may sentence its
-            # own request to being skipped.
+            self._store_backoff_seconds = min(
+                8.0, max(1.0, self._store_backoff_seconds * 2)
+            )
+            self._store_retry_at = time.monotonic() + self._store_backoff_seconds
+            self._store_recovery_successes = 0
+            # Keep per-request diagnostics generation-safe even though the
+            # admission gate now covers every request on this worker.
             if req_meta.store_job_id in self.stored_requests.get(req_id, ()):
                 self._skip_store_requests.add(req_id)
         return already_skipped
 
     def _clear_store_pressure(self) -> bool:
         with self.done_task_lock:
-            if not self._store_pressure_active and not self._skip_store_requests:
+            if not self._store_pressure_active:
+                return False
+            # Existing-key/no-op batches do not call this. Require several real
+            # successful writes before admitting the full backlog again.
+            self._store_recovery_successes += 1
+            if self._store_recovery_successes < 3:
                 return False
             self._store_pressure_active = False
+            self._store_backoff_seconds = 0.0
+            self._store_retry_at = 0.0
             self._skip_store_requests.clear()
         return True
 
@@ -873,8 +912,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         if self._clear_store_pressure():
             logger.info(
-                "Mooncake CPU/disk offloading pressure cleared after a "
-                "successful pinned-block batch"
+                "Mooncake CPU/disk offloading pressure cleared after "
+                "successful recovery batches"
             )
         return True
 
@@ -896,10 +935,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
             if not self.is_live_store_job(req_meta):
                 return
-            if req_meta.eviction_blocks is not None:
-                self._offload_eviction_blocks(req_meta)
-                return
-
             if self.enable_kv_event:
                 retry_token_ids = self._get_retry_token_ids(req_meta)
                 if retry_token_ids is not None and event_token_ids is not None:
@@ -914,6 +949,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     "offloading is under pressure",
                     req_id,
                 )
+                return
+
+            if req_meta.eviction_blocks is not None:
+                save_completed = self._offload_eviction_blocks(req_meta)
                 return
 
             # Offload the handed-off mamba boundary states (independent of the
@@ -1127,8 +1166,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 ):
                     logger.warning(
                         "Detected Mooncake CPU/disk offloading pressure "
-                        "(NO_AVAILABLE_HANDLE); skipping future store "
-                        "batches for request %s until a later store batch succeeds",
+                        "(NO_AVAILABLE_HANDLE); backing off all store jobs "
+                        "after request %s",
                         req_id,
                     )
 
@@ -1138,7 +1177,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 if self._clear_store_pressure():
                     logger.info(
                         "Mooncake CPU/disk offloading pressure cleared "
-                        "after a successful store batch"
+                        "after successful recovery batches"
                     )
 
             stored_events: list[BlockStored] = []
@@ -1200,7 +1239,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     token_ids_start,
                     event_token_ids,
                 )
-            self.finish_store_job(req_meta)
+            self.finish_store_job(req_meta, save_completed=save_completed)
             if req_meta.eviction_blocks is not None:
                 self.delete_finished_stored_request(req_meta.req_id)
             self.request_queue.task_done()
@@ -2276,10 +2315,8 @@ class MooncakeStoreWorker:
     def build_connector_worker_meta(self) -> MooncakeStoreWorkerMetadata | None:
         if self.kv_send_thread is None:
             return None
-        completed_saves = self.kv_send_thread.take_completed_saves()
-        if not completed_saves:
-            return None
-        return MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
+        metadata = self.kv_send_thread.take_store_metadata()
+        return metadata if metadata.completed_saves else None
 
     def lookup(
         self, num_tokens: int, block_hashes: Sequence[BlockHash]
