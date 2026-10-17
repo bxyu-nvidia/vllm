@@ -787,6 +787,30 @@ class BlockPool:
         """Return whether a block can be mutated by its sole owner."""
         return not block.is_null and block.ref_cnt == 1 and block.block_hash is None
 
+    def _discard_redundant_cached_block(
+        self, block: KVCacheBlock
+    ) -> list[KVCacheBlock] | None:
+        """Unregister an unused duplicate only if every prefix has another copy."""
+        primary_hash = block.block_hash
+        if primary_hash is None:
+            return None
+        representative = self.cached_block_hash_to_block.get_one_block(primary_hash)
+        if representative is None or representative is block:
+            return None
+        representatives = [representative]
+        # A duplicate full-block hash does not imply its partial aliases are
+        # redundant. Keep the block if it is the representative of any alias.
+        for key in self.cached_block_hashes_by_block.get(block.block_id, ()):
+            representative = self.cached_block_hash_to_block.get_one_block(key)
+            if representative is None or representative is block:
+                return None
+            representatives.append(representative)
+        self._remove_cached_block_hashes(block)
+        # Every prefix is still cached; do not publish BlockRemoved events.
+        if self.metrics_collector:
+            self.metrics_collector.on_duplicate_reclaimed(get_group_id(primary_hash))
+        return representatives
+
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
@@ -799,6 +823,7 @@ class BlockPool:
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
+        refresh_blocks: dict[int, KVCacheBlock] = {}
         other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
         for block in ordered_blocks:
             if block.pool is not None and block.pool is not self:
@@ -806,6 +831,10 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
+                if self.enable_caching:
+                    representatives = self._discard_redundant_cached_block(block)
+                    if representatives:
+                        refresh_blocks.update((b.block_id, b) for b in representatives)
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
@@ -817,6 +846,12 @@ class BlockPool:
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
+        # Transfer the duplicate's recency to the surviving copies. Do this
+        # after inserting releases: a survivor may occur in this same batch.
+        for block in refresh_blocks.values():
+            if block.ref_cnt == 0:
+                self.free_block_queue.remove(block)
+                self.free_block_queue.append(block)
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
 

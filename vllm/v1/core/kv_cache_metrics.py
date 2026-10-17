@@ -72,6 +72,7 @@ class KVCacheMetricsCollector:
                     "lookup_miss",
                     "miss_after_eviction",
                     "history_dropped",
+                    "duplicate_reclaimed",
                 ),
                 0,
             )
@@ -85,6 +86,10 @@ class KVCacheMetricsCollector:
         if len(self._evicted_hashes) > self.eviction_history_limit:
             _, dropped_group = self._evicted_hashes.popitem(last=False)
             self._group_counts(dropped_group)["history_dropped"] += 1
+
+    def on_duplicate_reclaimed(self, group_id: int) -> None:
+        """Count physical blocks reclaimed without losing any cached prefix."""
+        self._group_counts(group_id)["duplicate_reclaimed"] += 1
 
     def on_prefix_inserted(self, key: "BlockHashWithGroupId") -> None:
         self._evicted_hashes.pop(key, None)

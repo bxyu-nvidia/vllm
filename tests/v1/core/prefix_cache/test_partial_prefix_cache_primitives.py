@@ -533,3 +533,75 @@ def test_partial_block_promotes_to_direct_full_block_hash(dcp_world_size: int):
     )
     assert pool.get_cached_block(promoted_full_hash, [kv_cache_group_id]) == [blocks[1]]
     assert pool.get_cached_block(partial_hash, [kv_cache_group_id]) is None
+
+
+@pytest.mark.parametrize("release_together", [False, True])
+def test_unused_duplicate_reclaimed_before_unique_prefix(
+    release_together: bool,
+) -> None:
+    """A redundant copy must not displace the last copy of a different prefix."""
+    from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+
+    collector = KVCacheMetricsCollector()
+    pool = BlockPool(
+        4, True, 2, enable_kv_cache_events=True, metrics_collector=collector
+    )
+    unique, original, duplicate = pool.get_new_blocks(3)
+    unique_req = make_request("unique", [1, 2], 2, sha256)
+    shared_req = make_request("shared", [3, 4], 2, sha256)
+    for req, block in [
+        (unique_req, unique),
+        (shared_req, original),
+        (shared_req, duplicate),
+    ]:
+        pool.cache_full_blocks(req, [block], 0, 1, 2, 0)
+    pool.kv_event_queue.clear()
+    if release_together:
+        pool.free_blocks([original, unique, duplicate])
+    else:
+        for block in [original, unique, duplicate]:
+            pool.free_blocks([block])
+    assert not pool.kv_event_queue
+    assert pool.get_new_blocks(1) == [duplicate]
+    assert pool.get_cached_block(unique_req.block_hashes[0], [0]) == [unique]
+    assert pool.get_cached_block(shared_req.block_hashes[0], [0]) == [original]
+    assert collector.drain_turnover()["0"]["duplicate_reclaimed"] == 1
+    # The newer duplicate refreshes the old surviving copy's LRU position.
+    assert pool.get_new_blocks(1) == [unique]
+    assert pool.get_cached_block(shared_req.block_hashes[0], [0]) == [original]
+
+
+def test_duplicate_with_unique_partial_alias_is_retained() -> None:
+    """A full-block duplicate may still be the only copy of a partial prefix."""
+    pool = BlockPool(3, True, 2)
+    original, duplicate = pool.get_new_blocks(2)
+    req = make_request("req", [1, 2, 3, 4], 2, sha256)
+    for block in [original, duplicate]:
+        pool.cache_full_blocks(req, [block], 0, 1, 4, 0)
+    pool.cache_partial_block(req, duplicate, 2, 0, 4)
+    pool.free_blocks([original, duplicate])
+    assert pool.get_cached_block(req.block_hashes[0], [0]) == [duplicate]
+    assert duplicate.block_hash is not None
+    assert pool.cached_block_hashes_by_block[duplicate.block_id]
+
+
+def test_duplicate_keeps_active_references_and_reclaims_redundant_aliases() -> None:
+    """Only the last release can reclaim a duplicate, including its aliases."""
+    pool = BlockPool(3, True, 2, enable_kv_cache_events=True)
+    original, duplicate = pool.get_new_blocks(2)
+    req = make_request("req", [1, 2, 3, 4], 2, sha256)
+    for block in [original, duplicate]:
+        pool.cache_full_blocks(req, [block], 0, 1, 4, 0)
+        pool.cache_partial_block(req, block, 2, 0, 4)
+    pool.touch([duplicate])
+    pool.free_blocks([duplicate])
+    assert duplicate.block_hash is not None
+    assert duplicate.ref_cnt == 1
+    pool.kv_event_queue.clear()
+    pool.free_blocks([duplicate])
+    assert duplicate.block_hash is None
+    assert duplicate.block_id not in pool.cached_block_hashes_by_block
+    assert not pool.kv_event_queue
+    assert pool.get_cached_block(req.block_hashes[0], [0]) == [original]
+    assert pool.get_cached_block(req.block_hashes[1], [0]) == [original]
+    assert pool.get_new_blocks(1) == [duplicate]
