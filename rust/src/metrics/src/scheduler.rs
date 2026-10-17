@@ -304,6 +304,9 @@ pub struct SchedulerMetrics {
     pub mooncake_operation_keys_total: MooncakeOperationCounterFamily,
     pub mooncake_operation_bytes_total: MooncakeOperationCounterFamily,
     pub mooncake_operation_failed_keys_total: MooncakeOperationCounterFamily,
+    pub mooncake_skipped_save_batches: MooncakeOperationCounterFamily,
+    pub mooncake_skipped_save_keys: MooncakeOperationCounterFamily,
+    pub mooncake_skipped_save_bytes: MooncakeOperationCounterFamily,
 
     pub mooncake_pipeline_queued: Family<MooncakePipelineLabels, U64Gauge>,
     pub mooncake_pipeline_active: Family<MooncakePipelineLabels, U64Gauge>,
@@ -556,6 +559,25 @@ impl SchedulerMetrics {
             mooncake_pipeline_report_wait_seconds.clone(),
         );
 
+        // Skips are admission decisions, not attempted RPCs.
+        let mooncake_skipped_save_batches = Family::default();
+        registry.register(
+            "vllm:mooncake_store_skipped_save_batches",
+            "Save candidates skipped before writing; repeat skips count again, not unique keys or RPC failures.",
+            mooncake_skipped_save_batches.clone(),
+        );
+        let mooncake_skipped_save_keys = Family::default();
+        registry.register(
+            "vllm:mooncake_store_skipped_save_keys",
+            "Save candidates skipped before writing; repeat skips count again, not unique keys or RPC failures.",
+            mooncake_skipped_save_keys.clone(),
+        );
+        let mooncake_skipped_save_bytes = Family::default();
+        registry.register(
+            "vllm:mooncake_store_skipped_save_bytes",
+            "Save candidates skipped before writing; repeat skips count again, not unique keys or RPC failures.",
+            mooncake_skipped_save_bytes.clone(),
+        );
         // Mooncake store connector telemetry.
         let mooncake_operation_time_seconds =
             Family::new_with_constructor(mooncake_operation_time_histogram as fn() -> Histogram);
@@ -690,6 +712,9 @@ impl SchedulerMetrics {
             mooncake_operation_keys_total,
             mooncake_operation_bytes_total,
             mooncake_operation_failed_keys_total,
+            mooncake_skipped_save_batches,
+            mooncake_skipped_save_keys,
+            mooncake_skipped_save_bytes,
             nixl_xfer_time_seconds,
             nixl_post_time_seconds,
             nixl_bytes_transferred,

@@ -53,6 +53,7 @@ def _make_bare_scheduler(
     scheduler._eviction_save_retry_counts = {}
     scheduler._eviction_save_retry_at = {}
     scheduler._failed_eviction_save_jobs = {}
+    scheduler._eviction_save_errors = set()
     scheduler._eviction_save_backoff_until = 0.0
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
@@ -1822,13 +1823,26 @@ def test_failed_eviction_save_retries_without_holding_pins(monkeypatch, outcome)
     def schedule():
         return scheduler.build_connector_meta(_make_offload_only_output([]))
 
+    for _ in range(5):
+        deferred_job = schedule().requests[0].store_job_id
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                    completed_saves={deferred_job: 2}, failed_saves={deferred_job: 1.0}
+                )
+            )
+        )
+        assert block.ref_cnt == 0
+        assert scheduler._eviction_save_retry_counts[block.block_id] == 0
+        assert not schedule().requests
+        now[0] += 1
     for attempt in range(3):
         job = schedule().requests[0].store_job_id
         # Failure may arrive before the last rank's successful completion.
         scheduler.update_connector_output(
             KVConnectorOutput(
                 kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
-                    completed_saves={job: 1}, failed_saves={job: 2.0}
+                    completed_saves={job: 1}, failed_saves={job: 2.0}, save_errors={job}
                 )
             )
         )
@@ -1882,11 +1896,12 @@ def test_failed_eviction_save_retries_without_holding_pins(monkeypatch, outcome)
 
 def test_save_outcome_aggregation_preserves_failure_and_longest_backoff():
     result = MooncakeStoreWorkerMetadata(
-        completed_saves={1: 1}, failed_saves={1: 1.0}
+        completed_saves={1: 1}, failed_saves={1: 1.0}, save_errors={1}
     ).aggregate(
         MooncakeStoreWorkerMetadata(
-            completed_saves={1: 1, 2: 1}, failed_saves={1: 4.0, 2: 2.0}
+            completed_saves={1: 1, 2: 1}, failed_saves={1: 4.0, 2: 2.0}, save_errors={2}
         )
     )
     assert result.completed_saves == {1: 2, 2: 1}
     assert result.failed_saves == {1: 4.0, 2: 2.0}
+    assert result.save_errors == {1, 2}

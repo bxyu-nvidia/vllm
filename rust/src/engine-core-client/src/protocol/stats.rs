@@ -192,6 +192,9 @@ pub mod kv_connector {
         SavePut,
         EvictionSaveExists,
         EvictionSavePut,
+        SaveSkipped,
+        BoundarySaveSkipped,
+        EvictionSaveSkipped,
         LoadGet,
         LookupExists,
     }
@@ -203,6 +206,9 @@ pub mod kv_connector {
                 Self::SavePut => "save_put",
                 Self::EvictionSaveExists => "eviction_save_exists",
                 Self::EvictionSavePut => "eviction_save_put",
+                Self::SaveSkipped => "save_skipped",
+                Self::BoundarySaveSkipped => "boundary_save_skipped",
+                Self::EvictionSaveSkipped => "eviction_save_skipped",
                 Self::LoadGet => "load_get",
                 Self::LookupExists => "lookup_exists",
             }
@@ -216,6 +222,9 @@ pub mod kv_connector {
         Ok,
         Error,
         PartialFailure,
+        Backoff,
+        RecoveryBudget,
+        PriorFailure,
     }
 
     impl MooncakeStatus {
@@ -224,6 +233,9 @@ pub mod kv_connector {
                 Self::Ok => "ok",
                 Self::Error => "error",
                 Self::PartialFailure => "partial_failure",
+                Self::Backoff => "backoff",
+                Self::RecoveryBudget => "recovery_budget",
+                Self::PriorFailure => "prior_failure",
             }
         }
     }

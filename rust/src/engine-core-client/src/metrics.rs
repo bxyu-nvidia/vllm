@@ -91,6 +91,9 @@ struct SchedulerStatsHandles {
     mooncake_operation_keys_total: MooncakeOperationCounterFamily,
     mooncake_operation_bytes_total: MooncakeOperationCounterFamily,
     mooncake_operation_failed_keys_total: MooncakeOperationCounterFamily,
+    mooncake_skipped_save_batches: MooncakeOperationCounterFamily,
+    mooncake_skipped_save_keys: MooncakeOperationCounterFamily,
+    mooncake_skipped_save_bytes: MooncakeOperationCounterFamily,
 
     mooncake_pipeline_queued: Family<MooncakePipelineLabels, U64Gauge>,
     mooncake_pipeline_active: Family<MooncakePipelineLabels, U64Gauge>,
@@ -212,6 +215,9 @@ fn resolve_scheduler_stats_handles(
         mooncake_operation_keys_total: metrics.mooncake_operation_keys_total.clone(),
         mooncake_operation_bytes_total: metrics.mooncake_operation_bytes_total.clone(),
         mooncake_operation_failed_keys_total: metrics.mooncake_operation_failed_keys_total.clone(),
+        mooncake_skipped_save_batches: metrics.mooncake_skipped_save_batches.clone(),
+        mooncake_skipped_save_keys: metrics.mooncake_skipped_save_keys.clone(),
+        mooncake_skipped_save_bytes: metrics.mooncake_skipped_save_bytes.clone(),
         mooncake_pipeline_queued: metrics.mooncake_pipeline_queued.clone(),
         mooncake_pipeline_active: metrics.mooncake_pipeline_active.clone(),
         mooncake_pipeline_oldest_pending_seconds: metrics
@@ -465,6 +471,22 @@ fn record_mooncake_stats(handles: &SchedulerStatsHandles, stats: &MooncakeStats)
                 operation: operation.as_str().to_string(),
                 status: record.status.as_str().to_string(),
             };
+            if let Some(kind) = operation.as_str().strip_suffix("_skipped") {
+                let labels = MooncakeOperationLabels {
+                    operation: kind.to_string(),
+                    ..labels
+                };
+                handles.mooncake_skipped_save_batches.get_or_create(&labels).inc();
+                handles
+                    .mooncake_skipped_save_keys
+                    .get_or_create(&labels)
+                    .inc_by(record.num_keys);
+                handles
+                    .mooncake_skipped_save_bytes
+                    .get_or_create(&labels)
+                    .inc_by(record.num_bytes);
+                continue;
+            }
             handles
                 .mooncake_operation_time_seconds
                 .get_or_create(&labels)
@@ -763,6 +785,24 @@ mod tests {
                 "vllm:mooncake_store_operation_failed_keys_total{{model_name=\"model\",engine=\"0\",operation=\"{operation}\",status=\"partial_failure\"}} 1"
             )));
         }
+    }
+
+    #[test]
+    fn skipped_boundary_saves_are_not_rpc_failures() {
+        let metrics = Metrics::new();
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let mooncake: MooncakeStats = serde_json::from_value(serde_json::json!({
+            "boundary_save_skipped": [{"duration_seconds": 0.0, "num_keys": 5,
+                "num_bytes": 1024, "status": "backoff", "num_failed_keys": 0}],
+            "eviction_save_skipped": [{"duration_seconds": 0.0, "num_keys": 2,
+                "num_bytes": 512, "status": "recovery_budget", "num_failed_keys": 0}]
+        }))
+        .unwrap();
+        super::record_mooncake_stats(&handles, &mooncake);
+        let rendered = metrics.render().unwrap();
+        assert!(rendered.contains("vllm:mooncake_store_skipped_save_keys_total{model_name=\"model\",engine=\"0\",operation=\"boundary_save\",status=\"backoff\"} 5"));
+        assert!(rendered.contains("vllm:mooncake_store_skipped_save_bytes_total{model_name=\"model\",engine=\"0\",operation=\"eviction_save\",status=\"recovery_budget\"} 512"));
+        assert!(!rendered.contains("operation=\"boundary_save_skipped\""));
     }
 
     fn nixl_stats() -> NixlStats {

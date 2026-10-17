@@ -462,6 +462,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # so the scheduler can release the blocks it referenced for those jobs.
         self._completed_saves: dict[int, int] = {}
         self._failed_saves: dict[int, float] = {}
+        self._save_errors: set[int] = set()
         self.enable_kv_event = enable_kv_event
         # Caller always passes a non-None ReplicateConfig — see
         # MooncakeStoreWorker.__init__ where store_replicate_config is built.
@@ -473,7 +474,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
         self._store_pressure_active = False
         self._store_retry_at = 0.0
         self._store_backoff_seconds = 0.0
-        self._store_recovery_successes = 0
+        self._store_recovery_bytes = 0
+        self._store_recovery_budget = 256 * 1024**2
+        self._store_recovery_started_at = 0.0
+        self._store_recovery_ramp_at = 0.0
+        self._store_admitted_bytes = 0
+        self._store_job_deferred = False
+        self._store_job_failed = False
         self._skip_store_requests: set[str] = set()
 
         # Per-request high-water mark of tokens actually persisted; the next
@@ -531,6 +538,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self._failed_saves[store_job_id] = max(
                     1.0, self._store_retry_at - time.monotonic()
                 )
+                if self._store_job_failed or not self._store_job_deferred:
+                    self._save_errors.add(store_job_id)
 
     def take_store_metadata(self) -> MooncakeStoreWorkerMetadata:
         """Drain completions and outcomes atomically with respect to the sender."""
@@ -538,9 +547,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             result = MooncakeStoreWorkerMetadata(
                 completed_saves=self._completed_saves,
                 failed_saves=self._failed_saves,
+                save_errors=self._save_errors,
             )
             self._completed_saves = {}
             self._failed_saves = {}
+            self._save_errors = set()
         return result
 
     def take_completed_saves(self) -> dict[int, int]:
@@ -604,27 +615,84 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 8.0, max(1.0, self._store_backoff_seconds * 2)
             )
             self._store_retry_at = time.monotonic() + self._store_backoff_seconds
-            self._store_recovery_successes = 0
+            self._store_recovery_bytes = 0
+            self._store_recovery_budget = 256 * 1024**2
+            self._store_recovery_started_at = time.monotonic()
+            self._store_recovery_ramp_at = self._store_recovery_started_at
             # Keep per-request diagnostics generation-safe even though the
             # admission gate now covers every request on this worker.
             if req_meta.store_job_id in self.stored_requests.get(req_id, ()):
                 self._skip_store_requests.add(req_id)
         return already_skipped
 
-    def _clear_store_pressure(self) -> bool:
+    def _clear_store_pressure(self, successful_bytes: int) -> bool:
+        """Ramp byte admission every five seconds; require sustained recovery."""
         with self.done_task_lock:
             if not self._store_pressure_active:
                 return False
-            # Existing-key/no-op batches do not call this. Require several real
-            # successful writes before admitting the full backlog again.
-            self._store_recovery_successes += 1
-            if self._store_recovery_successes < 3:
+            self._store_recovery_bytes += successful_bytes
+            now = time.monotonic()
+            if (
+                now - self._store_recovery_ramp_at < 5.0
+                or self._store_recovery_bytes < self._store_recovery_budget
+            ):
+                return False
+            if self._store_recovery_budget < 4 * 1024**3:
+                self._store_recovery_budget *= 2
+                self._store_recovery_ramp_at = now
+                self._store_recovery_bytes = 0
+                return False
+            if now - self._store_recovery_started_at < 30.0:
                 return False
             self._store_pressure_active = False
             self._store_backoff_seconds = 0.0
             self._store_retry_at = 0.0
             self._skip_store_requests.clear()
         return True
+
+    def _record_skipped_puts(
+        self,
+        puts: list[tuple[str, list[int], list[int], KeyMetadata]],
+        *,
+        operation: str,
+        reason: str,
+    ) -> None:
+        # Candidate keys/bytes: no existence RPC is issued for these records.
+        if puts and self._record_operation_cb is not None:
+            self._record_operation_cb(
+                operation=f"{operation}_skipped",
+                duration_seconds=0.0,
+                num_keys=len(puts),
+                num_bytes=sum(sum(sizes) for _, _, sizes, _ in puts),
+                status=reason,
+                num_failed_keys=0,
+            )
+
+    def _admit_recovery_puts(
+        self,
+        puts: list[tuple[str, list[int], list[int], KeyMetadata]],
+        *,
+        operation: str,
+    ) -> int:
+        if not self._store_pressure_active:
+            return len(puts)
+        admitted = 0
+        for _, _, sizes, _ in puts:
+            key_bytes = sum(sizes)
+            # A store key is indivisible; permit one oversized key per job.
+            if (
+                self._store_admitted_bytes > 0
+                and self._store_admitted_bytes + key_bytes > self._store_recovery_budget
+            ):
+                break
+            admitted += 1
+            self._store_admitted_bytes += key_bytes
+        if admitted < len(puts):
+            self._store_job_deferred = True
+            self._record_skipped_puts(
+                puts[admitted:], operation=operation, reason="recovery_budget"
+            )
+        return admitted
 
     def _boundary_snapshot_puts(
         self, req_meta: ReqMeta, entries: list[tuple[int, int, int]]
@@ -742,7 +810,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 puts.append((db.key_for(key_hash), addr, size, db.metadata))
         return puts
 
-    def _maybe_offload_boundary_states(self, req_meta: ReqMeta) -> bool:
+    def _boundary_puts(
+        self, req_meta: ReqMeta
+    ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
         """Persist connector-pinned mamba "align" boundary states handed off
         for this request, deduped against the store.
 
@@ -758,13 +828,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
         - not block-aligned: the sub-block CoW partial tail, which also has to
           cover the other groups' blocks in the normal save's lcm gap.
 
-        Returns:
-            True when no put is needed or every put succeeds, False otherwise.
-
         """
         offloads = req_meta.boundary_state_offloads
         if not offloads or not req_meta.block_hashes:
-            return True
+            return []
 
         snapshots: list[tuple[int, int, int]] = []
         sub_block: list[tuple[int, int, int]] = []
@@ -779,9 +846,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
         if sub_block and self.coord.enable_partial_hash_hits:
             puts.extend(self._sub_block_tail_puts(req_meta, sub_block))
 
-        return self._put_pinned_blocks(req_meta, puts)
+        return puts
 
-    def _offload_eviction_blocks(self, req_meta: ReqMeta) -> bool:
+    def _maybe_offload_boundary_states(self, req_meta: ReqMeta) -> bool:
+        return self._put_pinned_blocks(req_meta, self._boundary_puts(req_meta))
+
+    def _eviction_puts(
+        self, req_meta: ReqMeta
+    ) -> list[tuple[str, list[int], list[int], KeyMetadata]]:
         puts: list[tuple[str, list[int], list[int], KeyMetadata]] = []
         for entry in req_meta.eviction_blocks or ():
             group = entry.group_id
@@ -807,9 +879,50 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         db.metadata,
                     )
                 )
-        return self._put_pinned_blocks(req_meta, puts, operation="eviction_save")
+        return puts
+
+    def _offload_eviction_blocks(self, req_meta: ReqMeta) -> bool:
+        return self._put_pinned_blocks(
+            req_meta, self._eviction_puts(req_meta), operation="eviction_save"
+        )
 
     def _put_pinned_blocks(
+        self,
+        req_meta: ReqMeta,
+        puts: list[tuple[str, list[int], list[int], KeyMetadata]],
+        *,
+        operation: str = "save",
+    ) -> bool:
+        # Bound each eviction RPC, without splitting an indivisible store key.
+        # No sleep/requeue here: return the outcome so GPU pins can be released.
+        start = 0
+        while start < len(puts):
+            end, size = start, 0
+            while end < len(puts):
+                key_bytes = sum(puts[end][2])
+                if (
+                    operation == "eviction_save"
+                    and end > start
+                    and size + key_bytes > 256 * 1024**2
+                ):
+                    break
+                size += key_bytes
+                end += 1
+            if not self._put_pinned_batch(
+                req_meta, puts[start:end], operation=operation
+            ):
+                self._record_skipped_puts(
+                    puts[end:],
+                    operation=operation,
+                    reason="prior_failure"
+                    if self._store_job_failed
+                    else "recovery_budget",
+                )
+                return False
+            start = end
+        return True
+
+    def _put_pinned_batch(
         self,
         req_meta: ReqMeta,
         puts: list[tuple[str, list[int], list[int], KeyMetadata]],
@@ -836,6 +949,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if len(exists) != len(keys):
                 raise RuntimeError("Mooncake returned an incomplete existence result")
         except Exception as e:
+            self._store_job_failed = True
             self._record_operation(
                 f"{operation}_exists",
                 exists_start,
@@ -853,6 +967,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
         missing = [i for i, e in enumerate(exists) if e != 1]
         if not missing:
             return True
+        admitted = self._admit_recovery_puts(
+            [puts[i] for i in missing],
+            operation="boundary_save" if operation == "save" else operation,
+        )
+        deferred = admitted < len(missing)
+        missing = missing[:admitted]
+        if not missing:
+            return False
         keys = [keys[i] for i in missing]
         addrs = [addrs[i] for i in missing]
         sizes = [sizes[i] for i in missing]
@@ -873,6 +995,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if len(res) != len(keys):
                 raise RuntimeError("Mooncake returned an incomplete put result")
         except Exception as e:
+            self._store_job_failed = True
             self._record_operation(
                 f"{operation}_put",
                 put_start,
@@ -898,6 +1021,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             num_failed_keys=len(failed),
         )
         if failed:
+            self._store_job_failed = True
             failed_codes = {res[i] for i in failed}
             logger.warning(
                 "Pinned-block put failed for request %s: %d/%d keys failed (codes=%s)",
@@ -910,17 +1034,20 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self._mark_request_skipped_for_pressure(req_meta)
             return False
 
-        if self._clear_store_pressure():
+        if self._clear_store_pressure(batch_bytes):
             logger.info(
                 "Mooncake CPU/disk offloading pressure cleared after "
                 "successful recovery batches"
             )
-        return True
+        return not deferred
 
     def _handle_request(self, req_meta: ReqMeta):
         # The single `finally` is the only way out, so the scheduler releases
         # this job's GPU block references however the job ends.
         save_completed = False
+        self._store_admitted_bytes = 0
+        self._store_job_deferred = False
+        self._store_job_failed = False
         token_len = 0
         req_id = req_meta.req_id
         event_token_ids = req_meta.token_ids
@@ -944,6 +1071,19 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         token_ids_start = retry_start
 
             if self._should_skip_request(req_id):
+                self._store_job_deferred = True
+                if req_meta.eviction_blocks is not None:
+                    self._record_skipped_puts(
+                        self._eviction_puts(req_meta),
+                        operation="eviction_save",
+                        reason="backoff",
+                    )
+                elif req_meta.boundary_state_offloads:
+                    self._record_skipped_puts(
+                        self._boundary_puts(req_meta),
+                        operation="boundary_save",
+                        reason="backoff",
+                    )
                 logger.debug(
                     "Skipping Mooncake store for request %s while CPU/disk "
                     "offloading is under pressure",
@@ -1110,6 +1250,25 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 addrs.extend(group_addrs)
                 sizes.extend(group_sizes)
 
+            admitted = self._admit_recovery_puts(
+                [
+                    (key, addr, size, self.token_databases[g_idx].metadata)
+                    for key, addr, size, g_idx in zip(
+                        keys, addrs, sizes, group_indices, strict=True
+                    )
+                ],
+                operation="save",
+            )
+            deferred_events = set(event_specs[admitted:]) if event_specs else set()
+            if admitted < len(keys):
+                keys, addrs, sizes = keys[:admitted], addrs[:admitted], sizes[:admitted]
+                if group_ids is not None:
+                    group_ids = group_ids[:admitted]
+                if event_specs is not None:
+                    event_specs = event_specs[:admitted]
+            if not keys:
+                return
+
             if current_event is not None:
                 current_event.synchronize()
 
@@ -1172,9 +1331,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     )
 
             if not put_had_exception and not failed_indices:
-                self._record_saved(req_meta, token_len)
-                save_completed = True
-                if self._clear_store_pressure():
+                if not self._store_job_deferred:
+                    self._record_saved(req_meta, token_len)
+                    save_completed = True
+                if self._clear_store_pressure(batch_bytes):
                     logger.info(
                         "Mooncake CPU/disk offloading pressure cleared "
                         "after successful recovery batches"
@@ -1198,6 +1358,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     g_idx,
                     block_hash,
                 ), event_indices in indices_by_event.items():
+                    if (s, end, g_idx, block_hash) in deferred_events:
+                        continue
                     if any(index in failed_indices for index in event_indices):
                         continue
                     db = self.token_databases[g_idx]

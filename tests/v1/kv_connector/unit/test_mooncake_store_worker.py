@@ -740,22 +740,14 @@ def test_store_sending_thread_skips_request_during_cpu_pressure(monkeypatch):
     store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [256] * len(
         keys
     )
-    # Recovery probes are spaced out; one success must not reopen the floodgate.
-    for i in range(3):
+    # Tiny successful writes cannot end recovery, even after thirty seconds.
+    for i in range(35):
         now[0] += 1
         _run_store_req(thread, _make_store_req(f"probe-{i}", [b"b0", b"b1"]))
-        assert thread._store_pressure_active is (i < 2)
-        if i < 2:
-            _run_store_req(thread, _make_store_req(f"skipped-{i}", [b"c0", b"c1"]))
+        assert thread._store_pressure_active
+        _run_store_req(thread, _make_store_req(f"skipped-{i}", [b"c0", b"c1"]))
         assert store.batch_put_from_multi_buffers.call_count == 2 + i
-
-    assert thread._store_pressure_active is False
-    assert "req-a" not in thread._skip_store_requests
-    assert store.batch_put_from_multi_buffers.call_count == 4
-
-    _run_store_req(thread, _make_store_req("req-a", [b"a4", b"a5"]))
-
-    assert store.batch_put_from_multi_buffers.call_count == 5
+    assert thread._store_recovery_budget == 256 * 1024**2
 
 
 def test_store_sending_thread_records_mooncake_metrics():
@@ -5166,6 +5158,7 @@ def test_eviction_save_releases_job_on_success_and_failure(failure):
     outcome = thread.take_store_metadata()
     assert outcome.completed_saves == {req.store_job_id: 1}
     assert (req.store_job_id in outcome.failed_saves) is (failure is not None)
+    assert (req.store_job_id in outcome.save_errors) is (failure is not None)
     assert thread.take_store_metadata().completed_saves == {}
     assert thread.take_store_metadata().failed_saves == {}
     assert thread.stored_requests == {}
@@ -5359,3 +5352,151 @@ def test_deduplicated_probe_does_not_clear_store_pressure(monkeypatch):
         _run_store_req(sender, _make_store_req(f"existing-{i}", [b"a", b"b"]))
     assert sender._store_pressure_active
     assert store.batch_put_from_multi_buffers.call_count == 1
+
+
+def test_eviction_rpc_size_and_recovery_admission(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [0] * len(keys)
+    sender = _make_store_sending_thread(store)
+    # Addresses are never dereferenced by this mock. Each key is 128 MiB.
+    sender.token_databases[0].set_block_len([128 * 1024**2])
+
+    def request():
+        return ReqMeta(
+            req_id="eviction",
+            token_len_chunk=0,
+            block_ids=(),
+            block_hashes=[],
+            can_save=True,
+            current_event=MagicMock(),
+            eviction_blocks=[EvictionSaveBlock(0, i, bytes([i]), 16) for i in range(6)],
+        )
+
+    _run_store_req(sender, request())
+    assert [
+        len(c.args[0]) for c in store.batch_put_from_multi_buffers.call_args_list
+    ] == [2, 2, 2]
+    store.reset_mock()
+    sender._store_pressure_active = True
+    sender._store_recovery_started_at = now[0]
+    sender._store_recovery_ramp_at = now[0]
+    stats = MooncakeStoreConnectorStats()
+    sender._record_operation_cb = stats.record_operation
+    req = request()
+    _run_store_req(sender, req)
+    assert store.batch_put_from_multi_buffers.call_count == 1
+    outcome = sender.take_store_metadata()
+    assert req.store_job_id in outcome.failed_saves
+    assert req.store_job_id not in outcome.save_errors
+    skipped = stats.data["eviction_save_skipped"]
+    assert sum(x["num_keys"] for x in skipped) == 4
+    assert sum(x["num_bytes"] for x in skipped) == 512 * 1024**2
+    assert sender.stored_requests == {}
+
+
+def test_recovery_ramps_bytes_and_requires_thirty_seconds(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    sender = _make_store_sending_thread(MagicMock())
+    req = _make_store_req("req", [b"a"])
+    sender._mark_request_skipped_for_pressure(req)
+    for seconds, mib in [(105, 512), (110, 1024), (115, 2048), (120, 4096)]:
+        now[0] = seconds
+        assert not sender._clear_store_pressure(sender._store_recovery_budget)
+        assert sender._store_recovery_budget == mib * 1024**2
+    now[0] = 129
+    assert not sender._clear_store_pressure(4 * 1024**3)
+    now[0] = 130
+    assert sender._clear_store_pressure(1)
+    assert not sender._store_pressure_active
+
+
+def test_skipped_boundary_saves_export_separately_from_rpcs():
+    from functools import partial
+
+    from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
+        MooncakeStorePromMetrics,
+    )
+
+    store = MagicMock()
+    sender = _make_partial_tail_send_thread(store)
+    sender._store_pressure_active = True
+    sender._store_retry_at = float("inf")
+    stats = MooncakeStoreConnectorStats()
+    sender._record_operation_cb = stats.record_operation
+    req = _make_partial_tail_req([1, 2, 3])
+    req.current_event = MagicMock()
+    _run_store_req(sender, req)
+    store.batch_is_exist.assert_not_called()
+    store.batch_put_from_multi_buffers.assert_not_called()
+    req.current_event.synchronize.assert_not_called()
+    records = stats.data["boundary_save_skipped"]
+    assert len(records) == 1 and records[0]["num_keys"] > 0
+    registry = CollectorRegistry()
+    metrics = MooncakeStorePromMetrics(
+        SimpleNamespace(kv_transfer_config=None),
+        {cls: partial(cls, registry=registry) for cls in (Counter, Gauge, Histogram)},
+        ["engine"],
+        {0: ["0"]},
+    )
+    metrics.observe(stats.data)
+    labels = {"engine": "0", "operation": "boundary_save", "status": "backoff"}
+    assert (
+        registry.get_sample_value(
+            "vllm:mooncake_store_skipped_save_batches_total", labels
+        )
+        == 1
+    )
+    assert (
+        registry.get_sample_value("vllm:mooncake_store_skipped_save_keys_total", labels)
+        == records[0]["num_keys"]
+    )
+    assert (
+        registry.get_sample_value(
+            "vllm:mooncake_store_skipped_save_bytes_total", labels
+        )
+        == records[0]["num_bytes"]
+    )
+    assert (
+        registry.get_sample_value("vllm:mooncake_store_operation_total", labels) is None
+    )
+
+
+def test_regular_save_recovery_does_not_advance_past_deferred_keys(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(worker.time, "monotonic", lambda: now[0])
+    store = MagicMock()
+    persisted = set()
+    store.batch_is_exist.side_effect = lambda keys: [int(k in persisted) for k in keys]
+
+    def put(keys, *args):
+        persisted.update(keys)
+        return [0] * len(keys)
+
+    store.batch_put_from_multi_buffers.side_effect = put
+    sender = _make_store_sending_thread(store)
+    sender.enable_kv_event = True
+    sender.token_databases[0].set_block_len([192 * 1024**2])
+    sender._store_pressure_active = True
+    sender._store_recovery_started_at = now[0]
+    sender._store_recovery_ramp_at = now[0]
+    stats = MooncakeStoreConnectorStats()
+    sender._record_operation_cb = stats.record_operation
+    req = _make_store_req("regular", [b"a", b"b"])
+    _run_store_req(sender, req)
+    assert len(persisted) == 1
+    assert "regular" not in sender._saved_offset
+    assert sum(r["num_keys"] for r in stats.data["save_skipped"]) == 1
+    assert len(sender.get_kv_events()) == 1
+    now[0] += 1
+    _run_store_req(sender, _make_store_req("regular", [b"a", b"b"]))
+    assert len(persisted) == 2
+    assert [
+        len(c.args[0]) for c in store.batch_put_from_multi_buffers.call_args_list
+    ] == [1, 1]
+    assert len(sender.get_kv_events()) == 1

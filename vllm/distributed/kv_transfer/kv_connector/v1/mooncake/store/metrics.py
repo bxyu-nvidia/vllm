@@ -150,6 +150,17 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
         metric_labelnames = labelnames + ["operation", "status"]
         self._metric_cache: dict[tuple[int, str, str], dict[str, PromMetric]] = {}
+        self._skipped_metrics = {
+            field: self._counter_cls(
+                name=f"vllm:mooncake_store_skipped_save_{field}_total",
+                documentation=(
+                    "Save candidates skipped before writing; repeat skips count "
+                    "again, not unique keys or RPC failures."
+                ),
+                labelnames=metric_labelnames,
+            )
+            for field in ("batches", "keys", "bytes")
+        }
         pipeline_labels = labelnames + ["stage", "rank"]
         self._pipeline_metrics: dict[str, PromMetric] = {}
         for field, description in (
@@ -250,6 +261,18 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
             for record in records:
                 assert isinstance(record, dict)
                 status = str(record["status"])
+                if operation.endswith("_skipped"):
+                    labels = self.per_engine_labelvalues[engine_idx] + [
+                        operation.removesuffix("_skipped"),
+                        status,
+                    ]
+                    for field, value in (
+                        ("batches", 1),
+                        ("keys", record["num_keys"]),
+                        ("bytes", record["num_bytes"]),
+                    ):
+                        self._skipped_metrics[field].labels(*labels).inc(int(value))
+                    continue
                 metrics = self._get_metrics(engine_idx, operation, status)
                 metrics["time"].observe(float(record["duration_seconds"]))
                 metrics["calls"].inc()

@@ -109,6 +109,7 @@ class MooncakeStoreScheduler:
         self._eviction_save_retry_counts: dict[int, int] = {}
         self._eviction_save_retry_at: dict[int, float] = {}
         self._failed_eviction_save_jobs: dict[int, float] = {}
+        self._eviction_save_errors: set[int] = set()
         self._eviction_save_backoff_until = 0.0
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = bool(
@@ -780,6 +781,8 @@ class MooncakeStoreScheduler:
                 # The job referenced no blocks, so nothing was recorded for it.
                 continue
             block_ids, remaining = pinned
+            if store_job_id in meta.save_errors:
+                self._eviction_save_errors.add(store_job_id)
             if (
                 store_job_id in self._eviction_save_jobs
                 and store_job_id in meta.failed_saves
@@ -806,10 +809,13 @@ class MooncakeStoreScheduler:
                 )
                 if failed_retry_at is not None:
                     for bid in block_ids:
+                        if store_job_id not in self._eviction_save_errors:
+                            self._eviction_save_retry_counts[bid] -= 1
                         # Blocks remain pinned until every rank stops reading.
                         # Releasing pins preserves LRU order; allocation can
                         # reclaim these blocks at any time during the backoff.
                         self._eviction_save_retry_at[bid] = failed_retry_at
+                self._eviction_save_errors.discard(store_job_id)
                 # Save completion is not a cache access. Keep cold blocks cold,
                 # but a concurrent prefix hit still owns its reference.
                 pool.unpin_blocks(
@@ -859,6 +865,7 @@ class MooncakeStoreScheduler:
                 self._eviction_save_retry_counts.clear()
                 self._eviction_save_retry_at.clear()
                 self._failed_eviction_save_jobs.clear()
+                self._eviction_save_errors.clear()
                 self._eviction_save_backoff_until = 0.0
                 logger.info("Mooncake store reset via remove_all succeeded.")
             else:
