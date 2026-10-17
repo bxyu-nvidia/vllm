@@ -1083,3 +1083,27 @@ def test_scheduler_pipeline_stats_are_available_before_lookup_completes():
     assert connector.get_kv_connector_stats().data[PIPELINE_KEY][0]["queued"] == 0
     connector.connector_scheduler.enable_lookup = False
     assert connector.get_kv_connector_stats() is None
+
+
+@pytest.mark.parametrize("hit", [0, 16])
+@pytest.mark.parametrize("with_tail", [False, True])
+def test_lookup_response_preserves_checkpoint_hint(hit, with_tail):
+    boundaries = (TailKeyBoundary(0, 32),) if with_tail else ()
+    result = MooncakeLookupResult(hit, boundaries, shared_prefix_boundary=48)
+    assert (
+        protocol.decode_lookup_response(protocol.encode_lookup_response(result))
+        == result
+    )
+
+
+def test_lookup_response_accepts_legacy_tail_keys():
+    payload = b"".join(value.to_bytes(4, "big") for value in (16, 0, 32))
+    assert protocol.decode_lookup_response(payload) == MooncakeLookupResult(
+        16, (TailKeyBoundary(0, 32),)
+    )
+
+
+@pytest.mark.parametrize("size", [0, 1, 3, 5, 7, 9])
+def test_lookup_response_rejects_truncated_fields(size):
+    with pytest.raises(ValueError, match="Invalid Mooncake lookup response"):
+        protocol.decode_lookup_response(bytes(size))

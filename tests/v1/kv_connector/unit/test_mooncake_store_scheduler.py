@@ -1700,3 +1700,37 @@ def test_external_only_core_scheduler_prefill_release_and_repeat(token_budget):
     assert pool.get_num_free_blocks() == free_before
     assert len(pool.cached_block_hash_to_block) == 0
     assert not scheduler.has_requests()
+
+
+@pytest.mark.parametrize(
+    "external_only,skip_cache,boundary,expected",
+    [
+        (True, False, 48, 48),
+        (False, False, 48, 0),
+        (True, True, 48, 0),
+        (True, False, 80, 0),
+        (True, False, 0, 0),
+    ],
+)
+def test_scheduler_checkpoint_hint_does_not_claim_a_cache_hit(
+    external_only, skip_cache, boundary, expected
+):
+    scheduler = _make_bare_scheduler()
+    scheduler.external_cache_only = external_only
+    scheduler.client = SimpleNamespace(
+        lookup=lambda *args, **kwargs: MooncakeLookupResult(
+            0, shared_prefix_boundary=boundary
+        )
+    )
+    request = SimpleNamespace(
+        request_id="sibling",
+        num_tokens=64,
+        num_prompt_tokens=64,
+        block_hashes=[],
+        shared_prefix_boundary=0,
+        skip_reading_prefix_cache=skip_cache,
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert request.shared_prefix_boundary == expected
+    assert not scheduler.load_specs

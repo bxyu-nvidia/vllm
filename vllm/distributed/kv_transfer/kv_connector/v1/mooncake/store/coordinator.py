@@ -186,7 +186,7 @@ class MooncakeStoreCoordinator:
         already reflects the eagle-pruned hit length and a second pop would
         leave the trailing block unloaded.
         """
-        blocks_per_group, hit_length = self._find_hit_blocks(
+        blocks_per_group, hit_length, _ = self._find_hit_blocks(
             block_hashes, max_length, cached_block_pool, apply_eagle=apply_eagle
         )
         masks = tuple(
@@ -194,6 +194,18 @@ class MooncakeStoreCoordinator:
             for blocks in blocks_per_group
         )
         return masks, hit_length
+
+    def find_lookup_hit(
+        self,
+        block_hashes: Sequence[BlockHash],
+        max_length: int,
+        cached_block_pool: ExternalCachedBlockPool,
+    ) -> tuple[int, int]:
+        """Return the reusable hit and a missing shared-prefix checkpoint hint."""
+        _, hit_length, shared_prefix_boundary = self._find_hit_blocks(
+            block_hashes, max_length, cached_block_pool
+        )
+        return hit_length, shared_prefix_boundary
 
     def load_mask(
         self,
@@ -332,7 +344,7 @@ class MooncakeStoreCoordinator:
         cached_block_pool: ExternalCachedBlockPool,
         *,
         apply_eagle: bool = True,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """Mirrors HybridKVCacheCoordinator.find_longest_cache_hit but
         dispatches via spec_manager_map (we don't allocate managers).
 
@@ -360,7 +372,7 @@ class MooncakeStoreCoordinator:
             blocks_by_group: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
             for gid, blks in zip(group_ids, hit_blocks, strict=True):
                 blocks_by_group[gid] = blks
-            return tuple(blocks_by_group), hit_length
+            return tuple(blocks_by_group), hit_length, 0
 
         num_groups = len(self.kv_cache_groups)
         hit_length = max_length
@@ -371,6 +383,7 @@ class MooncakeStoreCoordinator:
             self.attention_groups[0].spec, FullAttentionSpec
         )
         eagle_verified: set[int] = set()
+        longest_hit_length = 0
 
         while True:
             curr_hit_length = hit_length
@@ -416,6 +429,7 @@ class MooncakeStoreCoordinator:
                 elif _new_hit_length < curr_hit_length:
                     eagle_verified.clear()
                 curr_hit_length = _new_hit_length
+                longest_hit_length = max(longest_hit_length, curr_hit_length)
                 for gid, blocks in zip(group_ids, hit_blocks, strict=True):
                     hit_blocks_by_group[gid] = blocks
                     hit_length_by_group[gid] = _new_hit_length
@@ -442,6 +456,7 @@ class MooncakeStoreCoordinator:
         return (
             tuple(blks if blks is not None else [] for blks in hit_blocks_by_group),
             hit_length,
+            longest_hit_length if longest_hit_length > hit_length else 0,
         )
 
 

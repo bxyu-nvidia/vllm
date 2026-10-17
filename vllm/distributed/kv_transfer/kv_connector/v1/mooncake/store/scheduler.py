@@ -157,6 +157,18 @@ class MooncakeStoreScheduler:
             # Lookup not ready yet; scheduler will retry on a later step.
             return None, False
         num_external_hit_tokens = lookup_result.hit_length
+        # External-only disables local hash lookup, including discovery of
+        # missing Mamba checkpoints. Recover that hint from the store without
+        # treating the longer per-group prefix as loadable KV.
+        if (
+            self.external_cache_only
+            and self._boundary_state_group_ids
+            and not request.skip_reading_prefix_cache
+            and 0 < lookup_result.shared_prefix_boundary <= request.num_prompt_tokens
+        ):
+            request.shared_prefix_boundary = max(
+                request.shared_prefix_boundary, lookup_result.shared_prefix_boundary
+            )
 
         if num_external_hit_tokens < num_computed_tokens:
             need_to_allocate = 0

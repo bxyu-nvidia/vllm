@@ -680,11 +680,15 @@ class MooncakeLookupResult:
         tail_key_boundaries: Hash boundary used to store each cache group's
             tail block when ``hit_length`` does not identify its store key.
             There is one entry per group for every nonzero hit.
+        shared_prefix_boundary: A longer per-group hit needing a checkpoint
+            before all groups can reuse it. This is a scheduling hint, not KV
+            that can be loaded; zero means no missing checkpoint was found.
 
     """
 
     hit_length: int
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
+    shared_prefix_boundary: int = 0
 
 
 @dataclass

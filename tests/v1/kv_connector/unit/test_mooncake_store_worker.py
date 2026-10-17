@@ -5190,3 +5190,109 @@ def test_external_only_saved_kv_survives_local_reuse_and_reloads():
             data[block.block_id * 256 : (block.block_id + 1) * 256],
             expected[index * 256 : (index + 1) * 256],
         )
+
+
+@pytest.mark.parametrize("with_local_entries", [False, True])
+def test_external_only_lookup_schedules_missing_mamba_checkpoint(with_local_entries):
+    """A remote-only boundary creates a checkpoint without adopting local KV."""
+    from tests.v1.core.prefix_cache.test_mamba_eagle_resume_checkpoint import (
+        PREFIX,
+        _manager,
+        _prefill,
+        _stub,
+    )
+    from tests.v1.core.test_prefix_caching import make_request
+    from tests.v1.kv_connector.unit.test_mooncake_store_scheduler import (
+        _make_bare_scheduler,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.protocol import (
+        decode_lookup_response,
+        encode_lookup_response,
+    )
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    block_size, hash_size = 8576, 128
+    manager = _manager(
+        block_size,
+        hash_size,
+        eagle_group=0,
+        num_prefill_lookahead=1,
+        num_speculative_blocks=5,
+    )
+    stub = _stub(manager, block_size, hash_size)
+    scheduler = _make_bare_scheduler(
+        hash_block_size=hash_size, enable_partial_hash_hits=True
+    )
+    scheduler.external_cache_only = True
+    scheduler.bind_gpu_block_pool(manager.block_pool)
+    if with_local_entries:
+        owner = make_request("owner", PREFIX[:16000], hash_size, sha256)
+        _prefill(manager, stub, owner)
+    request = make_request("sibling", PREFIX[:12000] + [-1] * 4000, hash_size, sha256)
+    blocks, local, request.shared_prefix_boundary = manager.get_computed_blocks(request)
+    assert local == 0
+    assert request.shared_prefix_boundary == 0
+
+    worker = _make_bare_worker(block_size=hash_size)
+    worker._kv_cache_groups = manager.kv_cache_config.kv_cache_groups
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups,
+        scheduler_block_size=block_size,
+        hash_block_size=hash_size,
+        use_eagle=True,
+    )
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=gid),
+            block_size=block_size,
+            hash_block_size=hash_size,
+        )
+        for gid in range(2)
+    ]
+    _refresh_group_tp_replication_factors(worker)
+    # The physical boundary exists in the store, but EAGLE resumes one hash
+    # unit earlier, where no Mamba checkpoint has yet been materialized.
+    physical_hash = request.block_hashes[block_size // hash_size - 1]
+    present = {(gid, bytes(physical_hash)) for gid in range(2)}
+    worker.store.batch_is_exist.side_effect = lambda keys: [
+        int(any(f"@group:{gid}@{h.hex()}" in key for gid, h in present)) for key in keys
+    ]
+    scheduler.client = SimpleNamespace(
+        lookup=lambda req_id, num_tokens, hashes, **kwargs: decode_lookup_response(
+            encode_lookup_response(worker.lookup(num_tokens, hashes))
+        )
+    )
+    assert scheduler.get_num_new_matched_tokens(request, local) == (0, False)
+    assert request.shared_prefix_boundary == 8448
+    assert not scheduler.load_specs
+    assert not manager.block_pool.enable_local_cache
+
+    chunk = Scheduler._mamba_block_aligned_split(stub, request, request.num_tokens)
+    assert chunk == 8448
+    allocated = manager.allocate_slots(request, chunk, 0, blocks)
+    assert allocated is not None
+    checkpoint = allocated.blocks[1][0]
+    assert checkpoint.block_hash_num_tokens == chunk
+    assert manager.get_computed_blocks(request)[1] == 0
+
+    # Advancing the producer preserves the partial checkpoint via CoW and
+    # hands its exact block to the connector for offload.
+    request.num_computed_tokens = chunk
+    manager.new_step_starts()
+    next_chunk = Scheduler._mamba_block_aligned_split(
+        stub, request, request.num_tokens - chunk
+    )
+    assert manager.allocate_slots(request, next_chunk) is not None
+    offloads = manager.take_boundary_state_offloads()[request.request_id]
+    group_id, block_id, boundary = next(
+        entry for entry in offloads if entry[0] == 1 and entry[2] == chunk
+    )
+    assert manager.block_pool.blocks[block_id].block_hash_num_tokens == boundary
+
+    # Simulate publishing the handed-off checkpoint. Full attention still
+    # uses its existing physical-boundary key for the next sibling's load.
+    present.add((group_id, bytes(request.block_hashes[boundary // hash_size - 1])))
+    result = worker.lookup(request.num_tokens, request.block_hashes)
+    assert result.hit_length == chunk
+    assert result.shared_prefix_boundary == 0

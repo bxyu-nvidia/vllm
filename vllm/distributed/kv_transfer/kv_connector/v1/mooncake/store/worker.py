@@ -2336,7 +2336,7 @@ class MooncakeStoreWorker:
             self.hash_block_size,
             exists_set,
         )
-        _, hit_length = self.coord.find_longest_cache_hit(
+        hit_length, shared_prefix_boundary = self.coord.find_lookup_hit(
             block_hashes,
             token_len,
             cached_block_pool,
@@ -2345,7 +2345,7 @@ class MooncakeStoreWorker:
             usable_length = self.coord.align_lookup_length(num_tokens - 1)
             if usable_length <= 0:
                 return MooncakeLookupResult(0)
-            _, hit_length = self.coord.find_longest_cache_hit(
+            hit_length, shared_prefix_boundary = self.coord.find_lookup_hit(
                 block_hashes,
                 usable_length,
                 cached_block_pool,
@@ -2357,6 +2357,7 @@ class MooncakeStoreWorker:
                 hit_length,
                 cached_block_pool,
             ),
+            shared_prefix_boundary=shared_prefix_boundary,
         )
 
     def _tail_key_boundaries(

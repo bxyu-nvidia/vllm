@@ -3,6 +3,7 @@
 
 from math import lcm
 
+import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (  # noqa: E501
@@ -700,3 +701,33 @@ def test_dsv4_five_group_eagle_store_lookup_round_trip():
     # The final 256-token segment has no lookahead block, so EAGLE falls back
     # to the previous aligned boundary instead of consuming all 768 tokens.
     assert hit == 512
+
+
+@pytest.mark.parametrize("mamba_hit", [0, 16, 48])
+def test_lookup_reports_missing_hybrid_checkpoint_without_extending_hit(mamba_hit):
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    groups = [
+        KVCacheGroupSpec(["full"], _full()),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=16,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        ),
+    ]
+    coord = _make_coord(groups, hash_block_size=16)
+    hashes = _hashes(4)
+    present = {(0, bytes(h)) for h in hashes[:3]}
+    if mamba_hit:
+        present.add((1, bytes(hashes[mamba_hit // 16 - 1])))
+    pool = ExternalCachedBlockPool(16, present)
+
+    hit, junction = coord.find_lookup_hit(hashes, 64, pool)
+
+    assert hit == mamba_hit
+    assert junction == (48 if mamba_hit < 48 else 0)
+    assert coord.find_longest_cache_hit(hashes, 64, pool)[1] == hit

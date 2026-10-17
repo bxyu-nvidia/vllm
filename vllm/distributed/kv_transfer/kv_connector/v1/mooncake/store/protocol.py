@@ -18,7 +18,9 @@ Wire format (REQ/REP over IPC):
                    bytes); the server splits on hash_len
         Response: hit_length (u32 big-endian, first 4 bytes), followed by zero
                   or more 8-byte tail-key boundaries. Each entry is group_id
-                  (u32), then boundary_tokens (u32).
+                  (u32), then boundary_tokens (u32). An optional final u32
+                  carries the shared-prefix checkpoint boundary. Its presence
+                  is distinguished by length: 8 + 8*N instead of 4 + 8*N bytes.
 
       msg_type == RESET_MSG:
           (no payload frames)
@@ -52,23 +54,29 @@ TAIL_KEY_BOUNDARY_ENTRY_SIZE: int = 8
 
 def encode_lookup_response(result: MooncakeLookupResult) -> bytes:
     hit_length = result.hit_length.to_bytes(4, "big")
-    if not result.tail_key_boundaries:
-        return hit_length
-
     payload = bytearray(hit_length)
     for boundary in result.tail_key_boundaries:
         payload.extend(boundary.group_id.to_bytes(4, "big"))
         payload.extend(boundary.num_tokens.to_bytes(4, "big"))
+    if result.shared_prefix_boundary:
+        payload.extend(result.shared_prefix_boundary.to_bytes(4, "big"))
     return bytes(payload)
 
 
 def decode_lookup_response(payload: bytes) -> MooncakeLookupResult:
-    if len(payload) < 4 or (len(payload) - 4) % TAIL_KEY_BOUNDARY_ENTRY_SIZE:
+    if len(payload) < 4 or len(payload) % 4:
         raise ValueError("Invalid Mooncake lookup response")
+
+    shared_prefix_boundary = 0
+    if len(payload) % TAIL_KEY_BOUNDARY_ENTRY_SIZE == 0:
+        shared_prefix_boundary = int.from_bytes(payload[-4:], "big")
+        payload = payload[:-4]
 
     hit_length = int.from_bytes(payload[:4], "big")
     if len(payload) == 4:
-        return MooncakeLookupResult(hit_length)
+        return MooncakeLookupResult(
+            hit_length, shared_prefix_boundary=shared_prefix_boundary
+        )
 
     boundaries = []
     for offset in range(4, len(payload), TAIL_KEY_BOUNDARY_ENTRY_SIZE):
@@ -78,4 +86,4 @@ def decode_lookup_response(payload: bytes) -> MooncakeLookupResult:
                 num_tokens=int.from_bytes(payload[offset + 4 : offset + 8], "big"),
             )
         )
-    return MooncakeLookupResult(hit_length, tuple(boundaries))
+    return MooncakeLookupResult(hit_length, tuple(boundaries), shared_prefix_boundary)
