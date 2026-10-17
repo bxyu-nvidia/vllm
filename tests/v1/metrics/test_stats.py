@@ -35,6 +35,7 @@ def test_scheduler_iteration_details_serialization():
             kv_cache_usage=0.5,
             admission_blocked={"token_budget": 2},
             prefetch_events={"admitted": 1},
+            kv_cache_turnover={"5": {"miss_after_eviction": 3}},
             iteration_details=iteration_details,
         )
     )
@@ -46,6 +47,9 @@ def test_scheduler_iteration_details_serialization():
     assert decoded.scheduler_stats.kv_cache_usage == 0.5
     assert decoded.scheduler_stats.admission_blocked == {"token_budget": 2}
     assert decoded.scheduler_stats.prefetch_events == {"admitted": 1}
+    assert decoded.scheduler_stats.kv_cache_turnover == {
+        "5": {"miss_after_eviction": 3}
+    }
     assert decoded.scheduler_stats.iteration_details == iteration_details
 
 
@@ -330,5 +334,50 @@ def test_admission_event_export_accumulates_deltas_and_keeps_engine_labels():
                 )
                 == admitted
             )
+    finally:
+        unregister_vllm_metrics()
+
+
+def test_turnover_export_accumulates_deltas_per_engine_and_cache_group():
+    from prometheus_client import REGISTRY
+
+    from tests.v1.core.utils import create_scheduler
+    from vllm.v1.metrics.loggers import PrometheusStatLogger
+    from vllm.v1.metrics.prometheus import unregister_vllm_metrics
+
+    config = create_scheduler().vllm_config
+    config.observability_config.kv_cache_metrics = True
+    logger = PrometheusStatLogger(config, engine_indexes=[0, 1])
+    try:
+        for count in [2, 0, 1]:
+            logger.record(
+                SchedulerStats(
+                    kv_cache_turnover={
+                        "5": {"miss_after_eviction": count},
+                        "0": {"miss_after_eviction": 0},
+                    }
+                ),
+                None,
+                engine_idx=1,
+            )
+        labels = {
+            "model_name": config.model_config.served_model_name,
+            "engine": "1",
+            "event": "miss_after_eviction",
+        }
+        for group, expected in [("5", 3), ("0", 0)]:
+            assert (
+                REGISTRY.get_sample_value(
+                    "vllm:kv_cache_turnover_total", {**labels, "kv_cache_group": group}
+                )
+                == expected
+            )
+        assert (
+            REGISTRY.get_sample_value(
+                "vllm:kv_cache_turnover_total",
+                {**labels, "engine": "0", "kv_cache_group": "5"},
+            )
+            is None
+        )
     finally:
         unregister_vllm_metrics()

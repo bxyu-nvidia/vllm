@@ -3045,6 +3045,11 @@ class Scheduler(SchedulerInterface):
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
+            kv_cache_turnover=(
+                self.kv_metrics_collector.drain_turnover()
+                if self.kv_metrics_collector is not None
+                else {}
+            ),
             spec_decoding_stats=spec_stats,
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,

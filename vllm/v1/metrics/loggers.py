@@ -986,7 +986,16 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         #
         # KV Cache residency metrics
         #
+        self.counter_kv_cache_turnover = None
         if self.kv_cache_metrics_enabled:
+            self.counter_kv_cache_turnover = self._counter_cls(
+                name="vllm:kv_cache_turnover",
+                documentation=(
+                    "Unsampled prefix probes and evictions by cache group. "
+                    "Miss attribution uses bounded eviction history; not token counts."
+                ),
+                labelnames=labelnames + ["kv_cache_group", "event"],
+            )
             kv_cache_residency_buckets = histogram_buckets("kv_cache_residency")
 
             histogram_kv_block_lifetime = self._histogram_cls(
@@ -1153,6 +1162,13 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
             if scheduler_stats.perf_stats is not None:
                 self.perf_metrics_prom.observe(scheduler_stats.perf_stats, engine_idx)
+
+            if self.counter_kv_cache_turnover is not None:
+                for group, counts in scheduler_stats.kv_cache_turnover.items():
+                    for event_name, count in counts.items():
+                        self.counter_kv_cache_turnover.labels(
+                            *self.per_engine_labelvalues[engine_idx], group, event_name
+                        ).inc(count)
 
             if (
                 self.kv_cache_metrics_enabled

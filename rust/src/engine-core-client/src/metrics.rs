@@ -6,10 +6,10 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vllm_metrics::{
-    EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric, LoraAdapterNames,
-    LoraInfoLabels, MooncakeOperationCounterFamily, MooncakeOperationHistogramFamily,
-    MooncakeOperationLabels, RequestMetrics, SchedulerLogStatsAccumulator, SchedulerMetrics,
-    U64Counter, U64Gauge, WaitingReasonLabels,
+    EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric, KvCacheTurnoverLabels,
+    LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
+    MooncakeOperationHistogramFamily, MooncakeOperationLabels, RequestMetrics,
+    SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
 use vllm_metrics::{DEFERRED_REASONS, MooncakePipelineHistogramFamily, MooncakePipelineLabels};
@@ -57,6 +57,7 @@ struct SchedulerStatsHandles {
     scheduler_waiting_deferred: U64Gauge,
     admission_blocked: Family<WaitingReasonLabels, U64Counter>,
     prefetch_events: Family<WaitingReasonLabels, U64Counter>,
+    kv_cache_turnover: Family<KvCacheTurnoverLabels, U64Counter>,
     scheduler_deferred_by_reason: Family<WaitingReasonLabels, U64Gauge>,
     kv_cache_usage: F64Gauge,
 
@@ -166,6 +167,7 @@ fn resolve_scheduler_stats_handles(
     SchedulerStatsHandles {
         admission_blocked: metrics.admission_blocked.clone(),
         prefetch_events: metrics.prefetch_events.clone(),
+        kv_cache_turnover: metrics.kv_cache_turnover.clone(),
         scheduler_deferred_by_reason: metrics.scheduler_deferred_by_reason.clone(),
         scheduler_running: metrics.scheduler_running.get_or_create_owned(&labels),
         scheduler_waiting: metrics.scheduler_waiting.get_or_create_owned(&labels),
@@ -302,6 +304,19 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
             .set(stats.deferred_waiting_reasons.get(reason).copied().unwrap_or(0));
     }
     handles.kv_cache_usage.set(stats.kv_cache_usage);
+    for (group, counts) in &stats.kv_cache_turnover {
+        for (event, count) in counts {
+            handles
+                .kv_cache_turnover
+                .get_or_create(&KvCacheTurnoverLabels {
+                    model_name: handles.labels.model_name.clone(),
+                    engine: handles.labels.engine,
+                    kv_cache_group: group.clone(),
+                    event: event.clone(),
+                })
+                .inc_by(*count);
+        }
+    }
 
     // Prefix-cache counters, including the connector-backed external cache path.
     handles.prefix_cache_queries.inc_by(stats.prefix_cache_stats.base.queries);
@@ -634,6 +649,13 @@ mod tests {
         assert_eq!(multi.mooncake.as_ref().unwrap().pipeline.len(), 3);
         let stats = SchedulerStats {
             num_skipped_waiting_reqs: 3,
+            kv_cache_turnover: BTreeMap::from([(
+                "5".to_string(),
+                BTreeMap::from([
+                    ("evicted".to_string(), 7),
+                    ("miss_after_eviction".to_string(), 3),
+                ]),
+            )]),
             admission_blocked: BTreeMap::from([("token_budget".to_string(), 2)]),
             prefetch_events: BTreeMap::from([
                 ("attempted".to_string(), 3),
@@ -669,6 +691,9 @@ mod tests {
         ));
         assert!(rendered.contains(
             "vllm:kv_prefetch_events_total{model_name=\"model\",engine=\"0\",reason=\"admitted\"} 1"
+        ));
+        assert!(rendered.contains(
+            "vllm:kv_cache_turnover_total{model_name=\"model\",engine=\"0\",kv_cache_group=\"5\",event=\"miss_after_eviction\"} 3"
         ));
         let mut drained = stats.kv_connector_stats.unwrap();
         let KvConnectorStats::Multi(ref mut multi) = drained else {

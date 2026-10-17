@@ -327,6 +327,9 @@ pub struct SchedulerStats {
     pub connector_prefix_cache_stats: Option<PrefixCacheStats>,
     /// Sampled KV cache eviction events for residency metrics.
     pub kv_cache_eviction_events: Vec<KvCacheEvictionEvent>,
+    /// Unsampled prefix probes and evictions, by cache group then event.
+    #[serde(default)]
+    pub kv_cache_turnover: BTreeMap<String, BTreeMap<String, u64>>,
     /// Speculative decoding scheduler stats, when enabled.
     pub spec_decoding_stats: Option<SpecDecodingStats>,
     /// Connector-specific KV transfer stats.

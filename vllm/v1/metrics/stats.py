@@ -236,6 +236,8 @@ class SchedulerStats:
     connector_prefix_cache_stats: PrefixCacheStats | None = None
 
     kv_cache_eviction_events: list[KVCacheEvictionEvent] = field(default_factory=list)
+    # Unsampled prefix probes and evictions, by cache group then event.
+    kv_cache_turnover: dict[str, dict[str, int]] = field(default_factory=dict)
 
     spec_decoding_stats: SpecDecodingStats | None = None
     kv_connector_stats: dict[str, Any] | None = None

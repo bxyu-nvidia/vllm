@@ -222,3 +222,64 @@ def test_kv_cache_metrics_collector_smoke() -> None:
     assert abs(event.idle_seconds - 1.0) < 1e-6
     # One reuse gap between the two accesses.
     assert event.reuse_gaps_seconds == (1.0,)
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_turnover_requires_loss_of_last_cached_copy(duplicate: bool) -> None:
+    """Recycling an unhashed block or one duplicate must not attribute misses."""
+    from types import SimpleNamespace
+
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_utils import BlockHash
+
+    collector = KVCacheMetricsCollector()
+    pool = BlockPool(3, True, 16, metrics_collector=collector)
+    key = BlockHash(b"prefix")
+    blocks = pool.get_new_blocks(2)
+    request = SimpleNamespace(block_hashes=[key])
+    for block in blocks[: 2 if duplicate else 1]:
+        pool.cache_full_blocks(request, [block], 0, 1, 16, 0)
+    pool.free_blocks(blocks)
+    recycled = pool.get_new_blocks(1)
+    # Unhashed free blocks are recycled before cached blocks.
+    assert pool.get_cached_block(key, [0]) is not None
+    assert collector.drain_turnover()["0"]["evicted"] == 0
+    recycled += pool.get_new_blocks(1)
+    assert pool.get_cached_block(key, [0]) is None
+    assert pool.get_cached_block(key, [1]) is None
+    counts = collector.drain_turnover()
+    assert counts["0"]["evicted"] == 1
+    assert counts["0"]["miss_after_eviction"] == 1
+    assert counts["1"]["miss_after_eviction"] == 0
+    # Repeated probes count again, even across stats drains.
+    assert pool.get_cached_block(key, [0]) is None
+    assert collector.drain_turnover()["0"]["miss_after_eviction"] == 1
+    pool.cache_full_blocks(request, [recycled[0]], 0, 1, 16, 0)
+    assert pool.get_cached_block(key, [0]) is not None
+    # Explicit invalidation after reload is not a capacity eviction.
+    pool.evict_blocks({recycled[0].block_id})
+    assert pool.get_cached_block(key, [0]) is None
+    counts = collector.drain_turnover()["0"]
+    assert counts["lookup_hit"] == 1
+    assert counts["lookup_miss"] == 1
+    assert counts["miss_after_eviction"] == 0
+    assert counts["evicted"] == 0
+
+
+def test_turnover_history_is_bounded_and_reset_clears_attribution() -> None:
+    from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
+
+    collector = KVCacheMetricsCollector(eviction_history_limit=2)
+    keys = [make_block_hash_with_group_id(BlockHash(bytes([i])), 0) for i in range(3)]
+    for key in keys:
+        collector.on_prefix_evicted(key, 0)
+    for key in keys:
+        collector.on_prefix_lookup(key, 0, hit=False)
+    counts = collector.drain_turnover()["0"]
+    assert counts["evicted"] == 3
+    assert counts["history_dropped"] == 1
+    assert counts["lookup_miss"] == 3
+    assert counts["miss_after_eviction"] == 2
+    collector.reset()
+    collector.on_prefix_lookup(keys[-1], 0, hit=False)
+    assert collector.drain_turnover()["0"]["miss_after_eviction"] == 0

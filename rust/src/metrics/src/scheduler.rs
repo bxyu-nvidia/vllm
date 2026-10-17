@@ -94,6 +94,14 @@ pub struct EnginePositionLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct KvCacheTurnoverLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub kv_cache_group: String,
+    pub event: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct WaitingReasonLabels {
     pub model_name: String,
     pub engine: u32,
@@ -260,6 +268,7 @@ pub struct SchedulerMetrics {
     pub scheduler_waiting_by_reason: Family<WaitingReasonLabels, U64Gauge>,
     pub admission_blocked: Family<WaitingReasonLabels, U64Counter>,
     pub prefetch_events: Family<WaitingReasonLabels, U64Counter>,
+    pub kv_cache_turnover: Family<KvCacheTurnoverLabels, U64Counter>,
     pub scheduler_deferred_by_reason: Family<WaitingReasonLabels, U64Gauge>,
     pub kv_cache_usage: Family<EngineLabels, F64Gauge>,
 
@@ -466,6 +475,12 @@ impl SchedulerMetrics {
             kv_block_reuse_gap_seconds.clone(),
         );
 
+        let kv_cache_turnover = Family::default();
+        registry.register(
+            "vllm:kv_cache_turnover",
+            "Unsampled prefix probes and evictions by cache group. Miss attribution uses bounded eviction history; not token counts.",
+            kv_cache_turnover.clone(),
+        );
         let admission_blocked = Family::default();
         registry.register(
             "vllm:scheduler_admission_blocked",
@@ -642,6 +657,7 @@ impl SchedulerMetrics {
             scheduler_running,
             scheduler_waiting,
             scheduler_waiting_by_reason,
+            kv_cache_turnover,
             admission_blocked,
             prefetch_events,
             scheduler_deferred_by_reason,

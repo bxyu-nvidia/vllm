@@ -218,6 +218,10 @@ class BlockPool:
             block = self.cached_block_hash_to_block.get_one_block(
                 block_hash_with_group_id
             )
+            if self.metrics_collector:
+                self.metrics_collector.on_prefix_lookup(
+                    block_hash_with_group_id, group_id, hit=block is not None
+                )
             if not block:
                 return None
             cached_blocks.append(block)
@@ -647,6 +651,8 @@ class BlockPool:
                 block_hash_with_group_id
             )
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+        if self.metrics_collector:
+            self.metrics_collector.on_prefix_inserted(block_hash_with_group_id)
 
     def move_block_hashes(
         self,
@@ -689,7 +695,7 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
-                self._maybe_evict_cached_block(block)
+                self._maybe_evict_cached_block(block, record_turnover=True)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
@@ -729,12 +735,15 @@ class BlockPool:
                 released.append(block)
         self.free_block_queue.append_n(released)
 
-    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+    def _maybe_evict_cached_block(
+        self, block: KVCacheBlock, *, record_turnover: bool = False
+    ) -> bool:
         """If a block is cached in `cached_block_hash_to_block`, we reset its hash
         metadata and evict it from the cache.
 
         Args:
             block: The block to evict.
+            record_turnover: Whether removal is caused by capacity reallocation.
 
         Returns:
             True if the block is evicted, False otherwise.
@@ -749,6 +758,10 @@ class BlockPool:
             # The block doesn't have hash, eviction is not needed
             return False
 
+        if self.metrics_collector and record_turnover:
+            for key in evicted_hashes:
+                if self.cached_block_hash_to_block.get_one_block(key) is None:
+                    self.metrics_collector.on_prefix_evicted(key, get_group_id(key))
         self._emit_block_removed_events(evicted_hashes)
         return True
 
