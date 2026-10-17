@@ -155,6 +155,7 @@ def _make_store_sending_thread(
     enable_group_semantics: bool = False,
     supports_group_ids: bool = False,
     external_cache_only: bool = False,
+    lookup_key_prefixes: list[tuple[str, ...]] | None = None,
 ) -> mooncake_store_worker.KVCacheStoreSendingThread:
     if coord is None:
         coord = _default_send_coord()
@@ -176,6 +177,7 @@ def _make_store_sending_thread(
         enable_group_semantics=enable_group_semantics,
         supports_group_ids=supports_group_ids,
         external_cache_only=external_cache_only,
+        lookup_key_prefixes=lookup_key_prefixes,
     )
     thread.request_queue.task_done = MagicMock()
     return thread
@@ -5296,3 +5298,180 @@ def test_external_only_lookup_schedules_missing_mamba_checkpoint(with_local_entr
     result = worker.lookup(request.num_tokens, request.block_hashes)
     assert result.hit_length == chunk
     assert result.shared_prefix_boundary == 0
+
+
+@pytest.mark.parametrize(
+    "coverage,expected_reuse",
+    [
+        ("full", True),
+        ("partial", True),
+        ("missing", False),
+        ("other_chunk", False),
+        ("one_rank", False),
+        ("different_rank_hash", False),
+        ("non_causal", False),
+        ("mamba_only", False),
+        ("other_prefix", False),
+        ("no_future_hash", False),
+    ],
+)
+def test_checkpoint_reuses_only_matching_attention_in_every_namespace(
+    coverage, expected_reuse
+):
+    from functools import partial
+
+    from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
+        MooncakeStorePromMetrics,
+    )
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    store = MagicMock()
+    boundary = 8 if coverage in {"partial", "different_rank_hash"} else 12
+    hashes = [BlockHash(f"h{i}".encode()) for i in range(8)]
+    if coverage == "no_future_hash":
+        hashes = hashes[:3]
+    groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                non_causal=coverage == "non_causal",
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=16,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        ),
+    ]
+    coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        groups,
+        scheduler_block_size=16,
+        hash_block_size=4,
+    )
+    dbs = []
+    for gid in range(2):
+        db = ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=gid),
+            block_size=16,
+            hash_block_size=4,
+        )
+        db.set_kv_caches_base_addr([0x1000 * (gid + 1)])
+        db.set_block_len([256])
+        dbs.append(db)
+    prefixes = [db.key_for(hashes[0]).rsplit("@", 1)[0] for db in dbs]
+    rank1 = prefixes[0].replace("tp_rank:0", "tp_rank:1")
+    namespaces = [(prefixes[0], rank1), (prefixes[1],)]
+    present = set()
+    cover_hash = hashes[2] if coverage == "partial" else BlockHash(b"h3")
+    if coverage in {"full", "partial", "one_rank", "non_causal"}:
+        present.add(f"{prefixes[0]}@{cover_hash.hex()}")
+        if coverage != "one_rank":
+            present.add(f"{rank1}@{cover_hash.hex()}")
+    elif coverage == "different_rank_hash":
+        present.add(f"{prefixes[0]}@{hashes[2].hex()}")
+        present.add(f"{rank1}@{hashes[3].hex()}")
+    elif coverage == "other_chunk":
+        present.update(f"{prefix}@{hashes[7].hex()}" for prefix in namespaces[0])
+    elif coverage == "mamba_only":
+        present.add(dbs[1].key_for(hashes[3]))
+    elif coverage == "other_prefix":
+        present.update(f"{prefix}@{b'other'.hex()}" for prefix in namespaces[0])
+    store.batch_is_exist.side_effect = lambda keys: [
+        int(key in present) for key in keys
+    ]
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [0] * len(keys)
+    thread = _make_store_sending_thread(
+        store,
+        coord=coord,
+        token_databases=dbs,
+        lookup_key_prefixes=namespaces,
+    )
+    stats = MooncakeStoreConnectorStats()
+    thread._record_operation_cb = stats.record_operation
+    req = ReqMeta(
+        req_id="checkpoint",
+        token_len_chunk=0,
+        block_ids=([1, 2], [0]),
+        block_hashes=hashes,
+        can_save=True,
+        boundary_state_offloads=[(1, 7, boundary)],
+    )
+    assert thread._maybe_offload_boundary_states(req)
+    written = store.batch_put_from_multi_buffers.call_args.args[0]
+    boundary_hash = hashes[boundary // 4 - 1]
+    assert (dbs[0].key_for(boundary_hash) not in written) == expected_reuse
+    assert dbs[1].key_for(boundary_hash) in written
+    assert stats.data["checkpoint_mamba_put"][0]["num_bytes"] == 256
+    assert stats.data["save_put"][0]["num_bytes"] == (256 if expected_reuse else 512)
+    if expected_reuse:
+        assert stats.data["checkpoint_attention_reuse"][0]["num_bytes"] == 256
+        assert "checkpoint_attention_put" not in stats.data
+        # Check that lookup can recover this state via the original attention key.
+        present.update(written)
+        worker = _make_bare_worker(block_size=4)
+        worker.coord = coord
+        worker._kv_cache_groups = groups
+        worker.token_dbs = dbs
+        worker._lookup_key_prefixes = namespaces
+        worker.store = store
+        result = worker.lookup(33, hashes)
+        assert result.hit_length == boundary
+        assert result.tail_key_boundaries[0].num_tokens == (
+            12 if coverage == "partial" else 16
+        )
+        # Recheck each save: evicting the covering key restores normal uploads.
+        present.clear()
+        assert thread._maybe_offload_boundary_states(req)
+        assert len(store.batch_put_from_multi_buffers.call_args.args[0]) == 2
+    else:
+        assert "checkpoint_attention_reuse" not in stats.data
+        assert stats.data["checkpoint_attention_put"][0]["num_bytes"] == 256
+
+    registry = CollectorRegistry()
+    metrics = MooncakeStorePromMetrics(
+        SimpleNamespace(kv_transfer_config=None),
+        {cls: partial(cls, registry=registry) for cls in (Counter, Gauge, Histogram)},
+        ["engine"],
+        {0: ["0"]},
+    )
+    metrics.observe(stats.data)
+    assert registry.get_sample_value(
+        "vllm:mooncake_store_operation_bytes_total",
+        {"engine": "0", "operation": "checkpoint_mamba_put", "status": "ok"},
+    ) == (512 if expected_reuse else 256)
+
+
+@pytest.mark.parametrize("failure", ["exception", "partial"])
+def test_checkpoint_write_metrics_record_failed_keys(failure):
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    if failure == "exception":
+        store.batch_put_from_multi_buffers.side_effect = RuntimeError("failed")
+    else:
+        store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [0] * (
+            len(keys) - 1
+        ) + [-1]
+    thread = _make_partial_tail_send_thread(store)
+    stats = MooncakeStoreConnectorStats()
+    thread._record_operation_cb = stats.record_operation
+    assert not thread._maybe_offload_boundary_states(_make_partial_tail_req([1, 2, 3]))
+    mamba = stats.data["checkpoint_mamba_put"][0]
+    attention = stats.data["checkpoint_attention_put"][0]
+    assert mamba["num_failed_keys"] == 1
+    assert mamba["status"] == ("error" if failure == "exception" else "partial_failure")
+    assert attention["num_failed_keys"] == (3 if failure == "exception" else 0)
+    assert attention["num_bytes"] == 768

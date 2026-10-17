@@ -190,6 +190,9 @@ pub mod kv_connector {
     pub enum MooncakeOperation {
         SaveExists,
         SavePut,
+        CheckpointMambaPut,
+        CheckpointAttentionPut,
+        CheckpointAttentionReuse,
         LoadGet,
         LookupExists,
     }
@@ -199,6 +202,9 @@ pub mod kv_connector {
             match self {
                 Self::SaveExists => "save_exists",
                 Self::SavePut => "save_put",
+                Self::CheckpointMambaPut => "checkpoint_mamba_put",
+                Self::CheckpointAttentionPut => "checkpoint_attention_put",
+                Self::CheckpointAttentionReuse => "checkpoint_attention_reuse",
                 Self::LoadGet => "load_get",
                 Self::LookupExists => "lookup_exists",
             }

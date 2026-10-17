@@ -690,4 +690,40 @@ mod tests {
                 .contains("vllm:nixl_xfer_time_seconds_count{model_name=\"model\",engine=\"0\"} 2")
         );
     }
+
+    #[test]
+    fn checkpoint_stats_deserialize_and_export_without_changing_save_totals() {
+        let payload = serde_json::json!({
+            "save_put": [{"duration_seconds": 0.1, "num_keys": 2, "num_bytes": 768,
+                "status": "ok", "num_failed_keys": 0}],
+            "checkpoint_mamba_put": [{"duration_seconds": 0.1, "num_keys": 1,
+                "num_bytes": 256, "status": "ok", "num_failed_keys": 0}],
+            "checkpoint_attention_put": [{"duration_seconds": 0.1, "num_keys": 1,
+                "num_bytes": 512, "status": "ok", "num_failed_keys": 0}],
+            "checkpoint_attention_reuse": [{"duration_seconds": 0.01, "num_keys": 1,
+                "num_bytes": 1024, "status": "ok", "num_failed_keys": 0}]
+        });
+        let decoded: KvConnectorStats = serde_json::from_value(payload).unwrap();
+        assert!(matches!(&decoded, KvConnectorStats::Mooncake(_)));
+        let metrics = Metrics::new();
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        super::record_scheduler_stats_with_handles(
+            &handles,
+            &SchedulerStats {
+                kv_connector_stats: Some(decoded),
+                ..Default::default()
+            },
+        );
+        let rendered = metrics.render().unwrap();
+        for (operation, bytes) in [
+            ("save_put", 768),
+            ("checkpoint_mamba_put", 256),
+            ("checkpoint_attention_put", 512),
+            ("checkpoint_attention_reuse", 1024),
+        ] {
+            assert!(rendered.contains(&format!(
+                "vllm:mooncake_store_operation_bytes_total{{model_name=\"model\",engine=\"0\",operation=\"{operation}\",status=\"ok\"}} {bytes}"
+            )));
+        }
+    }
 }

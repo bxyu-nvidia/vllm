@@ -426,6 +426,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         group_participates: Sequence[bool] | None = None,
         *,
         external_cache_only: bool = False,
+        lookup_key_prefixes: Sequence[Sequence[str]] | None = None,
     ):
         super().__init__(
             store,
@@ -456,6 +457,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # so the scheduler can release the blocks it referenced for those jobs.
         self._completed_saves: dict[int, int] = {}
         self.external_cache_only = external_cache_only
+        self.lookup_key_prefixes = lookup_key_prefixes
         self._store_error: str | None = None
         self.enable_kv_event = enable_kv_event
         # Caller always passes a non-None ReplicateConfig — see
@@ -699,6 +701,87 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 puts.append((db.key_for(key_hash), addr, size, db.metadata))
         return puts
 
+    def _checkpoint_covering_keys(
+        self,
+        req_meta: ReqMeta,
+        puts: list[tuple[str, list[int], list[int], KeyMetadata]],
+    ) -> dict[int, list[tuple[str, ...]]]:
+        """Find later attention keys that can serve a checkpoint's partial block.
+
+        Only full attention permits this reuse: recurrent state must match the
+        exact boundary. Every lookup namespace must agree on a covering hash,
+        and it must be within the same physical block and this request's prefix.
+        Presence is rechecked in the save RPC; a lookup-time hint is not enough.
+        """
+        if self.lookup_key_prefixes is None:
+            return {}
+        full_groups = {
+            gid
+            for group in self.coord.attention_groups
+            if isinstance(group.spec, FullAttentionSpec) and not group.spec.non_causal
+            for gid in group.group_ids
+        }
+        boundaries = {
+            boundary for _, _, boundary in req_meta.boundary_state_offloads or ()
+        }
+        coverage: dict[int, list[tuple[str, ...]]] = {}
+        hash_size = self.coord.hash_block_size
+        for index, (key, _, _, metadata) in enumerate(puts):
+            gid = metadata.group_id
+            if gid not in full_groups:
+                continue
+            db = self.token_databases[gid]
+            prefixes = self.lookup_key_prefixes[gid]
+            if not prefixes:
+                continue
+            for boundary in boundaries:
+                if boundary <= 0 or boundary % db.block_size == 0:
+                    continue
+                hash_index = boundary // hash_size - 1
+                if hash_index >= len(req_meta.block_hashes):
+                    continue
+                if key != db.key_for(req_meta.block_hashes[hash_index]):
+                    continue
+                end = min(
+                    cdiv(boundary, db.block_size) * db.block_size // hash_size,
+                    len(req_meta.block_hashes),
+                )
+                coverage[index] = [
+                    tuple(f"{prefix}@{bytes(h).hex()}" for prefix in prefixes)
+                    for h in req_meta.block_hashes[hash_index + 1 : end]
+                ]
+        return coverage
+
+    def _record_checkpoint_puts(
+        self,
+        puts: list[tuple[str, list[int], list[int], KeyMetadata]],
+        started_at: float,
+        failed_indices: set[int],
+        *,
+        error: bool = False,
+    ) -> None:
+        """Break out checkpoint PUT traffic, a subset of aggregate save_put."""
+        for is_mamba, operation in (
+            (True, "checkpoint_mamba_put"),
+            (False, "checkpoint_attention_put"),
+        ):
+            indices = [
+                i
+                for i, put in enumerate(puts)
+                if (put[3].group_id in self.coord.mamba_group_ids) == is_mamba
+            ]
+            if not indices:
+                continue
+            failed = sum(i in failed_indices for i in indices)
+            self._record_operation(
+                operation,
+                started_at,
+                len(indices),
+                num_bytes=sum(sum(puts[i][2]) for i in indices),
+                status="error" if error else "partial_failure" if failed else "ok",
+                num_failed_keys=failed,
+            )
+
     def _maybe_offload_boundary_states(self, req_meta: ReqMeta) -> bool:
         """Persist connector-pinned mamba "align" boundary states handed off
         for this request, deduped against the store.
@@ -749,16 +832,33 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if self.enable_group_semantics and self.supports_group_ids
             else None
         )
+        covering_keys = self._checkpoint_covering_keys(req_meta, puts)
+        probe_keys = list(
+            dict.fromkeys(
+                [
+                    *keys,
+                    *(
+                        key
+                        for candidates in covering_keys.values()
+                        for candidate in candidates
+                        for key in candidate
+                    ),
+                ]
+            )
+        )
         exists_start = time.perf_counter()
         try:
-            exists = self.store.batch_is_exist(keys)
+            exists = self.store.batch_is_exist(probe_keys)
+            present = {
+                key for key, found in zip(probe_keys, exists, strict=True) if found == 1
+            }
         except Exception as e:
             self._record_operation(
                 "save_exists",
                 exists_start,
-                len(keys),
+                len(probe_keys),
                 status="error",
-                num_failed_keys=len(keys),
+                num_failed_keys=len(probe_keys),
             )
             logger.error(
                 "Failed to check boundary-state keys for request %s: %s",
@@ -766,10 +866,28 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 e,
             )
             return False
-        self._record_operation("save_exists", exists_start, len(keys))
-        missing = [i for i, e in enumerate(exists) if e != 1]
+        self._record_operation("save_exists", exists_start, len(probe_keys))
+        reused = {
+            i
+            for i, candidates in covering_keys.items()
+            if keys[i] not in present
+            and any(
+                all(key in present for key in candidate) for candidate in candidates
+            )
+        }
+        if reused:
+            self._record_operation(
+                "checkpoint_attention_reuse",
+                exists_start,
+                len(reused),
+                num_bytes=sum(sum(sizes[i]) for i in reused),
+            )
+        missing = [
+            i for i, key in enumerate(keys) if key not in present and i not in reused
+        ]
         if not missing:
             return True
+        puts = [puts[i] for i in missing]
         keys = [keys[i] for i in missing]
         addrs = [addrs[i] for i in missing]
         sizes = [sizes[i] for i in missing]
@@ -796,6 +914,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 status="error",
                 num_failed_keys=len(keys),
             )
+            self._record_checkpoint_puts(
+                puts, put_start, set(range(len(puts))), error=True
+            )
             logger.error(
                 "Failed to put boundary-state keys for request %s: %s",
                 req_meta.req_id,
@@ -804,6 +925,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             return False
 
         failed = [i for i, value in enumerate(res) if value < 0]
+        self._record_checkpoint_puts(puts, put_start, set(failed))
         self._record_operation(
             "save_put",
             put_start,
@@ -2046,6 +2168,7 @@ class MooncakeStoreWorker:
                     for group in self._kv_cache_groups
                 ],
                 external_cache_only=self.external_cache_only,
+                lookup_key_prefixes=self._lookup_key_prefixes,
             )
             self.kv_send_thread.start()
 
