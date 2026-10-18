@@ -22,6 +22,15 @@ _MAX_PENDING = 4096
 _RETRY_BATCH_SIZE = 128
 _RETRY_INTERVAL = 1.0
 _OBJECT_NOT_FOUND = -704
+CHECKPOINT_ANCHOR = 1
+CHECKPOINT_LINEAGE = 2
+CHECKPOINT_RETIRED = 4
+CHECKPOINT_READY = 8
+
+
+def supports_checkpoint_metadata(store: object) -> bool:
+    """Detect the optional pybind API without probing or renewing any leases."""
+    return callable(getattr(type(store), "batch_checkpoint_metadata", None))
 
 
 def _layout_digest(lookup_key_prefixes: Sequence[Sequence[str]]) -> str:
@@ -48,9 +57,9 @@ class MambaCheckpointRetirer(threading.Thread):
     """Keep roots and tips, deleting intermediate Mamba keys after save commits.
 
     Only the elected worker receives commits, after every rank reports a
-    successful save. Tiny derived-checkpoint markers live in the shared store
-    so a continuation can move between DP instances. Missing markers (including
-    evicted markers) conservatively make their checkpoints anchors.
+    successful save. New clients attach provenance to the checkpoint payload;
+    older clients use separate markers. Missing evidence conservatively retains
+    the checkpoint. Neither mode changes Mooncake read visibility or leases.
     """
 
     def __init__(
@@ -61,10 +70,12 @@ class MambaCheckpointRetirer(threading.Thread):
         *,
         record_operation: Callable[..., None] | None = None,
         publish_anchors: bool = False,
+        use_payload_metadata: bool = False,
     ) -> None:
         super().__init__(daemon=True, name="MambaCheckpointRetirer")
         self.store = store
         self._publish_anchors = publish_anchors
+        self._use_payload_metadata = use_payload_metadata
         self._anchor_prefix = anchor_checkpoint_prefix(lookup_key_prefixes)
         self._record_operation = record_operation
         self._mamba_prefixes = tuple(
@@ -150,6 +161,9 @@ class MambaCheckpointRetirer(threading.Thread):
         child = commit.checkpoint_hash
         if parent == child or not self._mamba_prefixes:
             return
+        if self._use_payload_metadata:
+            self._commit_payload_metadata(commit)
+            return
         if parent is None:
             if self._publish_anchors:
                 self._publish_anchor(child)
@@ -205,6 +219,9 @@ class MambaCheckpointRetirer(threading.Thread):
             )
             return
         self._record("checkpoint_retired_put", start, 1)
+        self._remove_parent(parent)
+
+    def _remove_parent(self, parent: str) -> None:
         pending = self._remove(self._keys(parent))
         if pending:
             self._pending[parent] = pending
@@ -217,6 +234,62 @@ class MambaCheckpointRetirer(threading.Thread):
                 )
         else:
             self._pending.pop(parent, None)
+
+    def _checkpoint_metadata(
+        self, keys: list[str], flags: int, operation: str
+    ) -> list[int] | None:
+        start = time.perf_counter()
+        try:
+            results = self.store.batch_checkpoint_metadata(keys, flags)
+            if len(results) != len(keys) or any(
+                value != _OBJECT_NOT_FOUND and not 0 <= value <= 15 for value in results
+            ):
+                raise RuntimeError("invalid checkpoint metadata result")
+        except Exception:
+            self._record(operation, start, len(keys), failed=len(keys), error=True)
+            logger.warning("Mamba checkpoint metadata operation failed", exc_info=True)
+            return None
+        self._record(
+            operation,
+            start,
+            len(keys),
+            failed=sum(value == _OBJECT_NOT_FOUND for value in results),
+        )
+        return results
+
+    def _commit_payload_metadata(self, commit: MambaCheckpointCommit) -> None:
+        parent = commit.parent_hash
+        child_keys = self._keys(commit.checkpoint_hash)
+        if parent is None:
+            if self._publish_anchors:
+                self._checkpoint_metadata(
+                    child_keys, CHECKPOINT_ANCHOR, "checkpoint_anchor_put"
+                )
+            return
+        # Attach lineage only to completed, resident payloads. This does not
+        # allocate marker objects or refresh leases. Missing children cannot
+        # justify retiring their parent.
+        child = self._checkpoint_metadata(
+            child_keys, CHECKPOINT_LINEAGE, "checkpoint_lineage_put"
+        )
+        if child is None or any(
+            value < 0 or not value & CHECKPOINT_READY for value in child
+        ):
+            return
+        parent_keys = self._keys(parent)
+        previous = self._checkpoint_metadata(parent_keys, 0, "checkpoint_retire_exists")
+        if previous is None or not any(
+            value >= 0 and value & CHECKPOINT_LINEAGE for value in previous
+        ):
+            return
+        # One surviving shard proves this hash has a predecessor. Publish on
+        # every remaining shard before removal so other DP workers skip it.
+        retired = self._checkpoint_metadata(
+            parent_keys, CHECKPOINT_RETIRED, "checkpoint_retired_put"
+        )
+        if retired is None:
+            return
+        self._remove_parent(parent)
 
     def _publish_anchor(self, checkpoint_hash: str) -> None:
         # Commits arrive only after every rank acknowledges the save. Do not

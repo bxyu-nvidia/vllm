@@ -90,10 +90,12 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from .checkpoint_retirement import (
+    CHECKPOINT_RETIRED,
     MambaCheckpointRetirer,
     anchor_checkpoint_prefix,
     lineage_checkpoint_prefix,
     retired_checkpoint_prefix,
+    supports_checkpoint_metadata,
 )
 from .metrics import MooncakeStoreConnectorStats
 from .pipeline import PIPELINE_KEY, PipelineTracker
@@ -2215,9 +2217,16 @@ class MooncakeStoreWorker:
                     self.coord.mamba_group_ids,
                     record_operation=self._record_kv_connector_operation,
                     publish_anchors=envs.VLLM_CACHE_INVENTORY_INTERVAL > 0,
+                    use_payload_metadata=supports_checkpoint_metadata(self.store),
                 )
                 self.checkpoint_retirer.start()
-                logger.info("Mooncake intermediate Mamba checkpoint retirement enabled")
+                logger.info(
+                    "Mooncake intermediate Mamba checkpoint retirement enabled "
+                    "(provenance=%s)",
+                    "payload metadata"
+                    if supports_checkpoint_metadata(self.store)
+                    else "legacy markers",
+                )
 
         self.kv_recv_threads = []
         ready_events_recving = []
@@ -2607,21 +2616,37 @@ class MooncakeStoreWorker:
         )
 
     def _lookup_retired_hashes(self, hashes: Sequence[bytes]) -> set[bytes] | None:
-        """Check shared markers before any candidate payload existence checks.
+        """Check provenance before any candidate payload existence checks.
 
         Do not cache negative results: another DP replica can retire a checkpoint
-        between requests. A failed marker query becomes a cache miss rather than
+        between requests. A failed metadata query becomes a cache miss rather than
         renewing possibly retired payloads. Already-issued loads retain leases.
         """
         if not hashes:
             return set()
-        prefix = retired_checkpoint_prefix(self._lookup_key_prefixes)
-        keys = [f"{prefix}@{h.hex()}" for h in hashes]
+        use_metadata = supports_checkpoint_metadata(self.store)
+        if use_metadata:
+            prefixes = tuple(
+                dict.fromkeys(
+                    prefix
+                    for gid in sorted(self.coord.mamba_group_ids)
+                    for prefix in self._lookup_key_prefixes[gid]
+                )
+            )
+            keys = [f"{prefix}@{h.hex()}" for h in hashes for prefix in prefixes]
+        else:
+            prefix = retired_checkpoint_prefix(self._lookup_key_prefixes)
+            keys = [f"{prefix}@{h.hex()}" for h in hashes]
         start = time.perf_counter()
         try:
-            results = self.store.batch_is_exist(keys)
-            if len(results) != len(keys) or any(x not in (0, 1) for x in results):
-                raise RuntimeError("invalid retirement marker existence result")
+            if use_metadata:
+                results = self.store.batch_checkpoint_metadata(keys)
+                valid = all(x == -704 or 0 <= x <= 15 for x in results)
+            else:
+                results = self.store.batch_is_exist(keys)
+                valid = all(x in (0, 1) for x in results)
+            if len(results) != len(keys) or not valid:
+                raise RuntimeError("invalid checkpoint retirement metadata result")
         except Exception:
             self._record_kv_connector_operation(
                 "lookup_retired_exists",
@@ -2630,11 +2655,21 @@ class MooncakeStoreWorker:
                 status="error",
                 num_failed_keys=len(keys),
             )
-            logger.warning("Mamba retirement marker lookup failed", exc_info=True)
+            logger.warning("Mamba retirement metadata lookup failed", exc_info=True)
             return None
         self._record_kv_connector_operation(
             "lookup_retired_exists", time.perf_counter() - start, len(keys)
         )
+        if use_metadata:
+            width = len(prefixes)
+            return {
+                h
+                for i, h in enumerate(hashes)
+                if any(
+                    value >= 0 and value & CHECKPOINT_RETIRED
+                    for value in results[i * width : (i + 1) * width]
+                )
+            }
         return {h for h, found in zip(hashes, results, strict=True) if found == 1}
 
     def _tail_key_boundaries(

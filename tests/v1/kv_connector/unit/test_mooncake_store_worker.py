@@ -5514,7 +5514,31 @@ def test_inventory_layout_reports_expected_shards_without_store_reads(monkeypatc
 # Retirement tests exercise observable store contents through the policy API.
 # A dict-backed Store catches deletion, completeness and retry errors without
 # requiring a GPU or a running Mooncake service.
-def _retirement_store():
+class _PayloadMetadataStore:
+    def __init__(self, store, objects):
+        self._store = store
+        self.flags = {}
+        self.objects = objects
+        self.metadata = MagicMock(side_effect=self._metadata)
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def batch_checkpoint_metadata(self, keys, add_flags=0):
+        return self.metadata(keys, add_flags)
+
+    def _metadata(self, keys, add_flags):
+        result = []
+        for key in keys:
+            if key not in self.objects:
+                result.append(-704)
+            else:
+                self.flags[key] = self.flags.get(key, 0) | add_flags
+                result.append(self.flags[key] | 8)
+        return result
+
+
+def _retirement_store(*, use_metadata=False):
     store = MagicMock()
     objects: dict[str, bytes] = {}
     leased: set[str] = set()
@@ -5536,6 +5560,8 @@ def _retirement_store():
 
     store.put.side_effect = put
     store.batch_remove.side_effect = remove
+    if use_metadata:
+        return _PayloadMetadataStore(store, objects), objects, leased
     return store, objects, leased
 
 
@@ -5719,7 +5745,10 @@ def test_mamba_retirement_shutdown_stops_background_retries():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_retired_checkpoint_lookup_stops_lease_renewal_across_replicas(enabled):
+@pytest.mark.parametrize("use_metadata", [False, True])
+def test_retired_checkpoint_lookup_stops_lease_renewal_across_replicas(
+    enabled, use_metadata
+):
     """Repeated candidate lookups must let a retired payload's lease expire."""
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
         MambaCheckpointRetirer,
@@ -5730,7 +5759,7 @@ def test_retired_checkpoint_lookup_stops_lease_renewal_across_replicas(enabled):
 
     worker = _make_hybrid_lookup_worker(hash_block_size=8)
     worker.retire_mamba_checkpoints = enabled
-    store, objects, leased = _retirement_store()
+    store, objects, leased = _retirement_store(use_metadata=use_metadata)
     worker.store = store
     hashes = [b"a", b"b", b"c"]
     prefixes = worker._lookup_key_prefixes
@@ -5754,7 +5783,10 @@ def test_retired_checkpoint_lookup_stops_lease_renewal_across_replicas(enabled):
 
     store.batch_is_exist.side_effect = exists
     # Writer is a separate replica; the lookup worker has no local retirer.
-    writer = MambaCheckpointRetirer(store, prefixes, {1})
+    writer = MambaCheckpointRetirer(
+        store, prefixes, {1}, use_payload_metadata=use_metadata
+    )
+    exists([f"{p}@{b'b'.hex()}" for p in prefixes[1]])
     writer.commit(MambaCheckpointCommit(b"a".hex(), b"b".hex()))
     writer.commit(MambaCheckpointCommit(b"b".hex(), b"c".hex()))
     retired_keys = {f"{p}@{b'b'.hex()}" for p in prefixes[1]}
@@ -5960,3 +5992,94 @@ def test_anchor_marker_failure_does_not_delete_payload_or_escape(failure):
     assert objects == {"m@a": b"state"}
     store.batch_remove.assert_not_called()
     assert stats.data["checkpoint_anchor_put"][-1]["status"] == "error"
+
+
+@pytest.mark.parametrize("publish_anchors", [False, True])
+def test_payload_provenance_survives_without_marker_objects(publish_anchors):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+        supports_checkpoint_metadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    store, objects, leased = _retirement_store(use_metadata=True)
+    objects.update({f"{p}@{h}": b"state" for p in ("m0", "m1") for h in "abc"})
+    leased.update({"m0@b", "m1@b"})
+    writer = MambaCheckpointRetirer(
+        store,
+        [("m0", "m1")],
+        {0},
+        publish_anchors=publish_anchors,
+        use_payload_metadata=True,
+    )
+    assert supports_checkpoint_metadata(store)
+    assert not supports_checkpoint_metadata(MagicMock())
+    writer.commit(MambaCheckpointCommit(None, "a"))
+    writer.commit(MambaCheckpointCommit("a", "b"))
+    # A different DP worker can continue the chain using resident metadata.
+    other = MambaCheckpointRetirer(
+        store, [("m0", "m1")], {0}, use_payload_metadata=True
+    )
+    other.commit(MambaCheckpointCommit("b", "c"))
+    for prefix in ("m0", "m1"):
+        assert store.flags.get(f"{prefix}@a", 0) == int(publish_anchors)
+        assert store.flags[f"{prefix}@b"] == 6
+        assert store.flags[f"{prefix}@c"] == 2
+        assert objects[f"{prefix}@b"] == b"state"  # In-flight loads still work.
+    store.put.assert_not_called()
+    store.batch_is_exist.assert_not_called()
+    leased.clear()
+    other.retry()
+    assert set(objects) == {"m0@a", "m1@a", "m0@c", "m1@c"}
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing_child", "missing_lineage", "short", "error"]
+)
+def test_payload_metadata_failures_preserve_parent(failure):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    store, objects, _ = _retirement_store(use_metadata=True)
+    objects.update({f"{p}@{h}": b"state" for p in ("m0", "m1") for h in "bc"})
+    store.flags.update({"m0@b": 2, "m1@b": 2})
+    if failure == "missing_child":
+        del objects["m1@c"]
+    elif failure == "missing_lineage":
+        store.flags.clear()
+    else:
+        store.metadata.side_effect = (
+            lambda keys, flags: [] if failure == "short" else [-706] * len(keys)
+        )
+    writer = MambaCheckpointRetirer(
+        store, [("m0", "m1")], {0}, use_payload_metadata=True
+    )
+    writer.commit(MambaCheckpointCommit("b", "c"))
+    assert {"m0@b", "m1@b"} <= objects.keys()
+    store.batch_remove.assert_not_called()
+    store.batch_is_exist.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["short", "error", "exception"])
+def test_payload_metadata_lookup_failure_does_not_renew_leases(failure):
+    worker = _make_hybrid_lookup_worker(hash_block_size=8)
+    worker.retire_mamba_checkpoints = True
+    store, _, _ = _retirement_store(use_metadata=True)
+    worker.store = store
+    if failure == "exception":
+        store.metadata.side_effect = RuntimeError("unavailable")
+    else:
+        store.metadata.side_effect = (
+            lambda keys, flags: [] if failure == "short" else [-706] * len(keys)
+        )
+    assert worker.lookup(17, [b"a", b"b"]).hit_length == 0
+    store.batch_is_exist.assert_not_called()
+    assert (
+        worker.kv_connector_stats.data["lookup_retired_exists"][-1]["status"] == "error"
+    )

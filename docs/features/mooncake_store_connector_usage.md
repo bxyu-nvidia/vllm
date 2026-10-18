@@ -82,14 +82,20 @@ For hybrid Mamba models, opt in through the MooncakeStoreConnector's
 
 With `MultiConnector`, put this setting on its MooncakeStoreConnector child.
 It defaults to `false`; disabled connectors do no lineage RPCs and start no
-retirement thread. No Mooncake server change or rebuild is required; the client
-must provide the existing `put`, `batch_is_exist`, and `batch_remove` APIs.
+retirement thread. With the updated Mooncake client and master, provenance is
+stored directly on each Mamba payload's metadata using `batch_checkpoint_metadata`.
+Deploy the updated **master first**, then rebuild the Mooncake Python client and
+update vLLM. Startup logs report `provenance=payload metadata` in this mode.
+Older clients automatically use the legacy marker implementation; they still
+need `put`, `batch_is_exist`, and `batch_remove`. A new client against an old
+master reports metadata errors rather than silently reverting to markers.
 
 For a chain `C1 -> C2 -> C3`, keep C1 as the anchor and retire C2 after C3 is
 saved successfully by every worker rank. Continuing to C4 retires C3. This
-works across requests and prefill replicas: small lineage markers are stored
-in Mooncake under a separate model/layout-scoped namespace. Missing or evicted
-markers conservatively retain extra anchors. A completed request's final
+works across requests and prefill replicas: anchor, lineage, and superseded bits
+live on the actual model/layout-scoped payload objects. They cannot be evicted
+separately from those objects, and are persisted in snapshots and HA metadata.
+Missing provenance conservatively retains extra checkpoints. A completed request's final
 checkpoint remains subject to normal Mooncake eviction. Lease expiry makes it
 eligible for eviction; it does not automatically delete the checkpoint.
 
@@ -98,15 +104,17 @@ and GPU cache entries are unchanged. Another branch needing the old checkpoint
 may have to recompute from an earlier prefix; this policy trades that reuse
 for capacity. A lookup racing deletion uses the existing failed-load fallback.
 
-Before attempting deletion, the writer publishes a separate shared retirement
-marker. With retirement enabled on all participating replicas, each hybrid
-lookup checks these markers in one batch and excludes retired Mamba candidates
+Before attempting deletion, the writer marks the parent's payload metadata as
+superseded. With retirement enabled on all participating replicas, each hybrid
+lookup checks this metadata in one batch and excludes retired Mamba candidates
 **before** probing payload keys. Attention candidates remain available. This
 stops routine candidate probes from renewing retired Mamba leases, even when a
 longer checkpoint would ultimately have been selected. Already-issued loads
-continue under their existing leases. Marker-query errors yield a cache miss.
-There is no negative-result cache, so retirement on another DP replica is
-visible on the next lookup. Disabled connectors issue no marker queries.
+continue under their existing leases: these flags never hide objects from
+Mooncake's existence or replica-location APIs. Metadata queries and updates do
+not grant read leases. Metadata-query errors yield a cache miss. There is no
+negative-result cache, so retirement on another DP replica is visible on the
+next lookup. Disabled connectors issue no provenance queries.
 
 Deletion is asynchronous and **never forced**: active Mooncake leases defer it.
 For example, `-default_kv_lease_ttl=180000` can delay retirement until the
@@ -114,11 +122,11 @@ three-minute lease expires (longer if readers renew it). Bounded background
 retries do not renew those leases. Queue overflow, missing replacement shards,
 or metadata failures leave checkpoints to ordinary eviction. There are at most
 4096 queued commits and 4096 pending retirement candidates per prefill instance;
-lease retries process at most 128 candidates per second. Lineage markers use
-one-byte payloads and are themselves subject to normal store eviction. Retirement
-markers are also one-byte, ungrouped objects; if one is evicted, the old
-checkpoint can become eligible for lookup again until it is deleted. An
-in-flight lookup racing marker publication or a checkpoint save can still
+lease retries process at most 128 candidates per second. Provenance is one byte
+of master metadata per object; there are no separate marker allocations in the
+new mode. A metadata query replaces the old marker-query RPC and examines all
+Mamba shards of each candidate; it does not scan the store. An
+in-flight lookup racing provenance publication or a checkpoint save can still
 renew a payload lease. If `enable_group_semantics` is enabled, attention reads
 can renew Mamba leases in the same group as well. Thus retirement remains best
 effort and the lease duration is not a deletion deadline.
@@ -127,12 +135,18 @@ Existing `vllm:mooncake_store_operation_*` metrics expose operations
 `checkpoint_lineage_put`, `checkpoint_retire_exists`, and `checkpoint_retire`.
 Retirement key counts are attempts, not unique removed checkpoints; `deferred`
 status records outstanding keys for retry, while already-absent keys are
-idempotent successes. `checkpoint_retired_put` measures retirement marker writes;
-`lookup_retired_exists` measures marker queries; `lookup_retired_skip` counts
+idempotent successes. Existing operation names are retained: in payload-metadata
+mode, `checkpoint_lineage_put`, `checkpoint_anchor_put`, and
+`checkpoint_retired_put` count payload-shard metadata updates (not marker-object
+PUTs), and `lookup_retired_exists` measures metadata queries.
+`lookup_retired_skip` counts
 Mamba payload keys excluded from lookup (repeated skips, not unique checkpoints
-or RPCs). These operations do not transfer checkpoint payloads. Rebuild the Rust
-frontend when updating vLLM so it recognizes the new operation names; no
-Mooncake rebuild is required.
+or RPCs). These operations do not transfer checkpoint payloads.
+
+Legacy clients still use one-byte markers in separate namespaces. Those markers
+can be evicted while their payload remains, losing provenance and allowing a
+superseded candidate to be probed again. Use the new client and master together
+to avoid that failure mode, and update all participating vLLM replicas.
 
 ### Debug inventory by checkpoint lifecycle
 
@@ -141,10 +155,10 @@ enabled, the Mooncake snapshot reports these disjoint categories:
 
 | Category | Meaning |
 | --- | --- |
-| `anchor` | An explicit anchor marker exists: vLLM observed an acknowledged checkpoint save with no reused predecessor, and neither lineage nor retirement evidence is present. |
-| `unknown` | No readable anchor, lineage, or retirement marker. Includes untracked saves, old entries, failed marker writes, and entries whose markers were evicted. |
-| `tip` | A readable lineage marker exists with no retirement marker. Includes intermediate checkpoints awaiting retirement publication, not just final trajectory checkpoints. |
-| `retired` | A readable retirement marker exists and Mamba payload objects remain, including partially deleted checkpoints. |
+| `anchor` | Explicit anchor evidence exists: vLLM observed an acknowledged checkpoint save with no reused predecessor, and neither lineage nor retirement evidence is present. |
+| `unknown` | No anchor, lineage, or superseded evidence. Includes untracked saves, old entries, failed metadata writes, and legacy entries whose markers were evicted. |
+| `tip` | Lineage evidence exists without superseded evidence. Includes intermediate checkpoints awaiting retirement publication, not just final trajectory checkpoints. |
+| `retired` | Superseded evidence exists and Mamba payload objects remain, including partially deleted checkpoints. |
 
 Each category exports `complete_prefixes`, `incomplete_prefixes`, `ready_objects`,
 `ready_bytes`, `pending_objects`, and `pending_bytes` under
@@ -153,34 +167,34 @@ sum to the Mamba totals. The previous `anchor_or_unknown` metrics remain as the
 sum of `anchor` and `unknown` for existing dashboards; do not add this aggregate
 to the four categories.
 
-Anchor markers are one-byte, model/layout-scoped objects published by the
-existing elected retirement worker after every rank acknowledges a root save.
+Anchor labels are attached by the existing elected retirement worker after
+every rank acknowledges a root save. Legacy clients publish separate markers.
 Publishing requires both `retire_mamba_checkpoints=true` and an inventory interval
 greater than zero at worker startup. With inventory disabled, root commits are
-ignored and there are no anchor-marker RPCs. With retirement disabled, no new
-lineage or anchor markers are published. `checkpoint_anchor_put` measures these
-diagnostic writes. They do not affect retirement decisions or query payloads,
-and therefore do not renew payload read leases.
+ignored and there are no anchor-label RPCs. With retirement disabled, no new
+lineage or anchor labels are published. `checkpoint_anchor_put` measures these
+diagnostic writes. They do not affect retirement decisions, read tensor data,
+or renew payload read leases.
 
 An anchor here is an **observed cache-chain root**, not a benchmark sample ID.
 A later-turn cache miss or recomputation can start another observed chain.
 Consequently, 1,500 benchmark samples is a useful sanity check, not a guaranteed
 upper bound on this metric. No Gym request tracking is added. Missing lineage
-alone never creates an anchor marker. If a hash has both anchor and lineage
-markers, lineage wins; retirement takes precedence over both.
+alone never creates an anchor label. If a hash has both anchor and lineage
+evidence, lineage wins; superseded evidence takes precedence over both.
 
-These are approximate, evidence-based counts. Marker eviction can move a known
-anchor or tip into `unknown`; a missing marker cannot establish its original
-role. Existing payloads are not retroactively labeled. Orphan markers and marker
+These are approximate, evidence-based counts. Payload-bound labels survive as
+long as their object metadata does; deleting and recreating the object resets
+them. Legacy marker eviction can still move an old entry into `unknown`.
+Existing payloads are not retroactively labeled. Orphan markers and marker
 bytes are excluded from the payload counts. A `tip` does not prove the trajectory
 is still active or that its full attention prefix exists.
 
 The inventory scan itself uses only metadata, with no payload reads or lease
-renewals. Deploy the updated vLLM namespace advertisement, rebuild its Rust
-frontend for `checkpoint_anchor_put`, and rebuild/redeploy the Mooncake **master**
-for the `mamba_anchor` namespace. The client API and Gym collector are unchanged.
-Older masters reject the new namespace kind, so deploy the master first. Use a
-fresh benchmark/cache to observe anchor provenance from the beginning.
+renewals. Rebuild/redeploy the Mooncake master and Python client, and update vLLM.
+The existing Rust operation names and Gym collector are unchanged by the
+payload-metadata fix. Deploy the master first. Use a fresh benchmark/cache to
+observe provenance from the beginning; already lost labels cannot be recovered.
 
 ## Usage
 
