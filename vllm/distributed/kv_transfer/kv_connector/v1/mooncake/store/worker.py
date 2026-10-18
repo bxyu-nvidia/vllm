@@ -89,7 +89,10 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
-from .checkpoint_retirement import MambaCheckpointRetirer
+from .checkpoint_retirement import (
+    MambaCheckpointRetirer,
+    retired_checkpoint_prefix,
+)
 from .metrics import MooncakeStoreConnectorStats
 from .pipeline import PIPELINE_KEY, PipelineTracker
 
@@ -2488,6 +2491,35 @@ class MooncakeStoreWorker:
         if not candidate_keys:
             return MooncakeLookupResult(0)
 
+        if self.retire_mamba_checkpoints and self.coord.mamba_group_ids:
+            hashes = list(
+                dict.fromkeys(
+                    h for gid, h in candidate_meta if gid in self.coord.mamba_group_ids
+                )
+            )
+            retired = self._lookup_retired_hashes(hashes)
+            if retired is None:
+                return MooncakeLookupResult(0)
+            if retired:
+                keys: list[str] = []
+                meta: list[tuple[int, bytes]] = []
+                pos = 0
+                for gid, hash_bytes in candidate_meta:
+                    count = len(self._lookup_key_prefixes[gid])
+                    if (
+                        gid not in self.coord.mamba_group_ids
+                        or hash_bytes not in retired
+                    ):
+                        keys.extend(candidate_keys[pos : pos + count])
+                        meta.append((gid, hash_bytes))
+                    pos += count
+                self._record_kv_connector_operation(
+                    "lookup_retired_skip", 0.0, len(candidate_keys) - len(keys)
+                )
+                candidate_keys, candidate_meta = keys, meta
+                if not candidate_keys:
+                    return MooncakeLookupResult(0)
+
         lookup_start = time.perf_counter()
         try:
             res = self.store.batch_is_exist(candidate_keys)
@@ -2545,6 +2577,37 @@ class MooncakeStoreWorker:
             ),
             shared_prefix_boundary=shared_prefix_boundary,
         )
+
+    def _lookup_retired_hashes(self, hashes: Sequence[bytes]) -> set[bytes] | None:
+        """Check shared markers before any candidate payload existence checks.
+
+        Do not cache negative results: another DP replica can retire a checkpoint
+        between requests. A failed marker query becomes a cache miss rather than
+        renewing possibly retired payloads. Already-issued loads retain leases.
+        """
+        if not hashes:
+            return set()
+        prefix = retired_checkpoint_prefix(self._lookup_key_prefixes)
+        keys = [f"{prefix}@{h.hex()}" for h in hashes]
+        start = time.perf_counter()
+        try:
+            results = self.store.batch_is_exist(keys)
+            if len(results) != len(keys) or any(x not in (0, 1) for x in results):
+                raise RuntimeError("invalid retirement marker existence result")
+        except Exception:
+            self._record_kv_connector_operation(
+                "lookup_retired_exists",
+                time.perf_counter() - start,
+                len(keys),
+                status="error",
+                num_failed_keys=len(keys),
+            )
+            logger.warning("Mamba retirement marker lookup failed", exc_info=True)
+            return None
+        self._record_kv_connector_operation(
+            "lookup_retired_exists", time.perf_counter() - start, len(keys)
+        )
+        return {h for h, found in zip(hashes, results, strict=True) if found == 1}
 
     def _tail_key_boundaries(
         self,

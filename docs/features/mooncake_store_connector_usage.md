@@ -90,12 +90,23 @@ saved successfully by every worker rank. Continuing to C4 retires C3. This
 works across requests and prefill replicas: small lineage markers are stored
 in Mooncake under a separate model/layout-scoped namespace. Missing or evicted
 markers conservatively retain extra anchors. A completed request's final
-checkpoint remains subject to normal Mooncake eviction and TTL behavior.
+checkpoint remains subject to normal Mooncake eviction. Lease expiry makes it
+eligible for eviction; it does not automatically delete the checkpoint.
 
 Only the intermediate checkpoint's Mamba objects are removed. Attention blocks
 and GPU cache entries are unchanged. Another branch needing the old checkpoint
 may have to recompute from an earlier prefix; this policy trades that reuse
 for capacity. A lookup racing deletion uses the existing failed-load fallback.
+
+Before attempting deletion, the writer publishes a separate shared retirement
+marker. With retirement enabled on all participating replicas, each hybrid
+lookup checks these markers in one batch and excludes retired Mamba candidates
+**before** probing payload keys. Attention candidates remain available. This
+stops routine candidate probes from renewing retired Mamba leases, even when a
+longer checkpoint would ultimately have been selected. Already-issued loads
+continue under their existing leases. Marker-query errors yield a cache miss.
+There is no negative-result cache, so retirement on another DP replica is
+visible on the next lookup. Disabled connectors issue no marker queries.
 
 Deletion is asynchronous and **never forced**: active Mooncake leases defer it.
 For example, `-default_kv_lease_ttl=180000` can delay retirement until the
@@ -104,13 +115,24 @@ retries do not renew those leases. Queue overflow, missing replacement shards,
 or metadata failures leave checkpoints to ordinary eviction. There are at most
 4096 queued commits and 4096 pending retirement candidates per prefill instance;
 lease retries process at most 128 candidates per second. Lineage markers use
-one-byte payloads and are themselves subject to normal store eviction.
+one-byte payloads and are themselves subject to normal store eviction. Retirement
+markers are also one-byte, ungrouped objects; if one is evicted, the old
+checkpoint can become eligible for lookup again until it is deleted. An
+in-flight lookup racing marker publication or a checkpoint save can still
+renew a payload lease. If `enable_group_semantics` is enabled, attention reads
+can renew Mamba leases in the same group as well. Thus retirement remains best
+effort and the lease duration is not a deletion deadline.
 
 Existing `vllm:mooncake_store_operation_*` metrics expose operations
 `checkpoint_lineage_put`, `checkpoint_retire_exists`, and `checkpoint_retire`.
 Retirement key counts are attempts, not unique removed checkpoints; `deferred`
 status records outstanding keys for retry, while already-absent keys are
-idempotent successes. These operations do not transfer checkpoint payloads.
+idempotent successes. `checkpoint_retired_put` measures retirement marker writes;
+`lookup_retired_exists` measures marker queries; `lookup_retired_skip` counts
+Mamba payload keys excluded from lookup (repeated skips, not unique checkpoints
+or RPCs). These operations do not transfer checkpoint payloads. Rebuild the Rust
+frontend when updating vLLM so it recognizes the new operation names; no
+Mooncake rebuild is required.
 
 ## Usage
 

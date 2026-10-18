@@ -24,6 +24,16 @@ _RETRY_INTERVAL = 1.0
 _OBJECT_NOT_FOUND = -704
 
 
+def _layout_digest(lookup_key_prefixes: Sequence[Sequence[str]]) -> str:
+    layout = "\n".join(sorted({p for group in lookup_key_prefixes for p in group}))
+    return hashlib.sha256(layout.encode()).hexdigest()
+
+
+def retired_checkpoint_prefix(lookup_key_prefixes: Sequence[Sequence[str]]) -> str:
+    """Return the shared retirement namespace, independent of DP instance IDs."""
+    return f"vllm-mamba-retired-v1@{_layout_digest(lookup_key_prefixes)}"
+
+
 class MambaCheckpointRetirer(threading.Thread):
     """Keep roots and tips, deleting intermediate Mamba keys after save commits.
 
@@ -52,9 +62,9 @@ class MambaCheckpointRetirer(threading.Thread):
             )
         )
         # Include the full layout/model/cache namespace, never DP instance IDs.
-        layout = "\n".join(sorted({p for group in lookup_key_prefixes for p in group}))
-        digest = hashlib.sha256(layout.encode()).hexdigest()
+        digest = _layout_digest(lookup_key_prefixes)
         self._marker_prefix = f"vllm-mamba-lineage-v1@{digest}"
+        self._retired_prefix = retired_checkpoint_prefix(lookup_key_prefixes)
         self._commits: queue.Queue[tuple[int, MambaCheckpointCommit]] = queue.Queue(
             _MAX_PENDING
         )
@@ -163,6 +173,20 @@ class MambaCheckpointRetirer(threading.Thread):
             self._record("checkpoint_lineage_put", start, 1)
         if exists[-2] != 1:
             return  # No known predecessor for the parent: retain it as an anchor.
+        # Publish before removal: new lookups must stop renewing payload leases
+        # while existing readers drain. This marker is not in a tensor group.
+        start = time.perf_counter()
+        try:
+            result = self.store.put(f"{self._retired_prefix}@{parent}", b"1")
+            if result != 0:
+                raise RuntimeError(f"retirement marker PUT returned {result}")
+        except Exception:
+            self._record("checkpoint_retired_put", start, 1, failed=1, error=True)
+            logger.warning(
+                "Mamba checkpoint retirement marker write failed", exc_info=True
+            )
+            return
+        self._record("checkpoint_retired_put", start, 1)
         pending = self._remove(self._keys(parent))
         if pending:
             self._pending[parent] = pending

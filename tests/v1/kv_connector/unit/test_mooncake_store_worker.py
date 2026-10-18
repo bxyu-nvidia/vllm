@@ -3783,7 +3783,7 @@ def test_uniform_group_uses_common_inner_replication_factor(spec_order):
     )
 
 
-def test_lookup_rejects_boundary_missing_one_mamba_shard():
+def _make_hybrid_lookup_worker(*, hash_block_size=16):
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         KVCacheGroupSpec,
@@ -3791,6 +3791,7 @@ def test_lookup_rejects_boundary_missing_one_mamba_shard():
     )
 
     worker = _make_bare_worker(block_size=16)
+    worker.hash_block_size = hash_block_size
     worker.tp_size = 2
     worker.num_kv_head = 1
     fa = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
@@ -3806,19 +3807,28 @@ def test_lookup_rejects_boundary_missing_one_mamba_shard():
     ]
     worker.token_dbs = [
         ChunkedTokenDatabase(
-            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0), block_size=16
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=0),
+            block_size=16,
+            hash_block_size=hash_block_size,
         ),
         ChunkedTokenDatabase(
-            KeyMetadata("test-model", 1, 0, 0, 0, group_id=1), block_size=16
+            KeyMetadata("test-model", 1, 0, 0, 0, group_id=1),
+            block_size=16,
+            hash_block_size=hash_block_size,
         ),
     ]
     worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
         worker._kv_cache_groups,
         scheduler_block_size=16,
-        hash_block_size=16,
+        hash_block_size=hash_block_size,
     )
     _refresh_group_tp_replication_factors(worker)
 
+    return worker
+
+
+def test_lookup_rejects_boundary_missing_one_mamba_shard():
+    worker = _make_hybrid_lookup_worker()
     # 33 tokens for two 16-token blocks: the hit stops below the request end,
     # so the full-hit re-derivation stays out of the shard accounting.
     worker.store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
@@ -5706,3 +5716,138 @@ def test_mamba_retirement_shutdown_stops_background_retries():
     assert not policy.is_alive()
     store.batch_is_exist.assert_not_called()
     store.batch_remove.assert_not_called()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_retired_checkpoint_lookup_stops_lease_renewal_across_replicas(enabled):
+    """Repeated candidate lookups must let a retired payload's lease expire."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    worker = _make_hybrid_lookup_worker(hash_block_size=8)
+    worker.retire_mamba_checkpoints = enabled
+    store, objects, leased = _retirement_store()
+    worker.store = store
+    hashes = [b"a", b"b", b"c"]
+    prefixes = worker._lookup_key_prefixes
+    objects.update(
+        {
+            f"{p}@{h.hex()}": b"state"
+            for group in prefixes
+            for p in group
+            for h in hashes
+        }
+    )
+    now = [0]
+    expiries = {}
+
+    def exists(keys):
+        for key in keys:
+            if key in objects:
+                expiries[key] = now[0] + 180
+                leased.add(key)
+        return [int(key in objects) for key in keys]
+
+    store.batch_is_exist.side_effect = exists
+    # Writer is a separate replica; the lookup worker has no local retirer.
+    writer = MambaCheckpointRetirer(store, prefixes, {1})
+    writer.commit(MambaCheckpointCommit(b"a".hex(), b"b".hex()))
+    writer.commit(MambaCheckpointCommit(b"b".hex(), b"c".hex()))
+    retired_keys = {f"{p}@{b'b'.hex()}" for p in prefixes[1]}
+    assert retired_keys <= objects.keys()  # Existing readers are still protected.
+    store.batch_is_exist.reset_mock()
+    for tick in (60, 120, 181):
+        now[0] = tick
+        assert worker.lookup(25, hashes).hit_length == 24
+        leased.difference_update(k for k, expiry in expiries.items() if expiry <= tick)
+        writer.retry()
+    probes = {
+        key for call in store.batch_is_exist.call_args_list for key in call.args[0]
+    }
+    assert bool(retired_keys & probes) is (not enabled)
+    assert bool(retired_keys & objects.keys()) is (not enabled)
+    # Attention at the retired boundary remains necessary for the longer hit.
+    assert all(f"{p}@{b'b'.hex()}" in probes for p in prefixes[0])
+    if enabled:
+        assert "lookup_retired_skip" in worker.kv_connector_stats.data
+    else:
+        assert "lookup_retired_exists" not in worker.kv_connector_stats.data
+
+
+@pytest.mark.parametrize("failure", ["exception", "short", "negative"])
+def test_retirement_marker_lookup_error_does_not_probe_payloads(failure):
+    worker = _make_hybrid_lookup_worker(hash_block_size=8)
+    worker.retire_mamba_checkpoints = True
+    if failure == "exception":
+        worker.store.batch_is_exist.side_effect = RuntimeError("unavailable")
+    else:
+        worker.store.batch_is_exist.return_value = (
+            [] if failure == "short" else [-706, 0]
+        )
+    assert worker.lookup(17, [b"a", b"b"]).hit_length == 0
+    worker.store.batch_is_exist.assert_called_once()
+    assert all(
+        key.startswith("vllm-mamba-retired-v1@")
+        for key in worker.store.batch_is_exist.call_args.args[0]
+    )
+    assert (
+        worker.kv_connector_stats.data["lookup_retired_exists"][0]["status"] == "error"
+    )
+
+
+def test_retirement_marker_failure_preserves_parent():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    store, objects, _ = _retirement_store()
+    objects.update({f"m@{h}": b"state" for h in "abc"})
+    writer = MambaCheckpointRetirer(store, [("m",)], {0})
+    writer.commit(MambaCheckpointCommit("a", "b"))
+    put = store.put.side_effect
+    store.put.side_effect = lambda key, value: (
+        -200 if key.startswith("vllm-mamba-retired-v1@") else put(key, value)
+    )
+    writer.commit(MambaCheckpointCommit("b", "c"))
+    assert "m@b" in objects
+    store.batch_remove.assert_not_called()
+
+
+def test_retirement_lookup_observes_new_markers_and_cache_reset():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    worker = _make_hybrid_lookup_worker(hash_block_size=8)
+    worker.retire_mamba_checkpoints = True
+    store, objects, leased = _retirement_store()
+    worker.store = store
+    prefixes = worker._lookup_key_prefixes
+    payloads = {
+        f"{p}@{h.hex()}": b"state"
+        for group in prefixes
+        for p in group
+        for h in (b"a", b"b", b"c")
+    }
+    objects.update(payloads)
+    assert worker.lookup(17, [b"a", b"b"]).hit_length == 16
+    writer = MambaCheckpointRetirer(store, prefixes, {1})
+    writer.commit(MambaCheckpointCommit(b"a".hex(), b"b".hex()))
+    leased.update(payloads)
+    writer.commit(MambaCheckpointCommit(b"b".hex(), b"c".hex()))
+    assert worker.lookup(17, [b"a", b"b"]).hit_length < 16
+    assert payloads.keys() <= objects.keys()
+    store.remove_all.side_effect = lambda *, force: objects.clear()
+    writer.reset_store()
+    objects.update(payloads)
+    assert worker.lookup(17, [b"a", b"b"]).hit_length == 16

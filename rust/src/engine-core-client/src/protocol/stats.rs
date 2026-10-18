@@ -196,6 +196,9 @@ pub mod kv_connector {
         CheckpointLineagePut,
         CheckpointRetireExists,
         CheckpointRetire,
+        CheckpointRetiredPut,
+        LookupRetiredExists,
+        LookupRetiredSkip,
         LoadGet,
         LookupExists,
     }
@@ -211,6 +214,9 @@ pub mod kv_connector {
                 Self::CheckpointLineagePut => "checkpoint_lineage_put",
                 Self::CheckpointRetireExists => "checkpoint_retire_exists",
                 Self::CheckpointRetire => "checkpoint_retire",
+                Self::CheckpointRetiredPut => "checkpoint_retired_put",
+                Self::LookupRetiredExists => "lookup_retired_exists",
+                Self::LookupRetiredSkip => "lookup_retired_skip",
                 Self::LoadGet => "load_get",
                 Self::LookupExists => "lookup_exists",
             }

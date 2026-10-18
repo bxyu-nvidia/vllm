@@ -778,6 +778,9 @@ mod tests {
             "MooncakeStoreConnector": {
                 "save_put": [record(7, "ok", 0)],
                 "checkpoint_lineage_put": [record(1, "ok", 0)],
+                "checkpoint_retired_put": [record(1, "ok", 0)],
+                "lookup_retired_exists": [record(3, "ok", 0)],
+                "lookup_retired_skip": [record(5, "ok", 0)],
                 "checkpoint_retire_exists": [record(7, "ok", 0)],
                 "checkpoint_retire": [record(5, "deferred", 2), record(2, "ok", 0)]
             }
@@ -797,6 +800,9 @@ mod tests {
         for (operation, status, keys) in [
             ("save_put", "ok", 7),
             ("checkpoint_lineage_put", "ok", 1),
+            ("checkpoint_retired_put", "ok", 1),
+            ("lookup_retired_exists", "ok", 3),
+            ("lookup_retired_skip", "ok", 5),
             ("checkpoint_retire_exists", "ok", 7),
             ("checkpoint_retire", "deferred", 5),
             ("checkpoint_retire", "ok", 2),
