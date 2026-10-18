@@ -91,6 +91,7 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from .checkpoint_retirement import (
     MambaCheckpointRetirer,
+    lineage_checkpoint_prefix,
     retired_checkpoint_prefix,
 )
 from .metrics import MooncakeStoreConnectorStats
@@ -2392,6 +2393,27 @@ class MooncakeStoreWorker:
                     if self._kv_cache_groups[gid].kv_cache_spec.prefix_cacheable
                     for prefix in prefixes
                 ]
+                # Advertise marker namespaces for a read-only master-side join.
+                # This adds no Store calls and never renews checkpoint leases.
+                scopes = {
+                    entry["scope"]
+                    for entry in self.kv_connector_stats.data["_cache_layout"]
+                    if entry["kind"] == "mamba"
+                }
+                for scope in sorted(scopes):
+                    self.kv_connector_stats.data["_cache_layout"].extend(
+                        {"scope": scope, "prefix": prefix, "kind": kind}
+                        for kind, prefix in (
+                            (
+                                "mamba_lineage",
+                                lineage_checkpoint_prefix(self._lookup_key_prefixes),
+                            ),
+                            (
+                                "mamba_retired",
+                                retired_checkpoint_prefix(self._lookup_key_prefixes),
+                            ),
+                        )
+                    )
             if not self._capacity_only:
                 self.kv_connector_stats.data[PIPELINE_KEY] = [
                     self.load_pipeline.snapshot()

@@ -29,6 +29,11 @@ def _layout_digest(lookup_key_prefixes: Sequence[Sequence[str]]) -> str:
     return hashlib.sha256(layout.encode()).hexdigest()
 
 
+def lineage_checkpoint_prefix(lookup_key_prefixes: Sequence[Sequence[str]]) -> str:
+    """Return the namespace used to identify derived checkpoints."""
+    return f"vllm-mamba-lineage-v1@{_layout_digest(lookup_key_prefixes)}"
+
+
 def retired_checkpoint_prefix(lookup_key_prefixes: Sequence[Sequence[str]]) -> str:
     """Return the shared retirement namespace, independent of DP instance IDs."""
     return f"vllm-mamba-retired-v1@{_layout_digest(lookup_key_prefixes)}"
@@ -62,8 +67,7 @@ class MambaCheckpointRetirer(threading.Thread):
             )
         )
         # Include the full layout/model/cache namespace, never DP instance IDs.
-        digest = _layout_digest(lookup_key_prefixes)
-        self._marker_prefix = f"vllm-mamba-lineage-v1@{digest}"
+        self._marker_prefix = lineage_checkpoint_prefix(lookup_key_prefixes)
         self._retired_prefix = retired_checkpoint_prefix(lookup_key_prefixes)
         self._commits: queue.Queue[tuple[int, MambaCheckpointCommit]] = queue.Queue(
             _MAX_PENDING

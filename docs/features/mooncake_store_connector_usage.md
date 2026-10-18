@@ -134,6 +134,36 @@ or RPCs). These operations do not transfer checkpoint payloads. Rebuild the Rust
 frontend when updating vLLM so it recognizes the new operation names; no
 Mooncake rebuild is required.
 
+### Debug inventory by checkpoint lifecycle
+
+With `VLLM_CACHE_INVENTORY_INTERVAL=10` and Gym's cache inventory collector
+enabled, the Mooncake snapshot also reports:
+
+| Category | Meaning |
+| --- | --- |
+| `anchor_or_unknown` | No readable lineage or retirement marker: an anchor, an untracked save, or a checkpoint whose marker was evicted. |
+| `tip` | A readable lineage marker exists and no readable retirement marker exists. This includes intermediate checkpoints awaiting retirement publication, not just final trajectory checkpoints. |
+| `retired` | A readable retirement marker exists and Mamba payload objects remain in the store, including partially deleted checkpoints. |
+
+Each category exports `complete_prefixes`, `incomplete_prefixes`,
+`ready_objects`, `ready_bytes`, `pending_objects`, and `pending_bytes` under
+`mooncake/total/cache_inventory/mamba/<category>/` in W&B. The category values
+sum to the existing Mamba totals. Marker-only entries are excluded, and marker
+bytes are not counted as Mamba payload bytes. `retired` describes resident
+marked payloads, not the contents of any worker's bounded retry queue.
+
+Classification uses the markers visible during the approximate metadata scan;
+marker eviction and concurrent writes can change it. A `tip` does not prove
+that the trajectory is still active or that its full attention prefix exists.
+There are no extra per-request RPCs, payload reads, or lease renewals for this
+inventory. It uses the existing opt-in scan interval and default-off behavior.
+
+Deploy the updated vLLM namespace advertisement and rebuild/redeploy the
+Mooncake **master** with lifecycle-aware inventory support. The client APIs are
+unchanged, and the Gym collector forwards the new fields automatically. Older
+masters reject the new marker namespace kinds; older vLLM workers do not
+advertise the markers, so their checkpoints appear as `anchor_or_unknown`.
+
 ## Usage
 
 ### Single-Node KV Cache Offloading

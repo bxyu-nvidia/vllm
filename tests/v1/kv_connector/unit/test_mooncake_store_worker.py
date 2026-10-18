@@ -5851,3 +5851,48 @@ def test_retirement_lookup_observes_new_markers_and_cache_reset():
     writer.reset_store()
     objects.update(payloads)
     assert worker.lookup(17, [b"a", b"b"]).hit_length == 16
+
+
+@pytest.mark.parametrize("interval", ["0", "10"])
+def test_inventory_marker_namespaces_match_retirement_writes(monkeypatch, interval):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    monkeypatch.setenv("VLLM_CACHE_INVENTORY_INTERVAL", interval)
+    worker = _make_hybrid_lookup_worker()
+    store, objects, _ = _retirement_store()
+    worker.store = store
+    objects.update(
+        {
+            f"{p}@{h}": b"state"
+            for prefixes in worker._lookup_key_prefixes
+            for p in prefixes
+            for h in "abc"
+        }
+    )
+    writer = MambaCheckpointRetirer(store, worker._lookup_key_prefixes, {1})
+    writer.commit(MambaCheckpointCommit("a", "b"))
+    writer.commit(MambaCheckpointCommit("b", "c"))
+    store.reset_mock()
+    stats = worker.get_kv_connector_stats()
+    store.batch_is_exist.assert_not_called()
+    store.put.assert_not_called()
+    if interval == "0":
+        assert "_cache_layout" not in stats.data
+        return
+    layout = stats.data["_cache_layout"]
+    markers = {
+        entry["kind"]: entry
+        for entry in layout
+        if entry["kind"] in ("mamba_lineage", "mamba_retired")
+    }
+    assert set(markers) == {"mamba_lineage", "mamba_retired"}
+    for entry in markers.values():
+        assert entry["scope"] == "test-model"
+        assert entry["prefix"] + "@b" in objects
+    # Metadata namespaces do not change the expected number of Mamba shards.
+    assert sum(entry["kind"] == "mamba" for entry in layout) == 2
