@@ -193,6 +193,9 @@ pub mod kv_connector {
         CheckpointMambaPut,
         CheckpointAttentionPut,
         CheckpointAttentionReuse,
+        CheckpointLineagePut,
+        CheckpointRetireExists,
+        CheckpointRetire,
         LoadGet,
         LookupExists,
     }
@@ -205,6 +208,9 @@ pub mod kv_connector {
                 Self::CheckpointMambaPut => "checkpoint_mamba_put",
                 Self::CheckpointAttentionPut => "checkpoint_attention_put",
                 Self::CheckpointAttentionReuse => "checkpoint_attention_reuse",
+                Self::CheckpointLineagePut => "checkpoint_lineage_put",
+                Self::CheckpointRetireExists => "checkpoint_retire_exists",
+                Self::CheckpointRetire => "checkpoint_retire",
                 Self::LoadGet => "load_get",
                 Self::LookupExists => "lookup_exists",
             }
@@ -218,6 +224,7 @@ pub mod kv_connector {
         Ok,
         Error,
         PartialFailure,
+        Deferred,
     }
 
     impl MooncakeStatus {
@@ -226,6 +233,7 @@ pub mod kv_connector {
                 Self::Ok => "ok",
                 Self::Error => "error",
                 Self::PartialFailure => "partial_failure",
+                Self::Deferred => "deferred",
             }
         }
     }

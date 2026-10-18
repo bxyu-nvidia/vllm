@@ -762,6 +762,59 @@ mod tests {
         }
     }
     #[test]
+    fn retirement_stats_preserve_multi_connector_metrics() {
+        // Unknown Mooncake operations/statuses used to make the entire mixed
+        // payload fall back to opaque telemetry, dropping NIXL stats as well.
+        let record = |keys, status, failed| {
+            serde_json::json!({
+                "duration_seconds": 0.01, "num_keys": keys, "num_bytes": 0,
+                "status": status, "num_failed_keys": failed
+            })
+        };
+        let payload = serde_json::json!({
+            "NixlConnector": {"transfer_duration": [0.2], "post_duration": [], "bytes_transferred": [1024],
+                "num_descriptors": [1], "num_failed_transfers": [],
+                "num_failed_notifications": [], "num_kv_expired_reqs": []},
+            "MooncakeStoreConnector": {
+                "save_put": [record(7, "ok", 0)],
+                "checkpoint_lineage_put": [record(1, "ok", 0)],
+                "checkpoint_retire_exists": [record(7, "ok", 0)],
+                "checkpoint_retire": [record(5, "deferred", 2), record(2, "ok", 0)]
+            }
+        });
+        let decoded: KvConnectorStats = serde_json::from_value(payload).unwrap();
+        assert!(matches!(&decoded, KvConnectorStats::Multi(stats) if stats.mooncake.is_some()));
+        let metrics = Metrics::new();
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        super::record_scheduler_stats_with_handles(
+            &handles,
+            &SchedulerStats {
+                kv_connector_stats: Some(decoded),
+                ..Default::default()
+            },
+        );
+        let rendered = metrics.render().unwrap();
+        for (operation, status, keys) in [
+            ("save_put", "ok", 7),
+            ("checkpoint_lineage_put", "ok", 1),
+            ("checkpoint_retire_exists", "ok", 7),
+            ("checkpoint_retire", "deferred", 5),
+            ("checkpoint_retire", "ok", 2),
+        ] {
+            assert!(rendered.contains(&format!(
+                "vllm:mooncake_store_operation_keys_total{{model_name=\"model\",engine=\"0\",operation=\"{operation}\",status=\"{status}\"}} {keys}"
+            )));
+        }
+        assert!(rendered.contains(
+            "vllm:mooncake_store_operation_failed_keys_total{model_name=\"model\",engine=\"0\",operation=\"checkpoint_retire\",status=\"deferred\"} 2"
+        ));
+        assert!(
+            rendered
+                .contains("vllm:nixl_xfer_time_seconds_count{model_name=\"model\",engine=\"0\"} 1")
+        );
+    }
+
+    #[test]
     fn cache_inventory_and_expected_layout_export_and_clear() {
         let metrics = Metrics::new();
         let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
