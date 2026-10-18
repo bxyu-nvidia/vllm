@@ -2205,6 +2205,7 @@ def test_estimate_max_model_len(model_id, max_model_len, want_estimated_max_len)
             head_size=128,
             dtype=torch.float16,
         )
+    vllm_config.cache_config.kv_cache_layout = "LBNHC"
     # Estimate the maximum model length, 16384 model_len need 8GB
     estimated_max_len = _estimate_max_model_len_from_groups(
         vllm_config, get_kv_cache_groups(vllm_config, kv_cache_spec), 8 * GiB_bytes
