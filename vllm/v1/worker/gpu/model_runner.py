@@ -183,6 +183,7 @@ from vllm.v1.worker.utils import (
     KVBlockZeroer,
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
+    get_replayssm_block_copy_tensors,
     get_uniform_decode_token_count,
 )
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
@@ -791,6 +792,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_caches = [
             cache for cache in kv_caches_dict.values() if cache.device == self.device
         ]
+        # Validate and cache optional ReplaySSM-owned state once cache binding
+        # has populated every layer. Block copies are a per-step hot path.
+        self.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
+            self.compilation_config.static_forward_context
+        )
+
         self.model_state.initialize_kv_cache(self.kv_cache_config, self.block_tables)
         if is_profiling:
             self.kv_connector = NO_OP_KV_CONNECTOR
@@ -1264,7 +1271,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # zeroing new blocks and before the forward pass reads them.
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
+                [*self.kv_caches, *self.replayssm_block_copy_tensors],
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
@@ -1585,7 +1592,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for block_table in block_tables:
                 block_table[:, 0].copy_(state_slots)
         slot_mappings = block_table_provider.get_dummy_slot_mappings(
-            input_batch.num_tokens
+            input_batch.num_tokens_after_padding
         )
         return block_tables, slot_mappings
 
@@ -1813,7 +1820,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
-            # Mamba "align" pre-copy: migrate recurrent state across block
+            # Mamba prefix-cache pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
             # boundary reset is visible to the attention metadata.
@@ -1835,10 +1842,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             dummy_num_reqs = batch_desc.num_reqs or num_reqs
+            # PIECEWISE pads tokens without padding requests. Keep that padding
+            # out of query lengths so the drafter can reuse the target's DP sync.
+            dummy_num_tokens = (
+                num_toks
+                if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE
+                else batch_desc.num_tokens
+            )
             input_batch = InputBatch.make_dummy(
                 dummy_num_reqs,
-                batch_desc.num_tokens,
+                dummy_num_tokens,
                 self.input_buffers,
+                num_tokens_after_padding=batch_desc.num_tokens,
                 max_query_len=batch_desc.max_query_len,
                 # Profiling and warmup must route the dummy tokens to experts
                 # so MoE memory is measured and MoE kernels are exercised.
@@ -2277,6 +2292,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
 
+        if (
+            self.vllm_config.use_flashinfer_replayssm
+            and self.kv_connector is not NO_OP_KV_CONNECTOR
+        ):
+            # NIXL can read the caches once the scheduler publishes prefill
+            # completion. Include canonicalization and draft KV writes in
+            # output readiness, retaining the early sampled-token copy above.
+            self.output_copy_stream.wait_stream(self.main_stream)
+            async_output.copy_event.record(self.output_copy_stream)
+
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
@@ -2346,6 +2371,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.pooling_runner = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
+        if hasattr(self, "replayssm_block_copy_tensors"):
+            self.replayssm_block_copy_tensors.clear()
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):

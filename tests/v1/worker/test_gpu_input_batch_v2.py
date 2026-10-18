@@ -18,15 +18,20 @@ DEVICE = current_platform.device_type
 
 
 @pytest.mark.parametrize(
-    "num_reqs,num_tokens",
+    "num_reqs,num_tokens,num_tokens_padded",
     [
-        (256, 496),  # remainder 240: previously gave the last request 241 tokens
-        (128, 512),  # no remainder
-        (3, 8),
-        (1, 7),
+        (256, 496, 496),  # remainder 240: previously gave the last request 241 tokens
+        (128, 512, 512),  # no remainder
+        (3, 8, 8),
+        (1, 7, 7),
+        (1, 6, 8),  # PIECEWISE graph padding must not change the query length
+        (2, 12, 16),
     ],
 )
-def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
+@pytest.mark.parametrize("is_padding", [True, False])
+def test_make_dummy_distributes_remainder(
+    num_reqs: int, num_tokens: int, num_tokens_padded: int, is_padding: bool
+):
     """No dummy request may exceed ceil(num_tokens / num_reqs) tokens.
 
     Dumping the remainder on a single request can produce a dummy request with
@@ -36,9 +41,23 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     CI failure).
     """
     buffers = InputBuffers(
-        max_num_reqs=num_reqs, max_num_tokens=num_tokens, device=torch.device(DEVICE)
+        max_num_reqs=num_reqs,
+        max_num_tokens=num_tokens_padded,
+        device=torch.device(DEVICE),
     )
-    batch = InputBatch.make_dummy(num_reqs, num_tokens, buffers)
+    batch = InputBatch.make_dummy(
+        num_reqs,
+        num_tokens,
+        buffers,
+        is_padding=is_padding,
+        num_tokens_after_padding=num_tokens_padded,
+    )
+    assert batch.num_tokens == num_tokens
+    assert batch.num_tokens_after_padding == num_tokens_padded
+    assert batch.input_ids.shape == batch.positions.shape == (num_tokens_padded,)
+    assert batch.is_padding.shape == (num_tokens_padded,)
+    assert (batch.is_padding[:num_tokens] == is_padding).all()
+    assert batch.is_padding[num_tokens:].all()
 
     max_per_req = -(-num_tokens // num_reqs)
     assert batch.num_scheduled_tokens.sum() == num_tokens

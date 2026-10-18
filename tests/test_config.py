@@ -104,6 +104,103 @@ def test_dspark_adaptive_verification_separates_graph_cache():
     assert config.compute_hash() != fixed_hash
 
 
+@pytest.mark.parametrize(
+    ("mode", "input_dtype"),
+    [("align", torch.bfloat16), ("align", torch.float16), ("none", torch.float16)],
+    ids=["align-bf16", "align-fp16-rejected", "none-fp16"],
+)
+def test_flashinfer_replayssm_validates_input_dtype(mode, input_dtype):
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            use_replayssm=True,
+            mamba_cache_mode=mode,
+            mamba_ssm_cache_dtype="float16",
+            replayssm_buffer_len=16,
+        ),
+        num_speculative_tokens=3,
+        model_config=SimpleNamespace(
+            supports_replayssm=True,
+            architecture="NemotronHForCausalLM",
+            dtype=input_dtype,
+        ),
+        mamba_config=SimpleNamespace(backend=MambaBackendEnum.FLASHINFER),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1, use_ubatching=False),
+        kv_transfer_config=None,
+        use_v2_model_runner=True,
+    )
+    if mode != "none" and input_dtype != torch.bfloat16:
+        with pytest.raises(ValueError, match="bfloat16 model inputs"):
+            VllmConfig.validate_mamba_cached_kernel(config)
+    else:
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+
+def test_flashinfer_replayssm_rejects_microbatching():
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            use_replayssm=True,
+            mamba_cache_mode="align",
+            replayssm_buffer_len=16,
+        ),
+        num_speculative_tokens=3,
+        model_config=SimpleNamespace(
+            supports_replayssm=True,
+            architecture="NemotronHForCausalLM",
+            dtype=torch.bfloat16,
+        ),
+        mamba_config=SimpleNamespace(backend=MambaBackendEnum.FLASHINFER),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1, use_ubatching=True),
+        kv_transfer_config=None,
+        use_v2_model_runner=True,
+    )
+    with pytest.raises(ValueError, match="ReplaySSM does not support microbatching"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize(
+    "connectors",
+    [
+        ["NixlConnector"],
+        ["MooncakeStoreConnector"],
+        ["NixlConnector", "MooncakeStoreConnector"],
+        ["NixlConnector", "OffloadingConnector"],
+        ["ExampleConnector"],
+    ],
+)
+@pytest.mark.parametrize("runner_v2", [False, True])
+def test_replayssm_kv_transfer_requires_canonical_state_connectors(
+    role, connectors, runner_v2
+):
+    transfer = KVTransferConfig(
+        kv_connector=connectors[0] if len(connectors) == 1 else "MultiConnector",
+        kv_role=role,
+        kv_connector_extra_config={
+            "connectors": [{"kv_connector": c, "kv_role": role} for c in connectors]
+        },
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            use_replayssm=True, mamba_cache_mode="align", replayssm_buffer_len=16
+        ),
+        num_speculative_tokens=5,
+        model_config=SimpleNamespace(
+            supports_replayssm=True,
+            architecture="NemotronHForCausalLM",
+            dtype=torch.bfloat16,
+        ),
+        mamba_config=SimpleNamespace(backend=MambaBackendEnum.FLASHINFER),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1, use_ubatching=False),
+        kv_transfer_config=transfer,
+        use_v2_model_runner=runner_v2,
+    )
+    if set(connectors) <= {"NixlConnector", "MooncakeStoreConnector"}:
+        assert VllmConfig.validate_mamba_cached_kernel(config) is config
+    else:
+        with pytest.raises(ValueError, match="supports only NixlConnector"):
+            VllmConfig.validate_mamba_cached_kernel(config)
+
+
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
@@ -256,7 +353,10 @@ def test_kda_recoverssm_derivation_is_revalidated():
             backend=MambaBackendEnum.TRITON,
             enable_stochastic_rounding=False,
         ),
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            use_ubatching=False,
+        ),
         kv_transfer_config=None,
         use_v2_model_runner=True,
     )
@@ -279,9 +379,17 @@ def test_kda_recoverssm_derivation_is_revalidated():
     assert not config.cache_config.use_kda_recoverssm
 
     config.model_config.architecture = "KimiLinearForCausalLM"
+    config.mamba_config.backend = MambaBackendEnum.TRITON
     config.parallel_config.pipeline_parallel_size = 2
     with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
         VllmConfig.validate_mamba_cached_kernel(config)
+
+    # Ordinary Triton ReplaySSM keeps its pre-existing PP support surface.
+    config.model_config.architecture = "NemotronHForCausalLM"
+    config.num_speculative_tokens = 0
+    config.cache_config.use_kda_recoverssm = False
+    config.use_v2_model_runner = False
+    VllmConfig.validate_mamba_cached_kernel(config)
 
 
 def test_mamba_cache_mode_all_is_rejected():
