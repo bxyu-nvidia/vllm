@@ -5516,6 +5516,7 @@ def test_inventory_layout_reports_expected_shards_without_store_reads(monkeypatc
 # requiring a GPU or a running Mooncake service.
 def _retirement_store():
     store = MagicMock()
+    del store.batch_retire
     objects: dict[str, bytes] = {}
     leased: set[str] = set()
     store.batch_is_exist.side_effect = lambda keys: [int(k in objects) for k in keys]
@@ -5782,6 +5783,7 @@ def test_retired_checkpoint_lookup_stops_lease_renewal_across_replicas(enabled):
 def test_retirement_marker_lookup_error_does_not_probe_payloads(failure):
     worker = _make_hybrid_lookup_worker(hash_block_size=8)
     worker.retire_mamba_checkpoints = True
+    del worker.store.batch_retire
     if failure == "exception":
         worker.store.batch_is_exist.side_effect = RuntimeError("unavailable")
     else:
@@ -5896,3 +5898,56 @@ def test_inventory_marker_namespaces_match_retirement_writes(monkeypatch, interv
         assert entry["prefix"] + "@b" in objects
     # Metadata namespaces do not change the expected number of Mamba shards.
     assert sum(entry["kind"] == "mamba" for entry in layout) == 2
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_master_retirement_acceptance_stops_client_deletion_retries(failure):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    store, objects, leased = _retirement_store()
+    store.batch_retire = MagicMock(return_value=[-900 if failure else 0])
+    objects.update({f"m@{h}": b"state" for h in "abc"})
+    leased.update(objects)
+    stats = MooncakeStoreConnectorStats()
+    writer = MambaCheckpointRetirer(
+        store,
+        [("m",)],
+        {0},
+        use_master_retirement=True,
+        record_operation=stats.record_operation,
+    )
+    writer.commit(MambaCheckpointCommit("a", "b"))
+    writer.commit(MambaCheckpointCommit("b", "c"))
+    store.batch_retire.assert_called_once_with(["m@b"])
+    assert "m@b" in objects  # Accepted means hidden/draining, not freed.
+    assert not any(key.startswith("vllm-mamba-retired-v1@") for key in objects)
+    store.batch_remove.assert_not_called()
+    store.batch_retire.return_value = [0]
+    writer.retry()
+    assert store.batch_retire.call_count == (2 if failure else 1)
+    assert not writer._pending
+    assert stats.data["checkpoint_retire_request"][-1]["status"] == "ok"
+    assert "checkpoint_retire" not in stats.data
+
+
+def test_master_retirement_lookup_relies_on_master_without_marker_probes():
+    worker = _make_hybrid_lookup_worker(hash_block_size=8)
+    worker.retire_mamba_checkpoints = True
+    # A new client exposes batch_retire; the master hides retired Mamba keys.
+    worker.store.batch_is_exist.side_effect = lambda keys: [
+        0 if "group:1" in key and key.endswith("@62") else 1 for key in keys
+    ]
+    assert worker.lookup(17, [b"a", b"b"]).hit_length < 16
+    assert worker.lookup(25, [b"a", b"b", b"c"]).hit_length == 24
+    assert worker.store.batch_is_exist.call_count == 2
+    assert all(
+        not key.startswith("vllm-mamba-retired-v1@")
+        for call in worker.store.batch_is_exist.call_args_list
+        for key in call.args[0]
+    )
+    assert "lookup_retired_exists" not in worker.kv_connector_stats.data

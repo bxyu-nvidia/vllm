@@ -55,9 +55,11 @@ class MambaCheckpointRetirer(threading.Thread):
         mamba_group_ids: Sequence[int] | set[int],
         *,
         record_operation: Callable[..., None] | None = None,
+        use_master_retirement: bool = False,
     ) -> None:
         super().__init__(daemon=True, name="MambaCheckpointRetirer")
         self.store = store
+        self.use_master_retirement = use_master_retirement
         self._record_operation = record_operation
         self._mamba_prefixes = tuple(
             dict.fromkeys(
@@ -177,20 +179,21 @@ class MambaCheckpointRetirer(threading.Thread):
             self._record("checkpoint_lineage_put", start, 1)
         if exists[-2] != 1:
             return  # No known predecessor for the parent: retain it as an anchor.
-        # Publish before removal: new lookups must stop renewing payload leases
-        # while existing readers drain. This marker is not in a tensor group.
-        start = time.perf_counter()
-        try:
-            result = self.store.put(f"{self._retired_prefix}@{parent}", b"1")
-            if result != 0:
-                raise RuntimeError(f"retirement marker PUT returned {result}")
-        except Exception:
-            self._record("checkpoint_retired_put", start, 1, failed=1, error=True)
-            logger.warning(
-                "Mamba checkpoint retirement marker write failed", exc_info=True
-            )
-            return
-        self._record("checkpoint_retired_put", start, 1)
+        if not self.use_master_retirement:
+            # Publish before removal: new lookups must stop renewing payload leases
+            # while existing readers drain. This marker is not in a tensor group.
+            start = time.perf_counter()
+            try:
+                result = self.store.put(f"{self._retired_prefix}@{parent}", b"1")
+                if result != 0:
+                    raise RuntimeError(f"retirement marker PUT returned {result}")
+            except Exception:
+                self._record("checkpoint_retired_put", start, 1, failed=1, error=True)
+                logger.warning(
+                    "Mamba checkpoint retirement marker write failed", exc_info=True
+                )
+                return
+            self._record("checkpoint_retired_put", start, 1)
         pending = self._remove(self._keys(parent))
         if pending:
             self._pending[parent] = pending
@@ -206,15 +209,23 @@ class MambaCheckpointRetirer(threading.Thread):
 
     def _remove(self, keys: list[str]) -> list[str]:
         start = time.perf_counter()
+        operation = (
+            "checkpoint_retire_request"
+            if self.use_master_retirement
+            else "checkpoint_retire"
+        )
         try:
-            # Never force: Mooncake leases protect concurrent DMA readers.
-            results = self.store.batch_remove(keys, force=False)
+            # The master owns deletion after acceptance; retries are only for
+            # failed submissions. Legacy clients retain lease-aware removal.
+            results = (
+                self.store.batch_retire(keys)
+                if self.use_master_retirement
+                else self.store.batch_remove(keys, force=False)
+            )
             if len(results) != len(keys):
                 raise RuntimeError("incomplete checkpoint removal result")
         except Exception:
-            self._record(
-                "checkpoint_retire", start, len(keys), failed=len(keys), error=True
-            )
+            self._record(operation, start, len(keys), failed=len(keys), error=True)
             logger.warning("Mamba checkpoint removal failed", exc_info=True)
             return keys
         pending = [
@@ -222,7 +233,7 @@ class MambaCheckpointRetirer(threading.Thread):
             for key, result in zip(keys, results, strict=True)
             if result not in (0, _OBJECT_NOT_FOUND)
         ]
-        self._record("checkpoint_retire", start, len(keys), failed=len(pending))
+        self._record(operation, start, len(keys), failed=len(pending))
         return pending
 
     def retry(self) -> None:

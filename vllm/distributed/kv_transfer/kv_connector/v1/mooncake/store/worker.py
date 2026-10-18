@@ -2213,9 +2213,17 @@ class MooncakeStoreWorker:
                     self._lookup_key_prefixes,
                     self.coord.mamba_group_ids,
                     record_operation=self._record_kv_connector_operation,
+                    use_master_retirement=callable(
+                        getattr(self.store, "batch_retire", None)
+                    ),
                 )
                 self.checkpoint_retirer.start()
-                logger.info("Mooncake intermediate Mamba checkpoint retirement enabled")
+                logger.info(
+                    "Mooncake intermediate Mamba checkpoint retirement enabled (%s)",
+                    "master-owned"
+                    if self.checkpoint_retirer.use_master_retirement
+                    else "legacy client retries",
+                )
 
         self.kv_recv_threads = []
         ready_events_recving = []
@@ -2513,7 +2521,11 @@ class MooncakeStoreWorker:
         if not candidate_keys:
             return MooncakeLookupResult(0)
 
-        if self.retire_mamba_checkpoints and self.coord.mamba_group_ids:
+        if (
+            self.retire_mamba_checkpoints
+            and self.coord.mamba_group_ids
+            and not callable(getattr(self.store, "batch_retire", None))
+        ):
             hashes = list(
                 dict.fromkeys(
                     h for gid, h in candidate_meta if gid in self.coord.mamba_group_ids
