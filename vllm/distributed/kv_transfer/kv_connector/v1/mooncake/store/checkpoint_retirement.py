@@ -29,6 +29,11 @@ def _layout_digest(lookup_key_prefixes: Sequence[Sequence[str]]) -> str:
     return hashlib.sha256(layout.encode()).hexdigest()
 
 
+def anchor_checkpoint_prefix(lookup_key_prefixes: Sequence[Sequence[str]]) -> str:
+    """Namespace for observed cache-chain roots, not benchmark sample IDs."""
+    return f"vllm-mamba-anchor-v1@{_layout_digest(lookup_key_prefixes)}"
+
+
 def lineage_checkpoint_prefix(lookup_key_prefixes: Sequence[Sequence[str]]) -> str:
     """Return the namespace used to identify derived checkpoints."""
     return f"vllm-mamba-lineage-v1@{_layout_digest(lookup_key_prefixes)}"
@@ -55,11 +60,12 @@ class MambaCheckpointRetirer(threading.Thread):
         mamba_group_ids: Sequence[int] | set[int],
         *,
         record_operation: Callable[..., None] | None = None,
-        use_master_retirement: bool = False,
+        publish_anchors: bool = False,
     ) -> None:
         super().__init__(daemon=True, name="MambaCheckpointRetirer")
         self.store = store
-        self.use_master_retirement = use_master_retirement
+        self._publish_anchors = publish_anchors
+        self._anchor_prefix = anchor_checkpoint_prefix(lookup_key_prefixes)
         self._record_operation = record_operation
         self._mamba_prefixes = tuple(
             dict.fromkeys(
@@ -81,7 +87,9 @@ class MambaCheckpointRetirer(threading.Thread):
 
     def submit(self, commit: MambaCheckpointCommit) -> None:
         """Queue an acknowledged save without blocking the model thread."""
-        if commit.parent_hash is None or self._stop_event.is_set():
+        if self._stop_event.is_set() or (
+            commit.parent_hash is None and not self._publish_anchors
+        ):
             return
         try:
             self._commits.put_nowait((self._generation, commit))
@@ -140,7 +148,11 @@ class MambaCheckpointRetirer(threading.Thread):
         """Publish lineage and retire the parent, if it is not an anchor."""
         parent = commit.parent_hash
         child = commit.checkpoint_hash
-        if parent is None or parent == child or not self._mamba_prefixes:
+        if parent == child or not self._mamba_prefixes:
+            return
+        if parent is None:
+            if self._publish_anchors:
+                self._publish_anchor(child)
             return
         child_keys = self._keys(child)
         probes = [*child_keys, self._marker(parent), self._marker(child)]
@@ -179,21 +191,20 @@ class MambaCheckpointRetirer(threading.Thread):
             self._record("checkpoint_lineage_put", start, 1)
         if exists[-2] != 1:
             return  # No known predecessor for the parent: retain it as an anchor.
-        if not self.use_master_retirement:
-            # Publish before removal: new lookups must stop renewing payload leases
-            # while existing readers drain. This marker is not in a tensor group.
-            start = time.perf_counter()
-            try:
-                result = self.store.put(f"{self._retired_prefix}@{parent}", b"1")
-                if result != 0:
-                    raise RuntimeError(f"retirement marker PUT returned {result}")
-            except Exception:
-                self._record("checkpoint_retired_put", start, 1, failed=1, error=True)
-                logger.warning(
-                    "Mamba checkpoint retirement marker write failed", exc_info=True
-                )
-                return
-            self._record("checkpoint_retired_put", start, 1)
+        # Publish before removal: new lookups must stop renewing payload leases
+        # while existing readers drain. This marker is not in a tensor group.
+        start = time.perf_counter()
+        try:
+            result = self.store.put(f"{self._retired_prefix}@{parent}", b"1")
+            if result != 0:
+                raise RuntimeError(f"retirement marker PUT returned {result}")
+        except Exception:
+            self._record("checkpoint_retired_put", start, 1, failed=1, error=True)
+            logger.warning(
+                "Mamba checkpoint retirement marker write failed", exc_info=True
+            )
+            return
+        self._record("checkpoint_retired_put", start, 1)
         pending = self._remove(self._keys(parent))
         if pending:
             self._pending[parent] = pending
@@ -207,25 +218,32 @@ class MambaCheckpointRetirer(threading.Thread):
         else:
             self._pending.pop(parent, None)
 
+    def _publish_anchor(self, checkpoint_hash: str) -> None:
+        # Commits arrive only after every rank acknowledges the save. Do not
+        # probe payloads for this diagnostic: that would renew their leases.
+        # If payloads were evicted meanwhile, inventory ignores orphan markers.
+        start = time.perf_counter()
+        try:
+            result = self.store.put(f"{self._anchor_prefix}@{checkpoint_hash}", b"1")
+            if result != 0:
+                raise RuntimeError(f"anchor PUT returned {result}")
+        except Exception:
+            self._record("checkpoint_anchor_put", start, 1, failed=1, error=True)
+            logger.warning("Mamba checkpoint anchor marker write failed", exc_info=True)
+            return
+        self._record("checkpoint_anchor_put", start, 1)
+
     def _remove(self, keys: list[str]) -> list[str]:
         start = time.perf_counter()
-        operation = (
-            "checkpoint_retire_request"
-            if self.use_master_retirement
-            else "checkpoint_retire"
-        )
         try:
-            # The master owns deletion after acceptance; retries are only for
-            # failed submissions. Legacy clients retain lease-aware removal.
-            results = (
-                self.store.batch_retire(keys)
-                if self.use_master_retirement
-                else self.store.batch_remove(keys, force=False)
-            )
+            # Never force: Mooncake leases protect concurrent DMA readers.
+            results = self.store.batch_remove(keys, force=False)
             if len(results) != len(keys):
                 raise RuntimeError("incomplete checkpoint removal result")
         except Exception:
-            self._record(operation, start, len(keys), failed=len(keys), error=True)
+            self._record(
+                "checkpoint_retire", start, len(keys), failed=len(keys), error=True
+            )
             logger.warning("Mamba checkpoint removal failed", exc_info=True)
             return keys
         pending = [
@@ -233,7 +251,7 @@ class MambaCheckpointRetirer(threading.Thread):
             for key, result in zip(keys, results, strict=True)
             if result not in (0, _OBJECT_NOT_FOUND)
         ]
-        self._record(operation, start, len(keys), failed=len(pending))
+        self._record("checkpoint_retire", start, len(keys), failed=len(pending))
         return pending
 
     def retry(self) -> None:

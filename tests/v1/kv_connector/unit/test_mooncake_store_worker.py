@@ -5516,7 +5516,6 @@ def test_inventory_layout_reports_expected_shards_without_store_reads(monkeypatc
 # requiring a GPU or a running Mooncake service.
 def _retirement_store():
     store = MagicMock()
-    del store.batch_retire
     objects: dict[str, bytes] = {}
     leased: set[str] = set()
     store.batch_is_exist.side_effect = lambda keys: [int(k in objects) for k in keys]
@@ -5783,7 +5782,6 @@ def test_retired_checkpoint_lookup_stops_lease_renewal_across_replicas(enabled):
 def test_retirement_marker_lookup_error_does_not_probe_payloads(failure):
     worker = _make_hybrid_lookup_worker(hash_block_size=8)
     worker.retire_mamba_checkpoints = True
-    del worker.store.batch_retire
     if failure == "exception":
         worker.store.batch_is_exist.side_effect = RuntimeError("unavailable")
     else:
@@ -5876,7 +5874,10 @@ def test_inventory_marker_namespaces_match_retirement_writes(monkeypatch, interv
             for h in "abc"
         }
     )
-    writer = MambaCheckpointRetirer(store, worker._lookup_key_prefixes, {1})
+    writer = MambaCheckpointRetirer(
+        store, worker._lookup_key_prefixes, {1}, publish_anchors=interval != "0"
+    )
+    writer.commit(MambaCheckpointCommit(None, "a"))
     writer.commit(MambaCheckpointCommit("a", "b"))
     writer.commit(MambaCheckpointCommit("b", "c"))
     store.reset_mock()
@@ -5890,18 +5891,50 @@ def test_inventory_marker_namespaces_match_retirement_writes(monkeypatch, interv
     markers = {
         entry["kind"]: entry
         for entry in layout
-        if entry["kind"] in ("mamba_lineage", "mamba_retired")
+        if entry["kind"] in ("mamba_anchor", "mamba_lineage", "mamba_retired")
     }
-    assert set(markers) == {"mamba_lineage", "mamba_retired"}
-    for entry in markers.values():
+    assert set(markers) == {"mamba_anchor", "mamba_lineage", "mamba_retired"}
+    for kind, entry in markers.items():
         assert entry["scope"] == "test-model"
-        assert entry["prefix"] + "@b" in objects
+        checkpoint = "a" if kind == "mamba_anchor" else "b"
+        assert entry["prefix"] + "@" + checkpoint in objects
     # Metadata namespaces do not change the expected number of Mamba shards.
     assert sum(entry["kind"] == "mamba" for entry in layout) == 2
 
 
-@pytest.mark.parametrize("failure", [False, True])
-def test_master_retirement_acceptance_stops_client_deletion_retries(failure):
+@pytest.mark.parametrize("enabled", [False, True])
+def test_anchor_marker_requires_observed_root_and_debug_opt_in(enabled):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+        anchor_checkpoint_prefix,
+        lineage_checkpoint_prefix,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    store, objects, _ = _retirement_store()
+    objects.update({f"m@{h}": b"state" for h in "abc"})
+    writer = MambaCheckpointRetirer(store, [("m",)], {0}, publish_anchors=enabled)
+    root = MambaCheckpointCommit(None, "a")
+    writer.submit(root)
+    assert writer._commits.qsize() == int(enabled)
+    writer.commit(root)
+    store.batch_is_exist.assert_not_called()  # Debugging must not extend leases.
+    store.batch_remove.assert_not_called()
+    anchor = anchor_checkpoint_prefix([("m",)])
+    assert (f"{anchor}@a" in objects) is enabled
+    writer.commit(MambaCheckpointCommit("a", "b"))
+    del objects[f"{lineage_checkpoint_prefix([('m',)])}@b"]
+    writer.commit(MambaCheckpointCommit("b", "c"))
+    # Missing lineage retains b under the old policy but never asserts a root.
+    assert "m@b" in objects
+    assert f"{anchor}@b" not in objects
+    assert f"{anchor}@c" not in objects
+
+
+@pytest.mark.parametrize("failure", ["exception", "status"])
+def test_anchor_marker_failure_does_not_delete_payload_or_escape(failure):
     from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
         MambaCheckpointRetirer,
     )
@@ -5909,45 +5942,21 @@ def test_master_retirement_acceptance_stops_client_deletion_retries(failure):
         MambaCheckpointCommit,
     )
 
-    store, objects, leased = _retirement_store()
-    store.batch_retire = MagicMock(return_value=[-900 if failure else 0])
-    objects.update({f"m@{h}": b"state" for h in "abc"})
-    leased.update(objects)
+    store, objects, _ = _retirement_store()
+    objects["m@a"] = b"state"
+    store.put.side_effect = (
+        RuntimeError("unavailable") if failure == "exception" else None
+    )
+    store.put.return_value = -1
     stats = MooncakeStoreConnectorStats()
     writer = MambaCheckpointRetirer(
         store,
         [("m",)],
         {0},
-        use_master_retirement=True,
+        publish_anchors=True,
         record_operation=stats.record_operation,
     )
-    writer.commit(MambaCheckpointCommit("a", "b"))
-    writer.commit(MambaCheckpointCommit("b", "c"))
-    store.batch_retire.assert_called_once_with(["m@b"])
-    assert "m@b" in objects  # Accepted means hidden/draining, not freed.
-    assert not any(key.startswith("vllm-mamba-retired-v1@") for key in objects)
+    writer.commit(MambaCheckpointCommit(None, "a"))
+    assert objects == {"m@a": b"state"}
     store.batch_remove.assert_not_called()
-    store.batch_retire.return_value = [0]
-    writer.retry()
-    assert store.batch_retire.call_count == (2 if failure else 1)
-    assert not writer._pending
-    assert stats.data["checkpoint_retire_request"][-1]["status"] == "ok"
-    assert "checkpoint_retire" not in stats.data
-
-
-def test_master_retirement_lookup_relies_on_master_without_marker_probes():
-    worker = _make_hybrid_lookup_worker(hash_block_size=8)
-    worker.retire_mamba_checkpoints = True
-    # A new client exposes batch_retire; the master hides retired Mamba keys.
-    worker.store.batch_is_exist.side_effect = lambda keys: [
-        0 if "group:1" in key and key.endswith("@62") else 1 for key in keys
-    ]
-    assert worker.lookup(17, [b"a", b"b"]).hit_length < 16
-    assert worker.lookup(25, [b"a", b"b", b"c"]).hit_length == 24
-    assert worker.store.batch_is_exist.call_count == 2
-    assert all(
-        not key.startswith("vllm-mamba-retired-v1@")
-        for call in worker.store.batch_is_exist.call_args_list
-        for key in call.args[0]
-    )
-    assert "lookup_retired_exists" not in worker.kv_connector_stats.data
+    assert stats.data["checkpoint_anchor_put"][-1]["status"] == "error"

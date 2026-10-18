@@ -1745,7 +1745,10 @@ def test_scheduler_checkpoint_hint_does_not_claim_a_cache_hit(
 
 
 @pytest.mark.parametrize("failed_rank", [False, True])
-def test_checkpoint_retirement_waits_for_success_from_every_rank(failed_rank):
+@pytest.mark.parametrize("parent_tokens", [0, 16])
+def test_checkpoint_retirement_waits_for_success_from_every_rank(
+    failed_rank, parent_tokens
+):
     scheduler = _make_bare_scheduler()
     scheduler.retire_mamba_checkpoints = True
     scheduler._num_workers = 2
@@ -1753,7 +1756,7 @@ def test_checkpoint_retirement_waits_for_success_from_every_rank(failed_rank):
         "req-0",
         48,
         ([1, 2, 3],),
-        checkpoint_parent_tokens=16,
+        checkpoint_parent_tokens=parent_tokens,
     )
     req = ReqMeta(
         "req-0",
@@ -1785,7 +1788,7 @@ def test_checkpoint_retirement_waits_for_success_from_every_rank(failed_rank):
         assert not scheduler.has_pending_push_work()
     else:
         assert [(c.parent_hash, c.checkpoint_hash) for c in commits] == [
-            (b"a".hex(), b"b".hex()),
+            (b"a".hex() if parent_tokens else None, b"b".hex()),
             (b"b".hex(), b"c".hex()),
         ]
         assert scheduler.has_pending_push_work()

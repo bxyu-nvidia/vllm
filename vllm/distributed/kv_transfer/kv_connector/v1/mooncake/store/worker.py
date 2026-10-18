@@ -91,6 +91,7 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from .checkpoint_retirement import (
     MambaCheckpointRetirer,
+    anchor_checkpoint_prefix,
     lineage_checkpoint_prefix,
     retired_checkpoint_prefix,
 )
@@ -2213,17 +2214,10 @@ class MooncakeStoreWorker:
                     self._lookup_key_prefixes,
                     self.coord.mamba_group_ids,
                     record_operation=self._record_kv_connector_operation,
-                    use_master_retirement=callable(
-                        getattr(self.store, "batch_retire", None)
-                    ),
+                    publish_anchors=envs.VLLM_CACHE_INVENTORY_INTERVAL > 0,
                 )
                 self.checkpoint_retirer.start()
-                logger.info(
-                    "Mooncake intermediate Mamba checkpoint retirement enabled (%s)",
-                    "master-owned"
-                    if self.checkpoint_retirer.use_master_retirement
-                    else "legacy client retries",
-                )
+                logger.info("Mooncake intermediate Mamba checkpoint retirement enabled")
 
         self.kv_recv_threads = []
         ready_events_recving = []
@@ -2413,6 +2407,10 @@ class MooncakeStoreWorker:
                         {"scope": scope, "prefix": prefix, "kind": kind}
                         for kind, prefix in (
                             (
+                                "mamba_anchor",
+                                anchor_checkpoint_prefix(self._lookup_key_prefixes),
+                            ),
+                            (
                                 "mamba_lineage",
                                 lineage_checkpoint_prefix(self._lookup_key_prefixes),
                             ),
@@ -2521,11 +2519,7 @@ class MooncakeStoreWorker:
         if not candidate_keys:
             return MooncakeLookupResult(0)
 
-        if (
-            self.retire_mamba_checkpoints
-            and self.coord.mamba_group_ids
-            and not callable(getattr(self.store, "batch_retire", None))
-        ):
+        if self.retire_mamba_checkpoints and self.coord.mamba_group_ids:
             hashes = list(
                 dict.fromkeys(
                     h for gid, h in candidate_meta if gid in self.coord.mamba_group_ids

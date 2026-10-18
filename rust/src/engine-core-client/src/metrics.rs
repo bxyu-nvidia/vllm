@@ -777,9 +777,9 @@ mod tests {
                 "num_failed_notifications": [], "num_kv_expired_reqs": []},
             "MooncakeStoreConnector": {
                 "save_put": [record(7, "ok", 0)],
+                "checkpoint_anchor_put": [record(1, "ok", 0)],
                 "checkpoint_lineage_put": [record(1, "ok", 0)],
                 "checkpoint_retired_put": [record(1, "ok", 0)],
-                "checkpoint_retire_request": [record(5, "ok", 0)],
                 "lookup_retired_exists": [record(3, "ok", 0)],
                 "lookup_retired_skip": [record(5, "ok", 0)],
                 "checkpoint_retire_exists": [record(7, "ok", 0)],
@@ -800,9 +800,9 @@ mod tests {
         let rendered = metrics.render().unwrap();
         for (operation, status, keys) in [
             ("save_put", "ok", 7),
+            ("checkpoint_anchor_put", "ok", 1),
             ("checkpoint_lineage_put", "ok", 1),
             ("checkpoint_retired_put", "ok", 1),
-            ("checkpoint_retire_request", "ok", 5),
             ("lookup_retired_exists", "ok", 3),
             ("lookup_retired_skip", "ok", 5),
             ("checkpoint_retire_exists", "ok", 7),
