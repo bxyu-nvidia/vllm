@@ -89,6 +89,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from .checkpoint_retirement import MambaCheckpointRetirer
 from .metrics import MooncakeStoreConnectorStats
 from .pipeline import PIPELINE_KEY, PipelineTracker
 
@@ -426,6 +427,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         group_participates: Sequence[bool] | None = None,
         *,
         external_cache_only: bool = False,
+        report_save_success: bool = False,
         lookup_key_prefixes: Sequence[Sequence[str]] | None = None,
     ):
         super().__init__(
@@ -456,6 +458,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
         # store_job_id -> times this rank finished with it, drained every step
         # so the scheduler can release the blocks it referenced for those jobs.
         self._completed_saves: dict[int, int] = {}
+        self._successful_saves: dict[int, int] = {}
+        self.report_save_success = report_save_success
         self.external_cache_only = external_cache_only
         self.lookup_key_prefixes = lookup_key_prefixes
         self._store_error: str | None = None
@@ -500,7 +504,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._saved_offset.pop(req_id, None)
             self._retry_token_ids.pop(req_id, None)
 
-    def finish_store_job(self, req_meta: ReqMeta) -> None:
+    def finish_store_job(self, req_meta: ReqMeta, *, successful: bool = False) -> None:
         """Retire a job from the ledger and report its blocks as no longer read.
 
         Every path out of a job must reach this, skips and failures included: a
@@ -514,18 +518,34 @@ class KVCacheStoreSendingThread(KVTransferThread):
         with self.done_task_lock:
             live = self.stored_requests.get(req_meta.req_id)
             if live is not None:
+                if (
+                    successful
+                    and self.report_save_success
+                    and req_meta.boundary_state_offloads
+                    and store_job_id in live
+                ):
+                    self._successful_saves[store_job_id] = (
+                        self._successful_saves.get(store_job_id, 0) + 1
+                    )
                 live.discard(store_job_id)
             self._completed_saves[store_job_id] = (
                 self._completed_saves.get(store_job_id, 0) + 1
             )
 
     def take_completed_saves(self) -> dict[int, int]:
+        return self.take_save_results().completed_saves
+
+    def take_save_results(self) -> MooncakeStoreWorkerMetadata:
         with self.done_task_lock:
             if self._store_error is not None:
                 raise RuntimeError(self._store_error)
-            completed = self._completed_saves
+            result = MooncakeStoreWorkerMetadata(
+                completed_saves=self._completed_saves,
+                successful_saves=self._successful_saves,
+            )
             self._completed_saves = {}
-        return completed
+            self._successful_saves = {}
+        return result
 
     def _record_saved(self, req_meta: ReqMeta, token_len: int) -> None:
         # Guard on job liveness so neither a concurrent finish/preempt pop nor a
@@ -1284,7 +1304,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         "pinned. Check Mooncake capacity and transfer errors."
                     )
             else:
-                self.finish_store_job(req_meta)
+                self.finish_store_job(req_meta, successful=save_completed)
             self.request_queue.task_done()
 
 
@@ -1638,6 +1658,13 @@ class MooncakeStoreWorker:
             extra_config.get("save_decode_cache", False)
         )
         self.external_cache_only = extra_config.get("external_cache_only", False)
+        self.retire_mamba_checkpoints = extra_config.get(
+            "retire_mamba_checkpoints", False
+        )
+        if not isinstance(self.retire_mamba_checkpoints, bool):
+            raise ValueError("retire_mamba_checkpoints must be a boolean")
+        self.checkpoint_retirer: MambaCheckpointRetirer | None = None
+        self._is_checkpoint_retirement_rank = parallel_config.rank == 0
         self.load_async = extra_config.get("load_async", True)
         # Mirrors MooncakeStoreConnector._capacity_only.
         self._capacity_only = (
@@ -2168,9 +2195,23 @@ class MooncakeStoreWorker:
                     for group in self._kv_cache_groups
                 ],
                 external_cache_only=self.external_cache_only,
+                report_save_success=self.retire_mamba_checkpoints,
                 lookup_key_prefixes=self._lookup_key_prefixes,
             )
             self.kv_send_thread.start()
+            if (
+                self.retire_mamba_checkpoints
+                and self._is_checkpoint_retirement_rank
+                and self.coord.mamba_group_ids
+            ):
+                self.checkpoint_retirer = MambaCheckpointRetirer(
+                    self.store,
+                    self._lookup_key_prefixes,
+                    self.coord.mamba_group_ids,
+                    record_operation=self._record_kv_connector_operation,
+                )
+                self.checkpoint_retirer.start()
+                logger.info("Mooncake intermediate Mamba checkpoint retirement enabled")
 
         self.kv_recv_threads = []
         ready_events_recving = []
@@ -2231,6 +2272,10 @@ class MooncakeStoreWorker:
         """
         if self._capacity_only or not self.can_put:
             return
+
+        if self.checkpoint_retirer is not None:
+            for commit in metadata.checkpoint_commits:
+                self.checkpoint_retirer.submit(commit)
 
         current_event = None
         for request in metadata.requests:
@@ -2381,10 +2426,8 @@ class MooncakeStoreWorker:
     def build_connector_worker_meta(self) -> MooncakeStoreWorkerMetadata | None:
         if self.kv_send_thread is None:
             return None
-        completed_saves = self.kv_send_thread.take_completed_saves()
-        if not completed_saves:
-            return None
-        return MooncakeStoreWorkerMetadata(completed_saves=completed_saves)
+        result = self.kv_send_thread.take_save_results()
+        return result if result.completed_saves else None
 
     def lookup(
         self, num_tokens: int, block_hashes: Sequence[BlockHash]
@@ -2569,6 +2612,8 @@ class MooncakeStoreWorker:
         if store is None:
             return
         self.store = None
+        if self.checkpoint_retirer is not None:
+            self.checkpoint_retirer.close()
         deadline = time.monotonic() + 5.0
         for thread in (self.kv_send_thread, *self.kv_recv_threads):
             if thread is None:
@@ -2644,7 +2689,11 @@ class LookupKeyServer:
                         # flat key space, clearing every (group_id, hash) entry.
                         if self.store_worker.kv_send_thread is not None:
                             self.store_worker.kv_send_thread.request_queue.join()
-                        self.store_worker.store.remove_all(force=True)
+                        retirer = self.store_worker.checkpoint_retirer
+                        if retirer is not None:
+                            retirer.reset_store()
+                        else:
+                            self.store_worker.store.remove_all(force=True)
                         logger.info("Mooncake store reset via remove_all succeeded.")
                         self.socket.send(RESP_OK)
                     except Exception as e:

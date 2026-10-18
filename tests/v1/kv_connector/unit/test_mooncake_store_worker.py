@@ -3519,6 +3519,9 @@ def _make_bare_worker(
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
     worker.external_cache_only = False
+    worker.retire_mamba_checkpoints = False
+    worker.checkpoint_retirer = None
+    worker._is_checkpoint_retirement_rank = True
     worker._capacity_only = False
     worker.block_size = block_size
     worker._is_hma_required = False
@@ -5496,3 +5499,210 @@ def test_inventory_layout_reports_expected_shards_without_store_reads(monkeypatc
     second = worker.get_kv_connector_stats()
     assert "_cache_layout" not in second.data
     worker.store.batch_is_exist.assert_not_called()
+
+
+# Retirement tests exercise observable store contents through the policy API.
+# A dict-backed Store catches deletion, completeness and retry errors without
+# requiring a GPU or a running Mooncake service.
+def _retirement_store():
+    store = MagicMock()
+    objects: dict[str, bytes] = {}
+    leased: set[str] = set()
+    store.batch_is_exist.side_effect = lambda keys: [int(k in objects) for k in keys]
+
+    def put(key, value):
+        objects.setdefault(key, value)
+        return 0
+
+    def remove(keys, *, force):
+        assert force is False
+        result = []
+        for key in keys:
+            if key in leased:
+                result.append(-706)
+            else:
+                result.append(0 if objects.pop(key, None) is not None else -704)
+        return result
+
+    store.put.side_effect = put
+    store.batch_remove.side_effect = remove
+    return store, objects, leased
+
+
+def test_mamba_retirement_keeps_anchor_and_tip_across_replicas():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    store, objects, _ = _retirement_store()
+    prefixes = [("attention",), ("mamba-rank0", "mamba-rank1"), ("mamba-group2",)]
+    original = {f"{p}@{h}" for group in prefixes for p in group for h in "abcd"}
+    objects.update(dict.fromkeys(original, b"state"))
+    # Each turn lands on a fresh replica: lineage cannot rely on Python memory.
+    for parent, child in [(None, "a"), ("a", "b"), ("b", "c"), ("c", "d")]:
+        policy = MambaCheckpointRetirer(store, prefixes, {1, 2})
+        policy.commit(MambaCheckpointCommit(parent, child))
+    assert original & objects.keys() == {
+        *(f"attention@{h}" for h in "abcd"),
+        *(f"{p}@{h}" for group in prefixes[1:] for p in group for h in "ad"),
+    }
+    # A fork/retry may retire the same parent twice; absent keys are harmless.
+    policy.commit(MambaCheckpointCommit("b", "d"))
+    assert "mamba-rank0@a" in objects
+    assert "mamba-rank0@d" in objects
+
+
+@pytest.mark.parametrize("failure", ["missing_shard", "lookup", "marker_put"])
+def test_mamba_retirement_preserves_parent_without_a_complete_replacement(failure):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    store, objects, _ = _retirement_store()
+    prefixes = [("m0", "m1")]
+    objects.update({f"{p}@{h}": b"state" for p in prefixes[0] for h in "abc"})
+    policy = MambaCheckpointRetirer(store, prefixes, {0})
+    policy.commit(MambaCheckpointCommit("a", "b"))
+    if failure == "missing_shard":
+        del objects["m1@c"]
+    elif failure == "lookup":
+        store.batch_is_exist.side_effect = RuntimeError("unavailable")
+    else:
+        store.put.side_effect = lambda *_: -200
+    policy.commit(MambaCheckpointCommit("b", "c"))
+    assert "m0@b" in objects and "m1@b" in objects
+    store.batch_remove.assert_not_called()
+
+
+def test_mamba_retirement_retries_leased_keys_without_renewing_them():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
+        MooncakeStoreConnectorStats,
+    )
+
+    store, objects, leased = _retirement_store()
+    objects.update({f"{p}@{h}": b"state" for p in ("m0", "m1") for h in "abc"})
+    stats = MooncakeStoreConnectorStats()
+    policy = MambaCheckpointRetirer(
+        store, [("m0", "m1")], {0}, record_operation=stats.record_operation
+    )
+    policy.commit(MambaCheckpointCommit("a", "b"))
+    leased.add("m1@b")
+    policy.commit(MambaCheckpointCommit("b", "c"))
+    assert "m0@b" not in objects and "m1@b" in objects
+    store.batch_is_exist.reset_mock()
+    policy.retry()
+    assert "m1@b" in objects
+    leased.clear()
+    policy.retry()
+    assert "m1@b" not in objects
+    store.batch_remove.assert_called_with(["m1@b"], force=False)
+    store.batch_is_exist.assert_not_called()
+    assert [r["status"] for r in stats.data["checkpoint_retire"]] == [
+        "deferred",
+        "deferred",
+        "ok",
+    ]
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_checkpoint_completion_reports_success_separately_from_block_release(success):
+    store = MagicMock()
+    thread = _make_store_sending_thread(store)
+    thread.report_save_success = True
+    req = ReqMeta(
+        req_id="r",
+        token_len_chunk=0,
+        block_ids=([1],),
+        block_hashes=[b"a"],
+        can_save=True,
+        store_job_id=99,
+        boundary_state_offloads=[(0, 1, 16)],
+    )
+    thread._maybe_offload_boundary_states = MagicMock(return_value=success)
+    thread.add_request(req)
+    thread._handle_request(req)
+    result = thread.take_save_results()
+    assert result.completed_saves == {99: 1}
+    assert result.successful_saves == ({99: 1} if success else {})
+
+
+def test_mamba_retirement_reset_discards_queued_and_leased_work():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    store, objects, leased = _retirement_store()
+    store.remove_all.side_effect = lambda *, force: objects.clear()
+    objects.update({f"m@{h}": b"state" for h in "abc"})
+    policy = MambaCheckpointRetirer(store, [("m",)], {0})
+    policy.commit(MambaCheckpointCommit("a", "b"))
+    leased.add("m@b")
+    policy.commit(MambaCheckpointCommit("b", "c"))
+    policy.submit(MambaCheckpointCommit("b", "c"))
+    policy.reset_store()
+    # A new run may reuse the same hashes; stale retries must not remove them.
+    objects["m@b"] = b"new state"
+    leased.clear()
+    policy.retry()
+    assert objects == {"m@b": b"new state"}
+    assert policy._commits.empty()
+
+
+def test_mamba_retirement_bounds_queue_and_retry_work(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
+        checkpoint_retirement as retirement,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    monkeypatch.setattr(retirement, "_MAX_PENDING", 2)
+    monkeypatch.setattr(retirement, "_RETRY_BATCH_SIZE", 1)
+    store, objects, leased = _retirement_store()
+    objects.update({f"m@{h}": b"state" for h in "abcde"})
+    leased.update(objects)
+    policy = retirement.MambaCheckpointRetirer(store, [("m",)], {0})
+    for parent, child in zip("abcd", "bcde", strict=True):
+        commit = MambaCheckpointCommit(parent, child)
+        policy.submit(commit)
+        policy.commit(commit)
+    assert policy._commits.qsize() == 2
+    assert len(policy._pending) == 2
+    store.batch_remove.reset_mock()
+    policy.retry()
+    store.batch_remove.assert_called_once_with(["m@c"], force=False)
+    policy.retry()
+    assert store.batch_remove.call_args.args == (["m@d"],)
+
+
+def test_mamba_retirement_shutdown_stops_background_retries():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.checkpoint_retirement import (  # noqa: E501
+        MambaCheckpointRetirer,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaCheckpointCommit,
+    )
+
+    store, _, _ = _retirement_store()
+    policy = MambaCheckpointRetirer(store, [("m",)], {0})
+    policy.start()
+    policy.close()
+    policy.submit(MambaCheckpointCommit("a", "b"))
+    assert not policy.is_alive()
+    store.batch_is_exist.assert_not_called()
+    store.batch_remove.assert_not_called()

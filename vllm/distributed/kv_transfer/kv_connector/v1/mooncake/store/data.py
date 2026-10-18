@@ -702,6 +702,14 @@ class LoadSpec:
     tail_key_boundaries: tuple[TailKeyBoundary, ...] = ()
 
 
+@dataclass(frozen=True)
+class MambaCheckpointCommit:
+    """A saved checkpoint and the earlier state used by its continuation."""
+
+    parent_hash: str | None
+    checkpoint_hash: str
+
+
 @dataclass
 class RequestTracker:
     """Tracks per-request state across scheduler ticks."""
@@ -716,6 +724,7 @@ class RequestTracker:
     # For a fresh request this is len(prompt). For a resumed-from-preemption
     # request it includes previously-generated tokens, which are re-prefilled.
     prefill_end_tokens: int = 0
+    checkpoint_parent_tokens: int = 0
 
     def reset(self) -> None:
         self.token_len = 0
@@ -724,6 +733,7 @@ class RequestTracker:
         self.token_ids = None
         self.has_pending_offload = False
         self.prefill_end_tokens = 0
+        self.checkpoint_parent_tokens = 0
 
     def update(
         self,
@@ -839,6 +849,8 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
     """Maps ``ReqMeta.store_job_id`` to the number of ranks done with that job."""
 
     completed_saves: dict[int, int] = field(default_factory=dict)
+    # Success is separate from completion: failed/skipped jobs also release refs.
+    successful_saves: dict[int, int] = field(default_factory=dict)
 
     def aggregate(
         self, other: "KVConnectorWorkerMetadata"
@@ -848,6 +860,8 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
             self.completed_saves[store_job_id] = (
                 self.completed_saves.get(store_job_id, 0) + count
             )
+        for job_id, count in other.successful_saves.items():
+            self.successful_saves[job_id] = self.successful_saves.get(job_id, 0) + count
         return self
 
 
@@ -860,6 +874,7 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         preempted_req_ids: set[str],
     ):
         self.requests: list[ReqMeta] = []
+        self.checkpoint_commits: list[MambaCheckpointCommit] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
 

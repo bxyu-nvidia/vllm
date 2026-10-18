@@ -71,6 +71,47 @@ Set the config path via environment variable:
 export MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json
 ```
 
+## Intermediate Mamba checkpoint retirement
+
+For hybrid Mamba models, opt in through the MooncakeStoreConnector's
+`kv_connector_extra_config`:
+
+```json
+{"retire_mamba_checkpoints": true}
+```
+
+With `MultiConnector`, put this setting on its MooncakeStoreConnector child.
+It defaults to `false`; disabled connectors do no lineage RPCs and start no
+retirement thread. No Mooncake server change or rebuild is required; the client
+must provide the existing `put`, `batch_is_exist`, and `batch_remove` APIs.
+
+For a chain `C1 -> C2 -> C3`, keep C1 as the anchor and retire C2 after C3 is
+saved successfully by every worker rank. Continuing to C4 retires C3. This
+works across requests and prefill replicas: small lineage markers are stored
+in Mooncake under a separate model/layout-scoped namespace. Missing or evicted
+markers conservatively retain extra anchors. A completed request's final
+checkpoint remains subject to normal Mooncake eviction and TTL behavior.
+
+Only the intermediate checkpoint's Mamba objects are removed. Attention blocks
+and GPU cache entries are unchanged. Another branch needing the old checkpoint
+may have to recompute from an earlier prefix; this policy trades that reuse
+for capacity. A lookup racing deletion uses the existing failed-load fallback.
+
+Deletion is asynchronous and **never forced**: active Mooncake leases defer it.
+For example, `-default_kv_lease_ttl=180000` can delay retirement until the
+three-minute lease expires (longer if readers renew it). Bounded background
+retries do not renew those leases. Queue overflow, missing replacement shards,
+or metadata failures leave checkpoints to ordinary eviction. There are at most
+4096 queued commits and 4096 pending retirement candidates per prefill instance;
+lease retries process at most 128 candidates per second. Lineage markers use
+one-byte payloads and are themselves subject to normal store eviction.
+
+Existing `vllm:mooncake_store_operation_*` metrics expose operations
+`checkpoint_lineage_put`, `checkpoint_retire_exists`, and `checkpoint_retire`.
+Retirement key counts are attempts, not unique removed checkpoints; `deferred`
+status records outstanding keys for retry, while already-absent keys are
+idempotent successes. These operations do not transfer checkpoint payloads.
+
 ## Usage
 
 ### Single-Node KV Cache Offloading
@@ -326,6 +367,7 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 
 ### kv_connector_extra_config
 
+- `retire_mamba_checkpoints` (bool): Retire intermediate Mamba states after their replacements are saved by all ranks, keeping anchors and tips. Default: `false`. See [checkpoint retirement](#intermediate-mamba-checkpoint-retirement).
 - `external_cache_only` (bool): Disable local prefix reuse and evict idle GPU cache entries after Store/request/P2P references drain. Requires `kv_role="kv_both"` and lookup enabled. Store write failures are fatal in this mode. Default: `false`. See [external-only prefix caching](#external-only-prefix-caching-on-a-prefiller).
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread so it never blocks the scheduler step. The request is held until the in-flight lookup completes, then resumed on a later step. Default: `false`.

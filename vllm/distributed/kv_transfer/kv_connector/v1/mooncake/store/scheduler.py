@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     LoadSpec,
+    MambaCheckpointCommit,
     MooncakeStoreConnectorMetadata,
     MooncakeStoreWorkerMetadata,
     ReqMeta,
@@ -69,6 +70,13 @@ class MooncakeStoreScheduler:
             raise ValueError(
                 "external_cache_only requires kv_role='kv_both' and enable_lookup=true"
             )
+        self.retire_mamba_checkpoints = kvc_extra_config.get(
+            "retire_mamba_checkpoints", False
+        )
+        if not isinstance(self.retire_mamba_checkpoints, bool):
+            raise ValueError("retire_mamba_checkpoints must be a boolean")
+        self._checkpoint_jobs: dict[int, tuple[list[MambaCheckpointCommit], int]] = {}
+        self._ready_checkpoint_commits: list[MambaCheckpointCommit] = []
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
         # Skips lookup CPU cost on instances that never load KV from the store.
@@ -285,6 +293,13 @@ class MooncakeStoreScheduler:
                     else None
                 ),
                 prefill_end_tokens=len(prefill_tokens),
+                checkpoint_parent_tokens=(
+                    load_spec.kvpool_cached_tokens
+                    if load_spec is not None and load_spec.can_load
+                    else request.num_computed_tokens
+                )
+                if self.retire_mamba_checkpoints
+                else 0,
             )
             self._request_trackers[request.req_id] = request_tracker
 
@@ -337,6 +352,13 @@ class MooncakeStoreScheduler:
                             else None
                         ),
                         prefill_end_tokens=len(prefill_tokens),
+                        checkpoint_parent_tokens=(
+                            load_spec.kvpool_cached_tokens
+                            if load_spec is not None and load_spec.can_load
+                            else request_real.num_computed_tokens
+                        )
+                        if self.retire_mamba_checkpoints
+                        else 0,
                     )
                     self._request_trackers[req_id] = request_tracker
 
@@ -413,6 +435,11 @@ class MooncakeStoreScheduler:
                     token_len=num_tokens_to_compute,
                     allocated_block_ids=block_ids,
                     num_saved_tokens=0,
+                    checkpoint_parent_tokens=(
+                        load_spec.kvpool_cached_tokens
+                        if self.retire_mamba_checkpoints
+                        else 0
+                    ),
                 )
                 self._request_trackers[request_id] = request_tracker
                 req_meta = ReqMeta.from_request_tracker(
@@ -445,6 +472,9 @@ class MooncakeStoreScheduler:
         self._finished_partial_tail_metas.clear()
 
         self._reference_save_blocks(meta)
+        if self.retire_mamba_checkpoints:
+            meta.checkpoint_commits = self._ready_checkpoint_commits
+            self._ready_checkpoint_commits = []
         return meta
 
     def _apply_current_save_block_ids(
@@ -516,6 +546,7 @@ class MooncakeStoreScheduler:
                 continue
             self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
+            self._track_checkpoint_save(req_meta)
 
     def register_finished_partial_tail(
         self,
@@ -571,6 +602,9 @@ class MooncakeStoreScheduler:
             num_prompt_tokens=tracker.prefill_end_tokens,
             store_job_id=store_job_id,
             boundary_state_offloads=remapped_offloads,
+        )
+        self._track_checkpoint_save(
+            self._finished_partial_tail_metas[request.request_id]
         )
         tracker.has_pending_offload = True
         # The store job owns exact block refs, so request cleanup need not wait.
@@ -631,6 +665,41 @@ class MooncakeStoreScheduler:
                 )
             )
 
+    def _track_checkpoint_save(self, req_meta: ReqMeta) -> None:
+        if not self.retire_mamba_checkpoints or not req_meta.boundary_state_offloads:
+            return
+        tracker = self._request_trackers.get(req_meta.req_id)
+        if tracker is None:
+            return
+        groups_by_boundary: dict[int, set[int]] = {}
+        for group_id, _, boundary in req_meta.boundary_state_offloads:
+            groups_by_boundary.setdefault(boundary, set()).add(group_id)
+        parent = tracker.checkpoint_parent_tokens
+        hashes = req_meta.block_hashes
+        hash_size = self._hash_block_size
+        if parent % hash_size or parent // hash_size > len(hashes):
+            return
+        commits = []
+        for boundary, groups in sorted(groups_by_boundary.items()):
+            if (
+                boundary <= parent
+                or boundary % hash_size
+                or boundary // hash_size > len(hashes)
+                or groups != self._boundary_state_group_ids
+            ):
+                continue
+            commits.append(
+                MambaCheckpointCommit(
+                    bytes(hashes[parent // hash_size - 1]).hex() if parent else None,
+                    bytes(hashes[boundary // hash_size - 1]).hex(),
+                )
+            )
+            parent = boundary
+        if commits:
+            assert req_meta.store_job_id is not None
+            self._checkpoint_jobs[req_meta.store_job_id] = (commits, 0)
+            tracker.checkpoint_parent_tokens = parent
+
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Drop the block references of store jobs every rank has finished."""
         meta = connector_output.kv_connector_worker_meta
@@ -644,6 +713,11 @@ class MooncakeStoreScheduler:
                 # The job referenced no blocks, so nothing was recorded for it.
                 continue
             block_ids, remaining = pinned
+            checkpoint_job = self._checkpoint_jobs.get(store_job_id)
+            if checkpoint_job is not None:
+                commits, successful = checkpoint_job
+                successful += meta.successful_saves.get(store_job_id, 0)
+                self._checkpoint_jobs[store_job_id] = (commits, successful)
             remaining -= count
             if remaining > 0:
                 self._pinned_saves[store_job_id] = (block_ids, remaining)
@@ -652,6 +726,11 @@ class MooncakeStoreScheduler:
                 f"store job {store_job_id} reported by too many ranks"
             )
             del self._pinned_saves[store_job_id]
+            checkpoint_job = self._checkpoint_jobs.pop(store_job_id, None)
+            if checkpoint_job is not None:
+                commits, successful = checkpoint_job
+                if successful == self._num_workers:
+                    self._ready_checkpoint_commits.extend(commits)
             # Tail-first, as elsewhere, so the shared prefix is evicted last.
             pool.free_blocks(pool.blocks[bid] for bid in reversed(block_ids))
 
@@ -660,10 +739,10 @@ class MooncakeStoreScheduler:
 
         Completions only reach the scheduler as worker metadata on a step, so an
         engine that quiesced with jobs in flight would leave those references
-        held indefinitely. Nothing else keeps it alive now that a finishing
-        request no longer defers its own free.
+        held indefinitely. An acknowledged checkpoint also needs one final
+        step to dispatch its retirement metadata to the elected worker.
         """
-        return bool(self._pinned_saves)
+        return bool(self._pinned_saves or self._ready_checkpoint_commits)
 
     def reset_store(self) -> bool:
         """Trigger a global ``remove_all(force=True)`` on the Mooncake master.
@@ -684,6 +763,10 @@ class MooncakeStoreScheduler:
         try:
             ok = self.client.reset()
             if ok:
+                self._ready_checkpoint_commits.clear()
+                self._checkpoint_jobs.clear()
+                for tracker in self._request_trackers.values():
+                    tracker.checkpoint_parent_tokens = 0
                 logger.info("Mooncake store reset via remove_all succeeded.")
             else:
                 logger.warning("Mooncake store reset returned NACK from worker.")

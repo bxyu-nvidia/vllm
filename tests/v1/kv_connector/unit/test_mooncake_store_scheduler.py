@@ -41,6 +41,9 @@ def _make_bare_scheduler(
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = kv_role
     scheduler.external_cache_only = False
+    scheduler.retire_mamba_checkpoints = False
+    scheduler._checkpoint_jobs = {}
+    scheduler._ready_checkpoint_commits = []
     scheduler.save_decode_cache = save_decode_cache
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
@@ -1520,10 +1523,15 @@ def test_store_job_blocks_are_released_once_every_rank_reports():
 def test_worker_metadata_aggregates_completions_across_ranks():
     # The engine merges each rank's metadata before the scheduler sees it, so a
     # job that every rank finished in one step arrives as a single count.
-    merged = MooncakeStoreWorkerMetadata(completed_saves={1: 1}).aggregate(
-        MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
+    merged = MooncakeStoreWorkerMetadata(
+        completed_saves={1: 1}, successful_saves={1: 1}
+    ).aggregate(
+        MooncakeStoreWorkerMetadata(
+            completed_saves={1: 1, 2: 1}, successful_saves={2: 1}
+        )
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+    assert merged.successful_saves == {1: 1, 2: 1}
 
 
 @pytest.mark.parametrize("external_cache_only", [False, True])
@@ -1734,3 +1742,84 @@ def test_scheduler_checkpoint_hint_does_not_claim_a_cache_hit(
     assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
     assert request.shared_prefix_boundary == expected
     assert not scheduler.load_specs
+
+
+@pytest.mark.parametrize("failed_rank", [False, True])
+def test_checkpoint_retirement_waits_for_success_from_every_rank(failed_rank):
+    scheduler = _make_bare_scheduler()
+    scheduler.retire_mamba_checkpoints = True
+    scheduler._num_workers = 2
+    scheduler._request_trackers["req-0"] = RequestTracker(
+        "req-0",
+        48,
+        ([1, 2, 3],),
+        checkpoint_parent_tokens=16,
+    )
+    req = ReqMeta(
+        "req-0",
+        48,
+        ([1, 2, 3],),
+        [b"a", b"b", b"c"],
+        can_save=True,
+        boundary_state_offloads=[(1, 7, 32), (1, 8, 48)],
+    )
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    meta.add_request(req)
+    scheduler._reference_save_blocks(meta)
+    job = req.store_job_id
+    for index in range(2):
+        output = SimpleNamespace(
+            kv_connector_worker_meta=MooncakeStoreWorkerMetadata(
+                completed_saves={job: 1},
+                successful_saves={} if failed_rank and index == 1 else {job: 1},
+            )
+        )
+        scheduler.update_connector_output(output)
+        if index == 0:
+            assert not scheduler._ready_checkpoint_commits
+            assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 1
+    assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 0
+    commits = scheduler._ready_checkpoint_commits
+    if failed_rank:
+        assert commits == []
+        assert not scheduler.has_pending_push_work()
+    else:
+        assert [(c.parent_hash, c.checkpoint_hash) for c in commits] == [
+            (b"a".hex(), b"b".hex()),
+            (b"b".hex(), b"c".hex()),
+        ]
+        assert scheduler.has_pending_push_work()
+    assert not scheduler._checkpoint_jobs
+
+
+def test_checkpoint_retirement_skips_incomplete_groups_and_backward_boundaries():
+    scheduler = _make_bare_scheduler()
+    scheduler.retire_mamba_checkpoints = True
+    scheduler._boundary_state_group_ids = frozenset({1, 2})
+    tracker = RequestTracker("req-0", 48, (), checkpoint_parent_tokens=32)
+    scheduler._request_trackers["req-0"] = tracker
+    req = ReqMeta(
+        "req-0",
+        48,
+        (),
+        [b"a", b"b", b"c"],
+        can_save=True,
+        store_job_id=1,
+        boundary_state_offloads=[(1, 7, 16), (2, 8, 16), (1, 9, 48)],
+    )
+    scheduler._track_checkpoint_save(req)
+    assert scheduler._checkpoint_jobs == {}
+    assert tracker.checkpoint_parent_tokens == 32
+
+
+@pytest.mark.parametrize("remote_hit", [False, True])
+def test_checkpoint_retirement_captures_actual_resume_boundary(remote_hit):
+    scheduler = _make_bare_scheduler()
+    scheduler.retire_mamba_checkpoints = True
+    out = _make_new_scheduler_output()
+    out.request.num_computed_tokens = 16 if not remote_hit else 0
+    scheduler._unfinished_requests["req-0"] = (out.request, ([0, 1],))
+    if remote_hit:
+        scheduler.load_specs["req-0"] = LoadSpec(0, 16, True)
+    scheduler.build_connector_meta(out)
+    assert scheduler._request_trackers["req-0"].checkpoint_parent_tokens == 16
