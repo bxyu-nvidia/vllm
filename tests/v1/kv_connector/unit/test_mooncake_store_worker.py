@@ -5475,3 +5475,24 @@ def test_checkpoint_write_metrics_record_failed_keys(failure):
     assert mamba["status"] == ("error" if failure == "exception" else "partial_failure")
     assert attention["num_failed_keys"] == (3 if failure == "exception" else 0)
     assert attention["num_bytes"] == 768
+
+
+def test_inventory_layout_reports_expected_shards_without_store_reads(monkeypatch):
+    monkeypatch.setenv("VLLM_CACHE_INVENTORY_INTERVAL", "10")
+    worker = _make_bare_worker()
+    worker.load_pipeline = mooncake_store_worker.PipelineTracker("load", 0)
+    worker._lookup_key_prefixes = [
+        ("model@tp_rank:0@group:0", "model@tp_rank:1@group:0")
+    ]
+    first = worker.get_kv_connector_stats()
+    assert first is not None
+    assert first.data["_cache_layout"] == [
+        {"scope": "model", "prefix": "model@tp_rank:0@group:0", "kind": "attention"},
+        {"scope": "model", "prefix": "model@tp_rank:1@group:0", "kind": "attention"},
+    ]
+    first.aggregate(first)  # Several workers may advertise the same layout.
+    assert len(first.data["_cache_layout"]) == 2
+    assert not any("cache_layout" in key for key in first.reduce())
+    second = worker.get_kv_connector_stats()
+    assert "_cache_layout" not in second.data
+    worker.store.batch_is_exist.assert_not_called()

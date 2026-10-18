@@ -55,6 +55,14 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
         if other.is_empty():
             return self
         for operation, records in other.data.items():
+            if operation == "_cache_layout":
+                self.data[operation] = list(
+                    {
+                        s["prefix"]: s
+                        for s in [*self.data.get(operation, []), *records]
+                    }.values()
+                )
+                continue
             if operation == PIPELINE_KEY:
                 snapshots = {
                     (s["stage"], s["rank"]): s for s in self.data.get(PIPELINE_KEY, [])
@@ -80,6 +88,8 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
     def reduce(self) -> dict[str, int | float]:
         reduced: dict[str, int | float] = {}
         for operation, records in sorted(self.data.items()):
+            if operation == "_cache_layout":
+                continue
             if operation == PIPELINE_KEY:
                 for snapshot in records:
                     prefix = f"{snapshot['stage']}_rank{snapshot['rank']}"
@@ -148,6 +158,12 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         per_engine_labelvalues: dict[int, list[object]],
     ):
         super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        self._cache_layout = self._gauge_cls(
+            name="vllm:mooncake_cache_layout",
+            documentation="Store namespace layout for metadata inventory.",
+            labelnames=labelnames + ["scope", "prefix", "kind"],
+            multiprocess_mode="mostrecent",
+        )
         metric_labelnames = labelnames + ["operation", "status"]
         self._metric_cache: dict[tuple[int, str, str], dict[str, PromMetric]] = {}
         pipeline_labels = labelnames + ["stage", "rank"]
@@ -240,6 +256,15 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
         if not transfer_stats_data:
             return
         for operation, records in transfer_stats_data.items():
+            if operation == "_cache_layout":
+                for row in records:
+                    self._cache_layout.labels(
+                        *self.per_engine_labelvalues[engine_idx],
+                        row["scope"],
+                        row["prefix"],
+                        row["kind"],
+                    ).set(1)
+                continue
             if operation == PIPELINE_KEY:
                 for snapshot in records:
                     self._observe_pipeline(snapshot, engine_idx)

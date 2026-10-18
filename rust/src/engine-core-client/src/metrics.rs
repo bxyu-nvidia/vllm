@@ -12,7 +12,10 @@ use vllm_metrics::{
     U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
-use vllm_metrics::{DEFERRED_REASONS, MooncakePipelineHistogramFamily, MooncakePipelineLabels};
+use vllm_metrics::{
+    CacheInventoryLabels, DEFERRED_REASONS, MooncakeCacheLayoutLabels,
+    MooncakePipelineHistogramFamily, MooncakePipelineLabels,
+};
 
 use crate::protocol::stats::{
     KvConnectorStats, MooncakeStats, MultiConnectorStats, NixlStats, SchedulerStats,
@@ -89,6 +92,8 @@ struct SchedulerStatsHandles {
     mooncake_operation_bytes_total: MooncakeOperationCounterFamily,
     mooncake_operation_failed_keys_total: MooncakeOperationCounterFamily,
 
+    cache_inventory: Family<CacheInventoryLabels, F64Gauge>,
+    mooncake_cache_layout: Family<MooncakeCacheLayoutLabels, U64Gauge>,
     mooncake_pipeline_queued: Family<MooncakePipelineLabels, U64Gauge>,
     mooncake_pipeline_active: Family<MooncakePipelineLabels, U64Gauge>,
     mooncake_pipeline_oldest_pending_seconds: Family<MooncakePipelineLabels, F64Gauge>,
@@ -204,6 +209,8 @@ fn resolve_scheduler_stats_handles(
         mooncake_operation_keys_total: metrics.mooncake_operation_keys_total.clone(),
         mooncake_operation_bytes_total: metrics.mooncake_operation_bytes_total.clone(),
         mooncake_operation_failed_keys_total: metrics.mooncake_operation_failed_keys_total.clone(),
+        cache_inventory: metrics.cache_inventory.clone(),
+        mooncake_cache_layout: metrics.mooncake_cache_layout.clone(),
         mooncake_pipeline_queued: metrics.mooncake_pipeline_queued.clone(),
         mooncake_pipeline_active: metrics.mooncake_pipeline_active.clone(),
         mooncake_pipeline_oldest_pending_seconds: metrics
@@ -247,6 +254,21 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
             .set(stats.deferred_waiting_reasons.get(reason).copied().unwrap_or(0));
     }
     handles.kv_cache_usage.set(stats.kv_cache_usage);
+    if let Some(inventory) = &stats.cache_inventory {
+        for (key, value) in inventory {
+            if let Some((kind, measure)) = key.split_once('.') {
+                handles
+                    .cache_inventory
+                    .get_or_create(&CacheInventoryLabels {
+                        model_name: handles.labels.model_name.clone(),
+                        engine: handles.labels.engine,
+                        kind: kind.to_string(),
+                        measure: measure.to_string(),
+                    })
+                    .set(*value);
+            }
+        }
+    }
 
     // Prefix-cache counters, including the connector-backed external cache path.
     handles.prefix_cache_queries.inc_by(stats.prefix_cache_stats.base.queries);
@@ -343,6 +365,18 @@ fn record_multi_connector_stats(handles: &SchedulerStatsHandles, stats: &MultiCo
 }
 
 fn record_mooncake_stats(handles: &SchedulerStatsHandles, stats: &MooncakeStats) {
+    for row in &stats.cache_layout {
+        handles
+            .mooncake_cache_layout
+            .get_or_create(&MooncakeCacheLayoutLabels {
+                model_name: handles.labels.model_name.clone(),
+                engine: handles.labels.engine,
+                scope: row.scope.clone(),
+                prefix: row.prefix.clone(),
+                kind: row.kind.clone(),
+            })
+            .set(1);
+    }
     for snapshot in &stats.pipeline {
         let labels = MooncakePipelineLabels {
             model_name: handles.labels.model_name.clone(),
@@ -636,6 +670,7 @@ mod tests {
 
     fn mooncake_stats() -> MooncakeStats {
         MooncakeStats {
+            cache_layout: vec![],
             pipeline: vec![],
             operations: BTreeMap::from([(
                 MooncakeOperation::LoadGet,
@@ -725,5 +760,39 @@ mod tests {
                 "vllm:mooncake_store_operation_bytes_total{{model_name=\"model\",engine=\"0\",operation=\"{operation}\",status=\"ok\"}} {bytes}"
             )));
         }
+    }
+    #[test]
+    fn cache_inventory_and_expected_layout_export_and_clear() {
+        let metrics = Metrics::new();
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let connector: KvConnectorStats = serde_json::from_value(serde_json::json!({
+            "_cache_layout": [{"scope": "model", "prefix": "model@tp_rank:0@group:1", "kind": "mamba"}]
+        })).unwrap();
+        assert!(matches!(&connector, KvConnectorStats::Mooncake(_)));
+        super::record_scheduler_stats_with_handles(
+            &handles,
+            &SchedulerStats {
+                cache_inventory: Some(std::collections::BTreeMap::from([(
+                    "mamba.in_use_blocks".to_string(),
+                    12.0,
+                )])),
+                kv_connector_stats: Some(connector),
+                ..Default::default()
+            },
+        );
+        let rendered = metrics.render().unwrap();
+        assert!(rendered.contains("vllm:cache_inventory{model_name=\"model\",engine=\"0\",kind=\"mamba\",measure=\"in_use_blocks\"} 12"));
+        assert!(rendered.contains("vllm:mooncake_cache_layout{model_name=\"model\",engine=\"0\",scope=\"model\",prefix=\"model@tp_rank:0@group:1\",kind=\"mamba\"} 1"));
+        super::record_scheduler_stats_with_handles(
+            &handles,
+            &SchedulerStats {
+                cache_inventory: Some(std::collections::BTreeMap::from([(
+                    "mamba.in_use_blocks".to_string(),
+                    0.0,
+                )])),
+                ..Default::default()
+            },
+        );
+        assert!(metrics.render().unwrap().contains("vllm:cache_inventory{model_name=\"model\",engine=\"0\",kind=\"mamba\",measure=\"in_use_blocks\"} 0"));
     }
 }

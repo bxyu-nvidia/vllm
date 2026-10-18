@@ -478,6 +478,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         labelnames = ["model_name", "engine"]
+        self.gauge_cache_inventory = self._gauge_cls(
+            name="vllm:cache_inventory",
+            documentation=(
+                "Cache metadata inventory; measure suffix gives units. "
+                "Bytes are per-rank group payload bytes."
+            ),
+            labelnames=labelnames + ["kind", "measure"],
+            multiprocess_mode="mostrecent",
+        )
         model_name = vllm_config.model_config.served_model_name
         max_model_len = vllm_config.model_config.max_model_len
 
@@ -1076,6 +1085,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.deferred_waiting_reasons.get(reason, 0)
                 )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            for key, value in (scheduler_stats.cache_inventory or {}).items():
+                kind, measure = key.split(".", 1)
+                self.gauge_cache_inventory.labels(
+                    *self.per_engine_labelvalues[engine_idx], kind, measure
+                ).set(value)
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

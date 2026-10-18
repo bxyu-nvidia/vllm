@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -2907,8 +2908,19 @@ class Scheduler(SchedulerInterface):
             ec_connector_stats.data if ec_connector_stats else None
         )
         num_running, num_waiting = self.get_request_counts()
+        inventory = None
+        interval = envs.VLLM_CACHE_INVENTORY_INTERVAL
+        if interval > 0 and time.monotonic() >= getattr(
+            self, "_next_inventory_at", 0.0
+        ):
+            from vllm.v1.core.cache_inventory import collect_cache_inventory
+
+            inventory = collect_cache_inventory(self.kv_cache_manager)
+            self._next_inventory_at = time.monotonic() + max(interval, 10.0)
+            logger.info("GPU cache inventory: %s", inventory)
         num_deferred = len(self.deferred_waiting)
         return SchedulerStats(
+            cache_inventory=inventory,
             num_running_reqs=num_running,
             num_waiting_reqs=num_waiting - num_deferred,
             num_skipped_waiting_reqs=num_deferred,

@@ -127,6 +127,23 @@ pub struct MooncakePipelineLabels {
     pub rank: i32,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct CacheInventoryLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub kind: String,
+    pub measure: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct MooncakeCacheLayoutLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub scope: String,
+    pub prefix: String,
+    pub kind: String,
+}
+
 pub type MooncakePipelineHistogramFamily =
     Family<MooncakePipelineLabels, Histogram, fn() -> Histogram>;
 
@@ -292,6 +309,8 @@ pub struct SchedulerMetrics {
     pub mooncake_operation_bytes_total: MooncakeOperationCounterFamily,
     pub mooncake_operation_failed_keys_total: MooncakeOperationCounterFamily,
 
+    pub cache_inventory: Family<CacheInventoryLabels, F64Gauge>,
+    pub mooncake_cache_layout: Family<MooncakeCacheLayoutLabels, U64Gauge>,
     pub mooncake_pipeline_queued: Family<MooncakePipelineLabels, U64Gauge>,
     pub mooncake_pipeline_active: Family<MooncakePipelineLabels, U64Gauge>,
     pub mooncake_pipeline_oldest_pending_seconds: Family<MooncakePipelineLabels, F64Gauge>,
@@ -466,6 +485,14 @@ impl SchedulerMetrics {
             "Deferred requests by last observed scheduler dependency.",
             scheduler_deferred_by_reason.clone(),
         );
+        let cache_inventory = Family::default();
+        registry.register("vllm:cache_inventory", "Cache metadata inventory; measure suffix gives units. Bytes are per-rank group payload bytes.", cache_inventory.clone());
+        let mooncake_cache_layout = Family::default();
+        registry.register(
+            "vllm:mooncake_cache_layout",
+            "Store namespace layout for metadata inventory.",
+            mooncake_cache_layout.clone(),
+        );
         let mooncake_pipeline_queued = Family::default();
         registry.register(
             "vllm:mooncake_pipeline_queued",
@@ -625,6 +652,8 @@ impl SchedulerMetrics {
             kv_block_lifetime_seconds,
             kv_block_idle_before_evict_seconds,
             kv_block_reuse_gap_seconds,
+            cache_inventory,
+            mooncake_cache_layout,
             mooncake_pipeline_queued,
             mooncake_pipeline_active,
             mooncake_pipeline_oldest_pending_seconds,

@@ -197,6 +197,7 @@ class SchedulerStats:
     step_counter: int = 0
     current_wave: int = 0
 
+    cache_inventory: dict[str, float] | None = None
     kv_cache_usage: float = 0.0
     iteration_details: SchedulerIterationDetails | None = None
 

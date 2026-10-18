@@ -222,3 +222,71 @@ def test_kv_cache_metrics_collector_smoke() -> None:
     assert abs(event.idle_seconds - 1.0) < 1e-6
     # One reuse gap between the two accesses.
     assert event.reuse_gaps_seconds == (1.0,)
+
+
+def test_inventory_counts_physical_blocks_once_and_preserves_idle_cache():
+    """Two request refs and two hash aliases must not double-count GPU bytes."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.cache_inventory import collect_cache_inventory
+    from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    pool = BlockPool(8, True, 4)
+    attention, mamba, pinned = pool.get_new_blocks(3)
+    attention.ref_cnt += 1
+    h = make_block_hash_with_group_id(BlockHash(b"shared"), 0)
+    attention.set_block_hash(h)
+    pool.cached_block_hashes_by_block[attention.block_id] = {
+        h,
+        make_block_hash_with_group_id(BlockHash(b"alias"), 0),
+    }
+    mamba.set_block_hash(make_block_hash_with_group_id(BlockHash(b"shared"), 1))
+    groups = [
+        KVCacheGroupSpec(
+            ["attn"],
+            FullAttentionSpec(
+                block_size=4, num_kv_heads=1, head_size=2, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(block_size=4, shapes=((2, 2),), dtypes=(torch.float32,)),
+        ),
+    ]
+    manager = SimpleNamespace(
+        block_pool=pool,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=groups),
+        coordinator=SimpleNamespace(
+            single_type_managers=[
+                SimpleNamespace(req_to_blocks={"a": [attention], "b": [attention]}),
+                SimpleNamespace(req_to_blocks={"a": [mamba]}),
+            ]
+        ),
+    )
+    first = collect_cache_inventory(manager)
+    assert first["attention.in_use_blocks"] == 1
+    assert first["attention.in_use_bytes"] == groups[0].kv_cache_spec.page_size_bytes
+    assert first["attention.cached_blocks"] == 1
+    assert first["attention.distinct_prefixes"] == 2
+    assert first["mamba.in_use_blocks"] == 1
+    assert first["pool.active_requests"] == 2
+    assert first["pool.unattributed_in_use_blocks"] == 1
+    assert first["pool.unused_blocks"] == 4
+    assert pinned.ref_cnt == 1  # Sampling must not touch references.
+
+    manager.coordinator.single_type_managers[1].req_to_blocks.clear()
+    pool.free_blocks([mamba])
+    second = collect_cache_inventory(manager)
+    assert second["mamba.in_use_blocks"] == 0
+    assert second["mamba.idle_cached_blocks"] == 1
+    assert second["mamba.idle_cached_bytes"] == 16
+    assert second["mamba.distinct_prefixes"] == 1
+    assert second["pool.reclaimable_blocks"] == 5

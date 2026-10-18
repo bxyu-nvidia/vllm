@@ -7248,3 +7248,30 @@ def test_deferred_reasons_follow_lookup_then_remote_load_and_cleanup():
     scheduler.schedule()
     assert scheduler.make_stats().deferred_waiting_reasons == {}
     assert not scheduler._deferred_reasons
+
+
+def test_cache_inventory_opt_in_and_interval(monkeypatch):
+    import vllm.v1.core.cache_inventory as inventory_module
+    import vllm.v1.core.sched.scheduler as scheduler_module
+
+    scheduler = create_scheduler()
+    snapshot = {"attention.distinct_prefixes": 12.0}
+    collect = Mock(return_value=snapshot)
+    monkeypatch.setattr(inventory_module, "collect_cache_inventory", collect)
+    monkeypatch.setenv("VLLM_CACHE_INVENTORY_INTERVAL", "0")
+    assert scheduler.make_stats().cache_inventory is None
+    collect.assert_not_called()
+    monkeypatch.setenv("VLLM_CACHE_INVENTORY_INTERVAL", "10")
+    now = [100.0]
+    monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: now[0])
+    assert scheduler.make_stats().cache_inventory == snapshot
+    for _ in range(5):
+        assert scheduler.make_stats().cache_inventory is None
+    assert collect.call_count == 1
+    now[0] = 110.0
+    assert scheduler.make_stats().cache_inventory == snapshot
+    assert collect.call_count == 2
+    monkeypatch.setenv("VLLM_CACHE_INVENTORY_INTERVAL", "0")
+    now[0] = 200.0
+    assert scheduler.make_stats().cache_inventory is None
+    assert collect.call_count == 2

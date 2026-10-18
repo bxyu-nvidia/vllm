@@ -2324,6 +2324,26 @@ class MooncakeStoreWorker:
 
     def get_kv_connector_stats(self) -> MooncakeStoreConnectorStats | None:
         with self._kv_connector_stats_lock:
+            interval = envs.VLLM_CACHE_INVENTORY_INTERVAL
+            if (
+                interval > 0
+                and not self._capacity_only
+                and self.tp_rank == 0
+                and time.monotonic() >= getattr(self, "_next_layout_at", 0.0)
+            ):
+                self._next_layout_at = time.monotonic() + max(interval, 10.0)
+                self.kv_connector_stats.data["_cache_layout"] = [
+                    {
+                        "prefix": prefix,
+                        "scope": prefix.rsplit("@tp_rank:", 1)[0],
+                        "kind": "mamba"
+                        if gid in self.coord.mamba_group_ids
+                        else "attention",
+                    }
+                    for gid, prefixes in enumerate(self._lookup_key_prefixes)
+                    if self._kv_cache_groups[gid].kv_cache_spec.prefix_cacheable
+                    for prefix in prefixes
+                ]
             if not self._capacity_only:
                 self.kv_connector_stats.data[PIPELINE_KEY] = [
                     self.load_pipeline.snapshot()

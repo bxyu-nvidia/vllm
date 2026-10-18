@@ -246,8 +246,17 @@ pub mod kv_connector {
     pub struct MooncakeStats {
         #[serde(default, rename = "_pipeline")]
         pub pipeline: Vec<MooncakePipelineSnapshot>,
+        #[serde(default, rename = "_cache_layout")]
+        pub cache_layout: Vec<MooncakeCacheLayout>,
         #[serde(flatten)]
         pub operations: BTreeMap<MooncakeOperation, Vec<MooncakeRecord>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct MooncakeCacheLayout {
+        pub scope: String,
+        pub prefix: String,
+        pub kind: String,
     }
 
     /// Live pipeline gauges plus timing observations since the previous update.
@@ -317,6 +326,8 @@ pub struct SchedulerStats {
     pub current_wave: u64,
     /// KV-cache usage. `1.0` means 100% usage.
     pub kv_cache_usage: f64,
+    #[serde(default)]
+    pub cache_inventory: Option<std::collections::BTreeMap<String, f64>>,
     /// Local prefix cache statistics.
     pub prefix_cache_stats: PrefixCacheStats,
     /// External connector prefix cache statistics, when configured.

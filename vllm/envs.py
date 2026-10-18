@@ -305,6 +305,7 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
+    VLLM_CACHE_INVENTORY_INTERVAL: float = 0
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -610,6 +611,10 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Debug CPU metadata snapshots; zero disables, positive values use a 10s minimum.
+    "VLLM_CACHE_INVENTORY_INTERVAL": lambda: float(
+        os.getenv("VLLM_CACHE_INVENTORY_INTERVAL", "0")
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
