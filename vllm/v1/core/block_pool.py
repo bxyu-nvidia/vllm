@@ -903,6 +903,7 @@ class BlockPool:
         if self.trace is not None:
             for block in self.blocks:
                 self._remove_cached_block_hashes(block, trace_reason="cache_reset")
+            self.trace.clear_eviction_history()
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()

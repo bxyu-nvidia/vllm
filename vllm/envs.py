@@ -1789,7 +1789,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MAMBA_CACHE_TRACE": lambda: os.getenv("VLLM_MAMBA_CACHE_TRACE", "0").lower()
     in ("1", "true"),
     # Evict a reused GPU Mamba state after its first direct hash boundary
-    # completes. Active references remain pinned; Mooncake is unaffected.
+    # completes, unless that prefix/group has completed two direct uses in
+    # this engine since the last cache reset (even with the same child hash).
+    # Active references remain pinned; Mooncake is unaffected.
     "VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT": lambda: os.getenv(
         "VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT", "0"
     ).lower()

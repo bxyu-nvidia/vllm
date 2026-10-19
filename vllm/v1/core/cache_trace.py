@@ -6,7 +6,8 @@ Counts and downstream hashes cover one GPU residency/cache group, up to removal.
 Downstream hashes identify confirmed computed prefixes, not necessarily cached
 checkpoints. Direct children are the first completed hash boundary per resume.
 Only distinct counts are emitted. No token IDs, per-step events, or device reads
-are recorded.
+are recorded. The optional eviction policy protects prefixes after two completed
+direct uses, including identical children, until an explicit cache reset.
 """
 
 import json
@@ -65,6 +66,10 @@ class CacheTrace:
         self._emit_events = emit_events
         self._on_direct_descendant = on_direct_descendant
         self._sequence = 0
+        # Saturated use counts survive residency changes. Pending uses also
+        # survive hash removal: an already-admitted reader can finish later.
+        self._direct_use_counts: dict[tuple[int, str], int] = {}
+        self._pending_direct_uses: dict[str, dict[tuple[int, str], Checkpoint]] = {}
 
     def register(
         self,
@@ -99,6 +104,7 @@ class CacheTrace:
         for block in blocks:
             for entry in self.by_block.get(block.block_id, {}).values():
                 if entry.prefix_length == resume_position:
+                    self._track_direct_use(request_id, entry)
                     self.pending.setdefault(request_id, []).append(
                         (entry, resume_position)
                     )
@@ -113,13 +119,49 @@ class CacheTrace:
         for block in blocks:
             for entry in self.by_block.get(block.block_id, {}).values():
                 if entry.prefix_length == boundary:
+                    self._track_direct_use(request.request_id, entry)
                     entry.successful_load_count += 1
                     self.pending.setdefault(request.request_id, []).append(
                         (entry, boundary)
                     )
 
+    def _track_direct_use(self, request_id: str, entry: Checkpoint) -> None:
+        key = (entry.group_id, entry.prefix_hash)
+        if (
+            self._on_direct_descendant is not None
+            and self._direct_use_counts.get(key, 0) < 2
+        ):
+            self._pending_direct_uses.setdefault(request_id, {})[key] = entry
+
+    def _observe_direct_uses(self, request: "Request", completed: int) -> None:
+        uses = self._pending_direct_uses.pop(request.request_id, {})
+        waiting = {}
+        for key, entry in uses.items():
+            if self._direct_use_counts.get(key, 0) >= 2:
+                continue
+            child_index = entry.prefix_length // entry.hash_block_size
+            if (
+                completed >= entry.prefix_length + entry.hash_block_size
+                and child_index < len(request.block_hashes)
+            ):
+                self._direct_use_counts[key] = self._direct_use_counts.get(key, 0) + 1
+            else:
+                waiting[key] = entry
+        if waiting:
+            self._pending_direct_uses[request.request_id] = waiting
+
+    def _is_protected(self, entry: Checkpoint) -> bool:
+        return self._direct_use_counts.get((entry.group_id, entry.prefix_hash), 0) >= 2
+
+    def clear_eviction_history(self) -> None:
+        """Forget protection after a successful explicit prefix-cache reset."""
+        self._direct_use_counts.clear()
+        self._pending_direct_uses.clear()
+
     def progress(self, request: "Request") -> None:
         completed = max(0, request.num_computed_tokens - request.num_in_flight_tokens)
+        if self._on_direct_descendant is not None:
+            self._observe_direct_uses(request, completed)
         waiting = []
         for entry, position in self.pending.pop(request.request_id, []):
             if entry.removed:
@@ -142,22 +184,29 @@ class CacheTrace:
             # is a direct child; later boundaries are descendants.
             if start == entry.prefix_length // entry.hash_block_size and end > start:
                 entry.direct_hashes.add(request.block_hashes[start].hex())
-                if self._on_direct_descendant is not None:
+                if self._on_direct_descendant is not None and not self._is_protected(
+                    entry
+                ):
                     evict_block_ids.add(entry.block_id)
             entry.computed_hashes.update(
                 h.hex() for h in request.block_hashes[start:end]
             )
-            if entry.block_id not in evict_block_ids:
-                active.append((entry, max(position, end * entry.hash_block_size)))
-        if active:
-            self.active[request.request_id] = active
-        else:
-            self.active.pop(request.request_id, None)
+            active.append((entry, max(position, end * entry.hash_block_size)))
         # Eviction emits the final counters and may remove aliases of the same
         # state. Do it after completing this request's accounting.
         if self._on_direct_descendant is not None:
             for block_id in evict_block_ids:
-                self._on_direct_descendant(block_id)
+                # Block-level eviction removes every alias of the state.
+                if not any(
+                    self._is_protected(entry)
+                    for entry in self.by_block.get(block_id, {}).values()
+                ):
+                    self._on_direct_descendant(block_id)
+        active = [(entry, position) for entry, position in active if not entry.removed]
+        if active:
+            self.active[request.request_id] = active
+        else:
+            self.active.pop(request.request_id, None)
 
     def remove(self, block_id: int, keys: Iterable[bytes], reason: str) -> None:
         for key in keys:
@@ -204,6 +253,7 @@ class CacheTrace:
             self.by_block.setdefault(destination_id, {})[key] = entry
 
     def detach(self, request_id: str) -> None:
+        self._pending_direct_uses.pop(request_id, None)
         self.pending.pop(request_id, None)
         self.external.pop(request_id, None)
         self.active.pop(request_id, None)
