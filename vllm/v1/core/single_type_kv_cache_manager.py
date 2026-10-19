@@ -307,6 +307,10 @@ class SingleTypeKVCacheManager(ABC):
                 "Computed blocks should be empty when prefix caching is disabled"
             )
 
+        if self.block_pool.trace is not None:
+            self.block_pool.trace.adopt(
+                request_id, new_computed_blocks, num_local_computed_tokens
+            )
         # Skip blocks are padded with null blocks.
         req_blocks.extend([self._null_block] * num_skipped_blocks)
         # Add the remaining computed blocks.

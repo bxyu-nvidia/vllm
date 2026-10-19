@@ -195,6 +195,12 @@ class KVCacheManager:
                     manager.shared_prefix_checkpoint = True
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        if self.block_pool.trace is not None:
+            self.block_pool.trace.groups = {
+                i: list(group.layer_names)
+                for i, group in enumerate(kv_cache_config.kv_cache_groups)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+            }
         self.retained_hit_group_ids = tuple(
             manager.kv_cache_group_id
             for manager in self.coordinator.single_type_managers
@@ -578,6 +584,10 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
+        if self.block_pool.trace is not None and num_external_computed_tokens > 0:
+            self.block_pool.trace.expect_external(
+                request.request_id, total_computed_tokens
+            )
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
@@ -627,6 +637,8 @@ class KVCacheManager:
 
         """
         self.coordinator.free(request.request_id)
+        if self.block_pool.trace is not None:
+            self.block_pool.trace.detach(request.request_id)
 
     def remove_skipped_blocks(
         self,
