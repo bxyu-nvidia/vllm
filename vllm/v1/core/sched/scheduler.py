@@ -344,6 +344,18 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
         )
+        if self.kv_cache_manager.block_pool.trace is not None:
+            self.kv_cache_manager.block_pool.trace.context = {
+                "engine_id": vllm_config.instance_id,
+                "model_namespace": vllm_config.model_config.model,
+                "model_revision": vllm_config.model_config.revision,
+                "dp_rank": self.parallel_config.data_parallel_rank,
+                "tp_size": self.parallel_config.tensor_parallel_size,
+                "pp_size": self.parallel_config.pipeline_parallel_size,
+                "worker_ranks": list(range(self.parallel_config.world_size)),
+                "rank_scope": "scheduler_logical_blocks_shared_by_workers",
+                "medium": "GPU",
+            }
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
             1 + self.num_spec_tokens + self.num_lookahead_tokens
@@ -1586,6 +1598,8 @@ class Scheduler(SchedulerInterface):
         )
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
+        if self.kv_cache_manager.block_pool.trace is not None:
+            self.kv_cache_manager.block_pool.trace.detach(request.request_id)
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -2069,6 +2083,12 @@ class Scheduler(SchedulerInterface):
                     num_scheduled_tokens,
                 )
             )
+        if (
+            failed_kv_load_req_ids
+            and self.kv_cache_manager.block_pool.trace is not None
+        ):
+            for req_id in failed_kv_load_req_ids:
+                self.kv_cache_manager.block_pool.trace.detach(req_id)
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
         # to avoid expensive operations inside the loop.
@@ -2195,6 +2215,21 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_ERROR
                 request.resumable = False
                 stopped = True
+
+            trace = self.kv_cache_manager.block_pool.trace
+            if trace is not None and not output_is_stale:
+                if request.request_id in trace.external:
+                    trace.loaded(
+                        request,
+                        (
+                            b
+                            for group in self.kv_cache_manager.get_blocks(
+                                request.request_id
+                            ).blocks
+                            for b in group
+                        ),
+                    )
+                trace.progress(request)
 
             routed_experts = None
             should_emit_output = bool(
@@ -2741,6 +2776,8 @@ class Scheduler(SchedulerInterface):
         if not delay_free_blocks:
             self._free_blocks(request)
 
+        if self.kv_cache_manager.block_pool.trace is not None:
+            self.kv_cache_manager.block_pool.trace.finish(request)
         return kv_xfer_params, ec_xfer_params
 
     def _free_blocks(self, request: Request):
@@ -3150,11 +3187,27 @@ class Scheduler(SchedulerInterface):
                 # reallocated, so the skipped blocks need no handling.)
                 self.kv_cache_manager.free(request)
 
+            if self.kv_cache_manager.block_pool.trace is not None:
+                self.kv_cache_manager.block_pool.trace.external.pop(
+                    request.request_id, None
+                )
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+
+        if not load_failed and self.kv_cache_manager.block_pool.trace is not None:
+            self.kv_cache_manager.block_pool.trace.loaded(
+                request,
+                (
+                    b
+                    for group in self.kv_cache_manager.get_blocks(
+                        request.request_id
+                    ).blocks
+                    for b in group
+                ),
+            )
 
         # DSV41 SWA bounded replay recomputes the tail of a hit loaded without
         # its window, or of a failed load, which may have lost it; the replay

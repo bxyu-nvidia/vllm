@@ -71,6 +71,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_socket
 from vllm.utils.torch_utils import is_non_overlapping_and_dense
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.cache_trace import worker_trace
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     maybe_convert_block_hash,
@@ -694,6 +695,42 @@ class KVCacheStoreSendingThread(KVTransferThread):
             )
             return False
 
+        trace = worker_trace()
+        if trace is not None:
+            boundaries = {
+                (g, req_meta.block_hashes[n // self.coord.hash_block_size - 1].hex()): (
+                    b,
+                    n,
+                )
+                for g, b, n in req_meta.boundary_puts or []
+                if n > 0
+                and n // self.coord.hash_block_size <= len(req_meta.block_hashes)
+            }
+            for key, result, index in zip(keys, res, missing):
+                metadata = puts[index][3]
+                if metadata.group_id not in self.coord.mamba_group_ids:
+                    continue
+                h = key.rsplit("@", 1)[-1]
+                block_id, boundary = boundaries[(metadata.group_id, h)]
+                trace.emit(
+                    "mooncake_put",
+                    object_key=key,
+                    prefix_hash=h,
+                    group_id=metadata.group_id,
+                    model_namespace=metadata.model_name + metadata.store_namespace,
+                    cache_prefix=metadata.cache_prefix,
+                    tp_rank=metadata.tp_rank,
+                    pp_rank=metadata.pp_rank,
+                    pcp_rank=metadata.pcp_rank,
+                    dcp_rank=metadata.dcp_rank,
+                    block_id=block_id,
+                    prefix_length=boundary,
+                    request_id=req_meta.req_id,
+                    store_job_id=req_meta.store_job_id,
+                    success=result >= 0,
+                    result=result,
+                    replica_reference={"object_key": key},
+                )
         failed = [i for i, value in enumerate(res) if value < 0]
         self._record_operation(
             "save_put",
@@ -1143,6 +1180,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         size_list: list[list[int]] = []
         key_list: list[str] = []
         block_id_list: list[int] = []
+        trace = worker_trace()
+        trace_keys: dict[str, tuple[int, int]] = {}
         for g_idx, db in enumerate(self.token_databases):
             if not self.group_participates[g_idx]:
                 continue
@@ -1164,6 +1203,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     ]
                 for store_shard_id in db.store_layout.local_shard_ids:
                     key_list.append(db.store_layout.key_for(store_shard_id, block_hash))
+                    if trace is not None:
+                        trace_keys[key_list[-1]] = (g_idx, boundary_tokens or end)
                     chunks.append((start, end))
                     store_shard_ids.append(store_shard_id)
             g_addrs, g_sizes, g_block_ids = db.store_layout.prepare_values(
@@ -1261,6 +1302,32 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 res = self.store.batch_get_into_multi_buffers(
                     batch_keys, batch_addrs, batch_sizes
                 )
+                if trace is not None:
+                    for key, result, block_id in zip(batch_keys, res, batch_block_ids):
+                        group_id, boundary = trace_keys[key]
+                        if group_id not in self.coord.mamba_group_ids:
+                            continue
+                        metadata = self.token_databases[group_id].metadata
+                        trace.emit(
+                            "mooncake_load",
+                            object_key=key,
+                            prefix_hash=key.rsplit("@", 1)[-1],
+                            group_id=group_id,
+                            prefix_length=boundary,
+                            model_namespace=metadata.model_name
+                            + metadata.store_namespace,
+                            cache_prefix=metadata.cache_prefix,
+                            tp_rank=self.tp_rank,
+                            pp_rank=metadata.pp_rank,
+                            pcp_rank=metadata.pcp_rank,
+                            dcp_rank=metadata.dcp_rank,
+                            block_id=block_id,
+                            request_id=req_id,
+                            success=result >= 0,
+                            result=result,
+                            successful_load_count=int(result >= 0),
+                            replica_reference={"object_key": key},
+                        )
                 if tiers_by_key is not None:
                     _log_mooncake_load_tier_summary(
                         req_id, batch_keys, res, tiers_by_key
@@ -1376,6 +1443,11 @@ class MooncakeStoreWorker:
         parallel_config = vllm_config.parallel_config
 
         self.dp_rank = parallel_config.data_parallel_index
+        trace = worker_trace()
+        if trace is not None:
+            trace.context.update(
+                engine_id=vllm_config.instance_id, dp_rank=self.dp_rank
+            )
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_size = parallel_config.pipeline_parallel_size
@@ -1385,6 +1457,14 @@ class MooncakeStoreWorker:
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         self.dcp_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
+        if trace is not None:
+            trace.context.update(
+                worker_rank=parallel_config.rank,
+                tp_rank=self.tp_rank,
+                pp_rank=self.pp_rank,
+                pcp_rank=self.pcp_rank,
+                dcp_rank=self.dcp_rank,
+            )
 
         assert vllm_config.kv_transfer_config is not None
         kv_role = vllm_config.kv_transfer_config.kv_role
@@ -1412,6 +1492,8 @@ class MooncakeStoreWorker:
 
         # Initialize MooncakeDistributedStore with its own TransferEngine
         store_config = MooncakeStoreConfig.load_from_config()
+        if trace is not None:
+            trace.context["tenant_id"] = store_config.tenant_id
         # Validate and create the custom memory pool before initializing the
         # store so failures cannot leak a partially initialized store handle.
         self._mem_pool = self._create_mem_pool(extra_config, model_config)
@@ -1745,6 +1827,23 @@ class MooncakeStoreWorker:
             assert isinstance(v, torch.Tensor | list)
             return v if isinstance(v, torch.Tensor) else v[0]
 
+        trace = worker_trace()
+        if trace is not None:
+            trace.context["devices"] = sorted(
+                {str(_repr_tensor(cache).device) for cache in kv_caches.values()}
+            )
+            trace.emit(
+                "gpu_cache_layout",
+                groups=[
+                    {
+                        "group_id": i,
+                        "layers": list(group.layer_names),
+                        "block_size": group.kv_cache_spec.block_size,
+                    }
+                    for i, group in enumerate(self._kv_cache_groups)
+                    if i in self.coord.mamba_group_ids
+                ],
+            )
         assert self.cache_config.num_gpu_blocks is not None
         self.num_blocks = self.cache_config.num_gpu_blocks
         use_group_regions = self._kv_cache_config.hisparse_host_num_blocks is not None
@@ -2170,6 +2269,18 @@ class MooncakeStoreWorker:
             logger.error("Remote connection failed in lookup: %s", e)
             return MooncakeLookupResult(0)
 
+        trace = worker_trace()
+        if trace is not None:
+            for key, result in zip(candidate_keys, res):
+                if result == 1 and any(
+                    f"@group:{g}@" in key for g in self.coord.mamba_group_ids
+                ):
+                    trace.emit(
+                        "mooncake_lookup_hit",
+                        object_key=key,
+                        prefix_hash=key.rsplit("@", 1)[-1],
+                        lookup_hit_count=1,
+                    )
         # A (group, hash) is "present" only when every namespace that will be
         # loaded has it (per-group count: sharded groups need every rank's
         # shard, replicated groups one namespace per unique KV head).

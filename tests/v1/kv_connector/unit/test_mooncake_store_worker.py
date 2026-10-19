@@ -5192,3 +5192,48 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+@pytest.mark.parametrize("result", [256, -1])
+def test_trace_boundary_put_uses_handoff_identity(monkeypatch, result):
+    from vllm.v1.core.cache_trace import CacheTrace
+
+    records: list[dict[str, object]] = []
+    trace = CacheTrace(sink=records.append)
+    monkeypatch.setattr(worker, "worker_trace", lambda: trace)
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    store.batch_put_from_multi_buffers.side_effect = lambda keys, *args: [result] * len(
+        keys
+    )
+    thread = _make_partial_tail_send_thread(store)
+    request = _resolve_partial_tail(thread, _make_partial_tail_req([1, 2, 3]))
+    thread._maybe_offload_boundary_states(request)
+    assert len(records) == 1
+    event = records[0]
+    assert event["event"] == "mooncake_put"
+    assert event["prefix_hash"] == b"a2".hex()
+    assert event["prefix_length"] == 12
+    assert event["group_id"] == 1
+    assert event["block_id"] == 7
+    assert event["request_id"] == "req-a"
+    assert event["success"] is (result >= 0)
+    # Trace collection must not renew a storage lease by looking up replicas.
+    store.batch_get_replica_desc.assert_not_called()
+
+
+def test_trace_load_counts_successes_separately_from_failures(monkeypatch):
+    from vllm.v1.core.cache_trace import CacheTrace
+
+    records: list[dict[str, object]] = []
+    monkeypatch.setattr(worker, "worker_trace", lambda: CacheTrace(sink=records.append))
+    monkeypatch.delenv("VLLM_MOONCAKE_STORE_TIER_LOG", raising=False)
+    store = MagicMock()
+    store.batch_get_into_multi_buffers.return_value = [256, -1]
+    thread = _make_store_recving_thread(store)
+    thread.coord.mamba_group_ids = {0}
+    thread._handle_request(_make_load_req("consumer", [b"a0", b"a1"], token_len=32))
+    assert [r["successful_load_count"] for r in records] == [1, 0]
+    assert [r["success"] for r in records] == [True, False]
+    assert all(r["request_id"] == "consumer" for r in records)
+    store.batch_get_replica_desc.assert_not_called()

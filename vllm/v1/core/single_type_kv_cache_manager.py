@@ -307,6 +307,10 @@ class SingleTypeKVCacheManager(ABC):
                 "Computed blocks should be empty when prefix caching is disabled"
             )
 
+        if self.block_pool.trace is not None:
+            self.block_pool.trace.adopt(
+                request_id, new_computed_blocks, num_local_computed_tokens
+            )
         # Skip blocks are padded with null blocks.
         req_blocks.extend([self._null_block] * num_skipped_blocks)
         # Add the remaining computed blocks.
@@ -574,6 +578,8 @@ class SingleTypeKVCacheManager(ABC):
         """
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
+        if self.block_pool.trace is not None:
+            self.block_pool.trace.release(request_id, req_blocks, retired=False)
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
         return req_blocks
@@ -1621,6 +1627,8 @@ class MambaManager(SingleTypeKVCacheManager):
             blocks[i] = self._null_block
         if freed:
             self.block_pool.free_blocks(freed)
+        if self.block_pool.trace is not None:
+            self.block_pool.trace.release(request_id, freed, retired=True)
         self._num_retired_blocks[request_id] = last_block
 
     def remove_skipped_blocks(
@@ -1651,6 +1659,10 @@ class MambaManager(SingleTypeKVCacheManager):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
+                    if self.block_pool.trace is not None:
+                        self.block_pool.trace.release(
+                            request_id, [blocks[last_state_block_idx]], retired=True
+                        )
                     blocks[last_state_block_idx] = self._null_block
 
     def _needs_internal_checkpoint(

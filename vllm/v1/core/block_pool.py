@@ -12,6 +12,7 @@ from vllm.distributed.kv_events import (
 )
 from vllm.logger import init_logger
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.v1.core.cache_trace import CacheTrace, trace_enabled
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -190,6 +191,7 @@ class BlockPool:
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
+        self.trace = CacheTrace() if trace_enabled() else None
         self.metrics_collector = metrics_collector
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
@@ -221,6 +223,11 @@ class BlockPool:
             if not block:
                 return None
             cached_blocks.append(block)
+        if self.trace is not None:
+            for group_id, block in zip(kv_cache_group_ids, cached_blocks):
+                self.trace.lookup(
+                    block.block_id, make_block_hash_with_group_id(block_hash, group_id)
+                )
         return cached_blocks
 
     def cache_full_blocks(
@@ -297,6 +304,15 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            if self.trace is not None:
+                self.trace.register(
+                    blk,
+                    block_hash_with_group_id,
+                    kv_cache_group_id,
+                    num_hash_tokens,
+                    request,
+                    self.hash_block_size,
+                )
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -521,6 +537,15 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+        if self.trace is not None:
+            self.trace.register(
+                block,
+                block_hash_with_group_id,
+                kv_cache_group_id,
+                num_tokens,
+                request,
+                self.hash_block_size,
+            )
         if self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens
@@ -590,6 +615,8 @@ class BlockPool:
     def _remove_cached_block_hashes(
         self,
         block: KVCacheBlock,
+        *,
+        trace_reason: str | None = "hash_replaced",
     ) -> list[BlockHashWithGroupId]:
         block_hashes: list[BlockHashWithGroupId] = []
         if block.block_hash is not None:
@@ -605,6 +632,8 @@ class BlockPool:
                 is not None
             ):
                 removed_hashes.append(block_hash)
+        if self.trace is not None and trace_reason is not None:
+            self.trace.remove(block.block_id, removed_hashes, trace_reason)
         block.reset_hash()
         return removed_hashes
 
@@ -659,7 +688,11 @@ class BlockPool:
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
         num_tokens = src_block.block_hash_num_tokens
-        for block_hash in self._remove_cached_block_hashes(src_block):
+        if self.trace is not None:
+            self.trace.move(src_block.block_id, dst_block.block_id)
+        for block_hash in self._remove_cached_block_hashes(
+            src_block, trace_reason=None
+        ):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
 
@@ -697,6 +730,9 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        if self.trace is not None:
+            for block in ret:
+                self.trace.allocate(block.block_id)
         return ret
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
@@ -724,6 +760,8 @@ class BlockPool:
             self._reuse_watchers[block.block_id] = on_reuse
             if block.ref_cnt == 0:
                 released.append(block)
+                if self.trace is not None:
+                    self.trace.eligible(block.block_id)
         self.free_block_queue.append_n(released)
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -741,7 +779,7 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
-        evicted_hashes = self._remove_cached_block_hashes(block)
+        evicted_hashes = self._remove_cached_block_hashes(block, trace_reason="evicted")
         if not evicted_hashes:
             # The block doesn't have hash, eviction is not needed
             return False
@@ -790,6 +828,8 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
+                if self.trace is not None:
+                    self.trace.eligible(block.block_id)
                 if block.block_hash is None or not self.enable_caching:
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
@@ -843,6 +883,9 @@ class BlockPool:
             )
             return False
 
+        if self.trace is not None:
+            for block in self.blocks:
+                self._remove_cached_block_hashes(block, trace_reason="cache_reset")
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
