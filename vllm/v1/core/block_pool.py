@@ -3,6 +3,7 @@
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
+import vllm.envs as envs
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -191,7 +192,18 @@ class BlockPool:
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
 
-        self.trace = CacheTrace() if trace_enabled() else None
+        emit_trace = trace_enabled()
+        evict_on_direct = envs.VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT
+        self.trace = (
+            CacheTrace(
+                emit_events=emit_trace,
+                on_direct_descendant=self._evict_used_mamba_state
+                if evict_on_direct
+                else None,
+            )
+            if emit_trace or evict_on_direct
+            else None
+        )
         self.metrics_collector = metrics_collector
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
@@ -840,6 +852,15 @@ class BlockPool:
         for pool, blocks in other_pools.items():
             pool.free_blocks(blocks)
 
+    def _evict_used_mamba_state(self, block_id: int) -> None:
+        # Remove lookup aliases immediately, but never release request/transfer
+        # references. Their normal completion paths still own those releases.
+        self.evict_blocks({block_id})
+        block = self.blocks[block_id]
+        if block.ref_cnt == 0:
+            self.free_block_queue.remove(block)
+            self.free_block_queue.prepend_n([block])
+
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
 
@@ -882,6 +903,7 @@ class BlockPool:
         if self.trace is not None:
             for block in self.blocks:
                 self._remove_cached_block_hashes(block, trace_reason="cache_reset")
+            self.trace.clear_eviction_history()
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()

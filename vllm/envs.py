@@ -241,6 +241,7 @@ if TYPE_CHECKING:
     VLLM_EC_SIDE_CHANNEL_PORT: int = 5601
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MAMBA_CACHE_TRACE: bool = False
+    VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT: bool = False
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
@@ -1784,8 +1785,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOONCAKE_BOOTSTRAP_PORT": lambda: int(
         os.getenv("VLLM_MOONCAKE_BOOTSTRAP_PORT", "8998")
     ),
-    # Opt-in checkpoint provenance; includes request token IDs in JSON logs.
+    # Opt-in Mamba hash-removal summaries.
     "VLLM_MAMBA_CACHE_TRACE": lambda: os.getenv("VLLM_MAMBA_CACHE_TRACE", "0").lower()
+    in ("1", "true"),
+    # Evict a reused GPU Mamba state after its first direct hash boundary
+    # completes, unless that prefix/group has completed two direct uses in
+    # this engine since the last cache reset (even with the same child hash).
+    # Active references remain pinned; Mooncake is unaffected.
+    "VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT": lambda: os.getenv(
+        "VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT", "0"
+    ).lower()
     in ("1", "true"),
     # Log per-batch memory/disk tier breakdown on external GETs.
     "VLLM_MOONCAKE_STORE_TIER_LOG": lambda: (
