@@ -54,7 +54,6 @@ def test_only_removal_emits_with_distinct_usage_counts_and_computed_hashes(trace
         trace.progress(consumer)
         expected.add(consumer.block_hashes[2].hex())
         trace.finish(consumer)
-    trace.release("producer", [block], retired=True)
     pool.free_blocks([block])
     assert records == []
     pool.evict_blocks({block.block_id})
@@ -65,6 +64,13 @@ def test_only_removal_emits_with_distinct_usage_counts_and_computed_hashes(trace
     assert record["event"] == "hash_removed"
     assert not {
         "engine_id",
+        "instance_id",
+        "created_ns",
+        "retired_ns",
+        "removed_ns",
+        "lifetime_ns",
+        "time_to_retirement_ns",
+        "computed_hashes",
         "model_namespace",
         "model_revision",
         "dp_rank",
@@ -80,28 +86,10 @@ def test_only_removal_emits_with_distinct_usage_counts_and_computed_hashes(trace
     assert record["lookup_hit_count"] == 3
     assert record["checkpoint_resume_count"] == 2
     assert record["successful_load_count"] == 0
-    assert set(record["computed_hashes"]) == expected
+    assert record["computed_hash_count_direct"] == len(expected)
+    assert record["computed_hash_count_descendants"] == len(expected)
     assert record["prefix_hash"] == producer.block_hashes[1].hex()
     assert not trace.entries
-
-
-def test_retirement_and_removal_use_first_retirement_and_monotonic_time(
-    traced_pool, monkeypatch
-):
-    from vllm.v1.core import cache_trace
-
-    pool, trace, records = traced_pool
-    clock = [100]
-    monkeypatch.setattr(cache_trace.time, "monotonic_ns", lambda: clock[0])
-    _, block, _ = register(pool)
-    clock[0] = 130
-    trace.release("producer", [block], retired=True)
-    clock[0] = 150
-    trace.release("producer", [block], retired=True)
-    clock[0] = 200
-    pool.evict_blocks({block.block_id})
-    assert records[0]["lifetime_ns"] == 100
-    assert records[0]["time_to_retirement_ns"] == 30
 
 
 def test_moves_preserve_counts_and_duplicate_residencies_are_independent(traced_pool):
@@ -135,10 +123,11 @@ def test_external_load_is_not_a_resume_and_detach_cancels_pending_use(traced_poo
     pool.evict_blocks({block.block_id})
     assert records[0]["successful_load_count"] == 1
     assert records[0]["checkpoint_resume_count"] == 0
-    assert records[0]["computed_hashes"] == []
+    assert records[0]["computed_hash_count_direct"] == 0
+    assert records[0]["computed_hash_count_descendants"] == 0
 
 
-def test_unfinished_checkpoint_has_unknown_lifetime_and_reset_emits_once_per_alias(
+def test_reset_emits_once_per_alias(
     traced_pool,
 ):
     pool, trace, records = traced_pool
@@ -148,10 +137,8 @@ def test_unfinished_checkpoint_has_unknown_lifetime_and_reset_emits_once_per_ali
     pool.free_blocks([block])
     assert pool.reset_prefix_cache()
     assert len(records) == 2
-    unfinished = next(r for r in records if r["prefix_length"] == 2)
-    assert unfinished["created_ns"] is None
-    assert unfinished["lifetime_ns"] is None
-    assert unfinished["time_to_retirement_ns"] is None
+    assert {record["prefix_length"] for record in records} == {2, 4}
+    assert all(record["computed_hash_count_descendants"] == 0 for record in records)
 
 
 def test_report_filters_and_deduplicates_removal_summaries(traced_pool, tmp_path):
@@ -179,3 +166,56 @@ def test_report_rejects_truncated_records(tmp_path):
 def test_tracing_is_disabled_by_default(monkeypatch):
     monkeypatch.delenv("VLLM_MAMBA_CACHE_TRACE", raising=False)
     assert BlockPool(2, True, 2).trace is None
+
+
+def test_direct_children_deduplicate_branches_and_wait_for_completed_boundaries(
+    traced_pool,
+):
+    pool, trace, records = traced_pool
+    _, block, _ = register(pool)
+    for request_id, tail in [
+        ("a", [7, 8, 9, 10]),
+        ("b", [7, 8, 11, 12]),
+        ("c", [13, 14, 15, 16]),
+    ]:
+        consumer = make_request(request_id, [1, 2, 3, 4, *tail], 2, sha256)
+        trace.adopt(request_id, [block], 4)
+        consumer.num_computed_tokens = 5
+        trace.progress(consumer)  # Resumed, but no complete child hash yet.
+        entry = next(iter(trace.by_block[block.block_id].values()))
+        if request_id == "a":
+            assert not entry.direct_hashes
+            assert not entry.computed_hashes
+        consumer.num_computed_tokens = 8
+        consumer.num_in_flight_tokens = 2
+        trace.progress(consumer)
+        if request_id == "a":
+            assert entry.direct_hashes == {consumer.block_hashes[2].hex()}
+            assert entry.computed_hashes == entry.direct_hashes
+        consumer.num_in_flight_tokens = 0
+        trace.progress(consumer)
+        trace.progress(consumer)  # Reobserving progress must not add counts.
+        trace.finish(consumer)
+    pool.evict_blocks({block.block_id})
+    assert records[0]["checkpoint_resume_count"] == 3
+    assert records[0]["computed_hash_count_direct"] == 2
+    assert records[0]["computed_hash_count_descendants"] == 5
+
+
+def test_report_keeps_distinct_records_with_same_process_local_sequence(tmp_path):
+    from tools.mamba_cache_trace import report
+
+    path = tmp_path / "trace.log"
+    records = [
+        {
+            "event": "hash_removed",
+            "prefix_hash": "abcd",
+            "sequence": 1,
+            "block_id": block_id,
+        }
+        for block_id in [1, 2]
+    ]
+    path.write_text(
+        "".join("MAMBA_CACHE_TRACE " + json.dumps(record) + "\n" for record in records)
+    )
+    assert report([path, path], "abcd")["removals"] == records

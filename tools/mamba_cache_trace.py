@@ -23,7 +23,12 @@ MARKER = "MAMBA_CACHE_TRACE "
 
 def read_events(paths: list[Path]) -> Iterator[dict[str, object]]:
     seen = set()
+    seen_paths = set()
     for path in paths:
+        resolved = path.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
         with path.open(errors="replace") as stream:
             for line_number, line in enumerate(stream, 1):
                 if MARKER not in line:
@@ -34,8 +39,9 @@ def read_events(paths: list[Path]) -> Iterator[dict[str, object]]:
                     raise ValueError(
                         f"Truncated/invalid trace at {path}:{line_number}"
                     ) from error
-                identity = (event["instance_id"], event.get("sequence"))
-                if identity[1] is not None:
+                identity = (event.get("instance_id"), event.get("sequence"))
+                # New records have no globally unique event identity.
+                if identity[0] is not None and identity[1] is not None:
                     if identity in seen:
                         continue
                     seen.add(identity)

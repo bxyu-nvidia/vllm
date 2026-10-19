@@ -4,14 +4,13 @@
 
 Counts and downstream hashes cover one GPU residency/cache group, up to removal.
 Downstream hashes identify confirmed computed prefixes, not necessarily cached
-checkpoints. No token IDs, per-step events, or device reads are recorded.
+checkpoints. Direct children are the first completed hash boundary per resume.
+Only distinct counts are emitted. No token IDs, per-step events, or device reads
+are recorded.
 """
 
 import json
 import os
-import socket
-import time
-import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -37,15 +36,12 @@ class Checkpoint:
     hash_block_size: int
     block_id: int
     generation: int
-    created_ns: int | None = None
-    created_monotonic_ns: int | None = None
-    retired_ns: int | None = None
-    retired_monotonic_ns: int | None = None
     removed: bool = False
     lookup_hit_count: int = 0
     successful_load_count: int = 0
     checkpoint_resume_count: int = 0
     computed_hashes: set[str] = field(default_factory=set)
+    direct_hashes: set[str] = field(default_factory=set)
 
 
 class CacheTrace:
@@ -54,12 +50,10 @@ class CacheTrace:
     def __init__(
         self, *, sink: Callable[[dict[str, object]], None] | None = None
     ) -> None:
-        self.instance_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
         self.groups: dict[int, list[str]] = {}
         self.generations: dict[int, int] = {}
         self.entries: dict[tuple[int, bytes], Checkpoint] = {}
         self.by_block: dict[int, dict[bytes, Checkpoint]] = {}
-        self.unconfirmed: dict[str, list[Checkpoint]] = {}
         self.pending: dict[str, list[tuple[Checkpoint, int]]] = {}
         self.active: dict[str, list[tuple[Checkpoint, int]]] = {}
         self.external: dict[str, int] = {}
@@ -87,17 +81,6 @@ class CacheTrace:
         )
         self.entries[block.block_id, key] = entry
         self.by_block.setdefault(block.block_id, {})[key] = entry
-        if num_tokens > self.external.get(request.request_id, 0):
-            if num_tokens <= request.num_computed_tokens - request.num_in_flight_tokens:
-                self._created(entry)
-            else:
-                self.unconfirmed.setdefault(request.request_id, []).append(entry)
-
-    @staticmethod
-    def _created(entry: Checkpoint) -> None:
-        if entry.created_ns is None:
-            entry.created_ns = time.time_ns()
-            entry.created_monotonic_ns = time.monotonic_ns()
 
     def lookup(self, block_id: int, key: bytes) -> None:
         entry = self.entries.get((block_id, key))
@@ -125,23 +108,12 @@ class CacheTrace:
             for entry in self.by_block.get(block.block_id, {}).values():
                 if entry.prefix_length == boundary:
                     entry.successful_load_count += 1
-                    self._created(entry)
                     self.pending.setdefault(request.request_id, []).append(
                         (entry, boundary)
                     )
 
     def progress(self, request: "Request") -> None:
         completed = max(0, request.num_computed_tokens - request.num_in_flight_tokens)
-        unconfirmed = []
-        for entry in self.unconfirmed.pop(request.request_id, []):
-            if entry.removed:
-                continue
-            if entry.prefix_length <= completed:
-                self._created(entry)
-            else:
-                unconfirmed.append(entry)
-        if unconfirmed:
-            self.unconfirmed[request.request_id] = unconfirmed
         waiting = []
         for entry, position in self.pending.pop(request.request_id, []):
             if entry.removed:
@@ -159,6 +131,10 @@ class CacheTrace:
                 continue
             end = min(completed // entry.hash_block_size, len(request.block_hashes))
             start = position // entry.hash_block_size
+            # Only the first completed hash boundary after the adopted state
+            # is a direct child; later boundaries are descendants.
+            if start == entry.prefix_length // entry.hash_block_size and end > start:
+                entry.direct_hashes.add(request.block_hashes[start].hex())
             entry.computed_hashes.update(
                 h.hex() for h in request.block_hashes[start:end]
             )
@@ -167,17 +143,6 @@ class CacheTrace:
             self.active[request.request_id] = active
         else:
             self.active.pop(request.request_id, None)
-
-    def release(
-        self, request_id: str, blocks: Iterable["KVCacheBlock"], *, retired: bool
-    ) -> None:
-        if not retired:
-            return
-        for block_id in {block.block_id for block in blocks if not block.is_null}:
-            for entry in self.by_block.get(block_id, {}).values():
-                if entry.retired_ns is None:
-                    entry.retired_ns = time.time_ns()
-                    entry.retired_monotonic_ns = time.monotonic_ns()
 
     def remove(self, block_id: int, keys: Iterable[bytes], reason: str) -> None:
         for key in keys:
@@ -189,11 +154,8 @@ class CacheTrace:
                 del self.by_block[block_id]
             entry.removed = True
             self._sequence += 1
-            now = time.monotonic_ns()
-            birth = entry.created_monotonic_ns
             record = {
                 "event": "hash_removed",
-                "instance_id": self.instance_id,
                 "sequence": self._sequence,
                 "prefix_hash": entry.prefix_hash,
                 "group_id": entry.group_id,
@@ -203,16 +165,8 @@ class CacheTrace:
                 "lookup_hit_count": entry.lookup_hit_count,
                 "successful_load_count": entry.successful_load_count,
                 "checkpoint_resume_count": entry.checkpoint_resume_count,
-                "created_ns": entry.created_ns,
-                "retired_ns": entry.retired_ns,
-                "removed_ns": time.time_ns(),
-                "lifetime_ns": None if birth is None else now - birth,
-                "time_to_retirement_ns": (
-                    None
-                    if birth is None or entry.retired_monotonic_ns is None
-                    else max(0, entry.retired_monotonic_ns - birth)
-                ),
-                "computed_hashes": sorted(entry.computed_hashes),
+                "computed_hash_count_direct": len(entry.direct_hashes),
+                "computed_hash_count_descendants": len(entry.computed_hashes),
             }
             if self._sink is not None:
                 self._sink(record)
@@ -221,6 +175,7 @@ class CacheTrace:
                     "MAMBA_CACHE_TRACE %s", json.dumps(record, separators=(",", ":"))
                 )
             entry.computed_hashes.clear()
+            entry.direct_hashes.clear()
 
     def allocate(self, block_id: int) -> None:
         self.generations[block_id] = self.generations.get(block_id, 0) + 1
@@ -236,7 +191,6 @@ class CacheTrace:
     def detach(self, request_id: str) -> None:
         self.pending.pop(request_id, None)
         self.external.pop(request_id, None)
-        self.unconfirmed.pop(request_id, None)
         self.active.pop(request_id, None)
 
     def finish(self, request: "Request") -> None:
