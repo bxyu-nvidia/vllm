@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in Mamba checkpoint provenance. No tensor reads or device synchronization.
+"""Keep Mamba accounting in memory; emit one JSON summary on hash removal.
 
-Records are JSON after the ``MAMBA_CACHE_TRACE `` log marker. Timestamps are
-observer timestamps, not kernel timestamps. Counts belong to a residency, not
-to every copy of a hash in the cluster. Request token records are append-only
-and referenced by (instance_id, request_id, token range).
+Counts and downstream hashes cover one GPU residency/cache group, up to removal.
+Downstream hashes identify confirmed computed prefixes, not necessarily cached
+checkpoints. No token IDs, per-step events, or device reads are recorded.
 """
 
+import json
 import os
 import socket
-import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -32,33 +31,25 @@ def trace_enabled() -> bool:
 
 @dataclass
 class Checkpoint:
-    residency_id: str
     prefix_hash: str
-    cache_hash: str
     group_id: int
-    layers: list[str]
     prefix_length: int
+    hash_block_size: int
     block_id: int
     generation: int
-    producer_request_id: str | None
-    origin: str
-    registered_ns: int
-    registered_monotonic_ns: int
-    checkpoint_created_ns: int | None = None
-    request_released_ns: int | None = None
+    created_ns: int | None = None
+    created_monotonic_ns: int | None = None
     retired_ns: int | None = None
-    eviction_eligible_ns: int | None = None
-    hash_removed_ns: int | None = None
-    storage_reclaimed_ns: int | None = None
+    retired_monotonic_ns: int | None = None
+    removed: bool = False
     lookup_hit_count: int = 0
     successful_load_count: int = 0
     checkpoint_resume_count: int = 0
-    consumers: list[dict[str, object]] = field(default_factory=list)
-    consumers_truncated: bool = False
+    computed_hashes: set[str] = field(default_factory=set)
 
 
 class CacheTrace:
-    """Scheduler-owned checkpoint histories, bounded by slots and live requests."""
+    """Observe scheduler completions silently until a cached hash is removed."""
 
     def __init__(
         self, *, sink: Callable[[dict[str, object]], None] | None = None
@@ -71,66 +62,11 @@ class CacheTrace:
         self.entries: dict[tuple[int, bytes], Checkpoint] = {}
         self.by_block: dict[int, dict[bytes, Checkpoint]] = {}
         self.unconfirmed: dict[str, list[Checkpoint]] = {}
-        self.removed: dict[int, list[Checkpoint]] = {}
         self.pending: dict[str, list[tuple[Checkpoint, int]]] = {}
-        self.active: dict[str, list[tuple[Checkpoint, dict[str, object]]]] = {}
+        self.active: dict[str, list[tuple[Checkpoint, int]]] = {}
         self.external: dict[str, int] = {}
-        self.token_offsets: dict[str, int] = {}
         self._sink = sink
         self._sequence = 0
-        self._lock = threading.Lock()
-
-    def emit(self, event: str, **fields: object) -> None:
-        with self._lock:
-            self._sequence += 1
-            sequence = self._sequence
-        record = {
-            "schema_version": 1,
-            "event": event,
-            "instance_id": self.instance_id,
-            "run_id": self.run_id,
-            "sequence": sequence,
-            "timestamp_ns": time.time_ns(),
-            "monotonic_ns": time.monotonic_ns(),
-            **self.context,
-            **fields,
-        }
-        if self._sink is not None:
-            self._sink(record)
-        else:
-            import json
-
-            logger.info(
-                "MAMBA_CACHE_TRACE %s", json.dumps(record, separators=(",", ":"))
-            )
-
-    def summary(self, event: str, entry: Checkpoint, **fields: object) -> None:
-        self.emit(
-            event,
-            **asdict(entry),
-            observed_lifetime_ns=time.monotonic_ns() - entry.registered_monotonic_ns,
-            token_reference={
-                "instance_id": self.instance_id,
-                "request_id": entry.producer_request_id,
-                "start": 0,
-                "end": entry.prefix_length,
-            },
-            **fields,
-        )
-
-    def tokens(self, request: "Request") -> None:
-        offset = self.token_offsets.get(request.request_id, 0)
-        end = len(request.all_token_ids)
-        if end > offset:
-            self.emit(
-                "request_tokens",
-                request_id=request.request_id,
-                start=offset,
-                end=end,
-                prompt_length=request.num_prompt_tokens,
-                token_ids=list(request.all_token_ids[offset:end]),
-            )
-            self.token_offsets[request.request_id] = end
 
     def register(
         self,
@@ -143,35 +79,27 @@ class CacheTrace:
     ) -> None:
         if group_id not in self.groups or (block.block_id, key) in self.entries:
             return
-        self.tokens(request)
-        external = num_tokens <= self.external.get(request.request_id, 0)
         entry = Checkpoint(
-            residency_id=uuid.uuid4().hex,
             prefix_hash=request.block_hashes[num_tokens // hash_block_size - 1].hex(),
-            cache_hash=key[:-4].hex(),
             group_id=group_id,
-            layers=self.groups[group_id],
             prefix_length=num_tokens,
+            hash_block_size=hash_block_size,
             block_id=block.block_id,
             generation=self.generations.get(block.block_id, 0),
-            producer_request_id=None if external else request.request_id,
-            origin="external" if external else "computed",
-            registered_ns=time.time_ns(),
-            registered_monotonic_ns=time.monotonic_ns(),
         )
-        if not external and (
-            num_tokens <= request.num_computed_tokens - request.num_in_flight_tokens
-        ):
-            entry.checkpoint_created_ns = time.time_ns()
         self.entries[block.block_id, key] = entry
         self.by_block.setdefault(block.block_id, {})[key] = entry
-        if entry.checkpoint_created_ns is None and not external:
-            self.unconfirmed.setdefault(request.request_id, []).append(entry)
-        elif entry.checkpoint_created_ns is not None:
-            self._reclaim_removed(block.block_id, "checkpoint_overwritten")
-        self.summary(
-            "checkpoint_registered", entry, adopting_request_id=request.request_id
-        )
+        if num_tokens > self.external.get(request.request_id, 0):
+            if num_tokens <= request.num_computed_tokens - request.num_in_flight_tokens:
+                self._created(entry)
+            else:
+                self.unconfirmed.setdefault(request.request_id, []).append(entry)
+
+    @staticmethod
+    def _created(entry: Checkpoint) -> None:
+        if entry.created_ns is None:
+            entry.created_ns = time.time_ns()
+            entry.created_monotonic_ns = time.monotonic_ns()
 
     def lookup(self, block_id: int, key: bytes) -> None:
         entry = self.entries.get((block_id, key))
@@ -199,101 +127,110 @@ class CacheTrace:
             for entry in self.by_block.get(block.block_id, {}).values():
                 if entry.prefix_length == boundary:
                     entry.successful_load_count += 1
-                    entry.checkpoint_created_ns = time.time_ns()
-                    self._reclaim_removed(block.block_id, "checkpoint_loaded_overwrite")
+                    self._created(entry)
                     self.pending.setdefault(request.request_id, []).append(
                         (entry, boundary)
                     )
-                    self.summary(
-                        "checkpoint_loaded", entry, request_id=request.request_id
-                    )
 
     def progress(self, request: "Request") -> None:
-        self.tokens(request)
         completed = max(0, request.num_computed_tokens - request.num_in_flight_tokens)
         unconfirmed = []
         for entry in self.unconfirmed.pop(request.request_id, []):
-            if entry.hash_removed_ns is not None:
+            if entry.removed:
                 continue
             if entry.prefix_length <= completed:
-                entry.checkpoint_created_ns = time.time_ns()
-                self._reclaim_removed(entry.block_id, "checkpoint_overwritten")
-                self.summary("checkpoint_created", entry)
+                self._created(entry)
             else:
                 unconfirmed.append(entry)
         if unconfirmed:
             self.unconfirmed[request.request_id] = unconfirmed
         waiting = []
         for entry, position in self.pending.pop(request.request_id, []):
+            if entry.removed:
+                continue
             if completed <= position:
                 waiting.append((entry, position))
                 continue
             entry.checkpoint_resume_count += 1
-            consumer: dict[str, object] = {
-                "request_id": request.request_id,
-                "resume_position": position,
-                "computed_start": position,
-                "computed_end": completed,
-                "resumed_ns": time.time_ns(),
-            }
-            if len(entry.consumers) < 32:
-                entry.consumers.append(consumer)
-            else:
-                entry.consumers_truncated = True
-            self.active.setdefault(request.request_id, []).append((entry, consumer))
-            self.summary("checkpoint_resumed", entry, consumer=consumer)
+            self.active.setdefault(request.request_id, []).append((entry, position))
         if waiting:
             self.pending[request.request_id] = waiting
-        for entry, consumer in self.active.get(request.request_id, []):
-            consumer["computed_end"] = completed
-            self.emit(
-                "checkpoint_compute",
-                residency_id=entry.residency_id,
-                prefix_hash=entry.prefix_hash,
-                group_id=entry.group_id,
-                **consumer,
+        active = []
+        for entry, position in self.active.get(request.request_id, []):
+            if entry.removed:
+                continue
+            end = min(completed // entry.hash_block_size, len(request.block_hashes))
+            start = position // entry.hash_block_size
+            entry.computed_hashes.update(
+                h.hex() for h in request.block_hashes[start:end]
             )
+            active.append((entry, max(position, end * entry.hash_block_size)))
+        if active:
+            self.active[request.request_id] = active
+        else:
+            self.active.pop(request.request_id, None)
 
     def release(
         self, request_id: str, blocks: Iterable["KVCacheBlock"], *, retired: bool
     ) -> None:
-        ids = {block.block_id for block in blocks if not block.is_null}
-        now = time.time_ns()
-        for block_id in ids:
+        if not retired:
+            return
+        for block_id in {block.block_id for block in blocks if not block.is_null}:
             for entry in self.by_block.get(block_id, {}).values():
-                entry.request_released_ns = now
-                if retired:
-                    entry.retired_ns = now
-                self.summary(
-                    "checkpoint_retired" if retired else "request_released",
-                    entry,
-                    request_id=request_id,
-                )
-
-    def eligible(self, block_id: int) -> None:
-        for entry in self.by_block.get(block_id, {}).values():
-            entry.eviction_eligible_ns = time.time_ns()
-            self.summary("eviction_eligible", entry)
+                if entry.retired_ns is None:
+                    entry.retired_ns = time.time_ns()
+                    entry.retired_monotonic_ns = time.monotonic_ns()
 
     def remove(self, block_id: int, keys: Iterable[bytes], reason: str) -> None:
         for key in keys:
             entry = self.entries.pop((block_id, key), None)
-            if entry is not None:
-                del self.by_block[block_id][key]
-                if not self.by_block[block_id]:
-                    del self.by_block[block_id]
-                entry.hash_removed_ns = time.time_ns()
-                self.removed.setdefault(block_id, []).append(entry)
-                self.summary("hash_removed", entry, reason=reason)
+            if entry is None:
+                continue
+            del self.by_block[block_id][key]
+            if not self.by_block[block_id]:
+                del self.by_block[block_id]
+            entry.removed = True
+            self._sequence += 1
+            now = time.monotonic_ns()
+            birth = entry.created_monotonic_ns
+            record = {
+                **self.context,
+                "schema_version": 2,
+                "event": "hash_removed",
+                "medium": "GPU",
+                "instance_id": self.instance_id,
+                "run_id": self.run_id,
+                "sequence": self._sequence,
+                "prefix_hash": entry.prefix_hash,
+                "group_id": entry.group_id,
+                "prefix_length": entry.prefix_length,
+                "block_id": entry.block_id,
+                "generation": entry.generation,
+                "reason": reason,
+                "lookup_hit_count": entry.lookup_hit_count,
+                "successful_load_count": entry.successful_load_count,
+                "checkpoint_resume_count": entry.checkpoint_resume_count,
+                "created_ns": entry.created_ns,
+                "retired_ns": entry.retired_ns,
+                "removed_ns": time.time_ns(),
+                "lifetime_ns": None if birth is None else now - birth,
+                "time_to_retirement_ns": (
+                    None
+                    if birth is None or entry.retired_monotonic_ns is None
+                    else max(0, entry.retired_monotonic_ns - birth)
+                ),
+                "computed_hashes": sorted(entry.computed_hashes),
+            }
+            if self._sink is not None:
+                self._sink(record)
+            else:
+                logger.info(
+                    "MAMBA_CACHE_TRACE %s", json.dumps(record, separators=(",", ":"))
+                )
+            entry.computed_hashes.clear()
 
     def allocate(self, block_id: int) -> None:
-        self._reclaim_removed(block_id, "slot_reallocated")
         self.generations[block_id] = self.generations.get(block_id, 0) + 1
-
-    def _reclaim_removed(self, block_id: int, reason: str) -> None:
-        for entry in self.removed.pop(block_id, []):
-            entry.storage_reclaimed_ns = time.time_ns()
-            self.summary("storage_reclaimed", entry, reason=reason)
 
     def move(self, source_id: int, destination_id: int) -> None:
         for key, entry in self.by_block.pop(source_id, {}).items():
@@ -302,38 +239,12 @@ class CacheTrace:
             entry.generation = self.generations.get(destination_id, 0)
             self.entries[destination_id, key] = entry
             self.by_block.setdefault(destination_id, {})[key] = entry
-            self.summary(
-                "checkpoint_move_scheduled", entry, previous_block_id=source_id
-            )
 
     def detach(self, request_id: str) -> None:
         self.pending.pop(request_id, None)
         self.external.pop(request_id, None)
         self.unconfirmed.pop(request_id, None)
-        for entry, consumer in self.active.pop(request_id, []):
-            self.emit("consumer_detached", residency_id=entry.residency_id, **consumer)
+        self.active.pop(request_id, None)
 
     def finish(self, request: "Request") -> None:
-        self.tokens(request)
-        self.emit(
-            "request_finished",
-            request_id=request.request_id,
-            status=request.status.name,
-            prompt_length=request.num_prompt_tokens,
-            token_count=len(request.all_token_ids),
-        )
         self.detach(request.request_id)
-        self.token_offsets.pop(request.request_id, None)
-
-
-_worker_trace: CacheTrace | None = None
-
-
-def worker_trace() -> CacheTrace | None:
-    """Return a process-local event writer for connector transfer facts."""
-    global _worker_trace
-    if not trace_enabled():
-        return None
-    if _worker_trace is None:
-        _worker_trace = CacheTrace()
-    return _worker_trace
