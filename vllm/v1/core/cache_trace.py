@@ -55,8 +55,6 @@ class CacheTrace:
         self, *, sink: Callable[[dict[str, object]], None] | None = None
     ) -> None:
         self.instance_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
-        self.run_id = os.getenv("VLLM_MAMBA_CACHE_TRACE_RUN_ID")
-        self.context: dict[str, object] = {}
         self.groups: dict[int, list[str]] = {}
         self.generations: dict[int, int] = {}
         self.entries: dict[tuple[int, bytes], Checkpoint] = {}
@@ -194,19 +192,14 @@ class CacheTrace:
             now = time.monotonic_ns()
             birth = entry.created_monotonic_ns
             record = {
-                **self.context,
-                "schema_version": 2,
                 "event": "hash_removed",
-                "medium": "GPU",
                 "instance_id": self.instance_id,
-                "run_id": self.run_id,
                 "sequence": self._sequence,
                 "prefix_hash": entry.prefix_hash,
                 "group_id": entry.group_id,
                 "prefix_length": entry.prefix_length,
                 "block_id": entry.block_id,
                 "generation": entry.generation,
-                "reason": reason,
                 "lookup_hit_count": entry.lookup_hit_count,
                 "successful_load_count": entry.successful_load_count,
                 "checkpoint_resume_count": entry.checkpoint_resume_count,

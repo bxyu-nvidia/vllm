@@ -241,7 +241,6 @@ if TYPE_CHECKING:
     VLLM_EC_SIDE_CHANNEL_PORT: int = 5601
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
     VLLM_MAMBA_CACHE_TRACE: bool = False
-    VLLM_MAMBA_CACHE_TRACE_RUN_ID: str = ""
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
     VLLM_MOONCAKE_LOAD_RECV_THREADS: int = 1
     VLLM_MOONCAKE_DISK_STAGING_USABLE_RATIO: float = 0.9
@@ -1788,9 +1787,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in checkpoint provenance; includes request token IDs in JSON logs.
     "VLLM_MAMBA_CACHE_TRACE": lambda: os.getenv("VLLM_MAMBA_CACHE_TRACE", "0").lower()
     in ("1", "true"),
-    "VLLM_MAMBA_CACHE_TRACE_RUN_ID": lambda: os.getenv(
-        "VLLM_MAMBA_CACHE_TRACE_RUN_ID", ""
-    ),
     # Log per-batch memory/disk tier breakdown on external GETs.
     "VLLM_MOONCAKE_STORE_TIER_LOG": lambda: (
         os.getenv("VLLM_MOONCAKE_STORE_TIER_LOG", "False").lower() in ("true", "1")

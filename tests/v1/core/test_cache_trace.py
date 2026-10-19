@@ -63,6 +63,20 @@ def test_only_removal_emits_with_distinct_usage_counts_and_computed_hashes(trace
     assert len(records) == 1
     record = records[0]
     assert record["event"] == "hash_removed"
+    assert not {
+        "engine_id",
+        "model_namespace",
+        "model_revision",
+        "dp_rank",
+        "tp_size",
+        "pp_size",
+        "worker_ranks",
+        "rank_scope",
+        "medium",
+        "schema_version",
+        "run_id",
+        "reason",
+    }.intersection(record)
     assert record["lookup_hit_count"] == 3
     assert record["checkpoint_resume_count"] == 2
     assert record["successful_load_count"] == 0
@@ -134,7 +148,6 @@ def test_unfinished_checkpoint_has_unknown_lifetime_and_reset_emits_once_per_ali
     pool.free_blocks([block])
     assert pool.reset_prefix_cache()
     assert len(records) == 2
-    assert {r["reason"] for r in records} == {"cache_reset"}
     unfinished = next(r for r in records if r["prefix_length"] == 2)
     assert unfinished["created_ns"] is None
     assert unfinished["lifetime_ns"] is None

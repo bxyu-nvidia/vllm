@@ -344,18 +344,6 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
         )
-        if self.kv_cache_manager.block_pool.trace is not None:
-            self.kv_cache_manager.block_pool.trace.context = {
-                "engine_id": vllm_config.instance_id,
-                "model_namespace": vllm_config.model_config.model,
-                "model_revision": vllm_config.model_config.revision,
-                "dp_rank": self.parallel_config.data_parallel_rank,
-                "tp_size": self.parallel_config.tensor_parallel_size,
-                "pp_size": self.parallel_config.pipeline_parallel_size,
-                "worker_ranks": list(range(self.parallel_config.world_size)),
-                "rank_scope": "scheduler_logical_blocks_shared_by_workers",
-                "medium": "GPU",
-            }
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
             1 + self.num_spec_tokens + self.num_lookahead_tokens

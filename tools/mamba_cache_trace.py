@@ -21,7 +21,7 @@ from pathlib import Path
 MARKER = "MAMBA_CACHE_TRACE "
 
 
-def read_events(paths: list[Path], run_id: str | None) -> Iterator[dict[str, object]]:
+def read_events(paths: list[Path]) -> Iterator[dict[str, object]]:
     seen = set()
     for path in paths:
         with path.open(errors="replace") as stream:
@@ -34,8 +34,6 @@ def read_events(paths: list[Path], run_id: str | None) -> Iterator[dict[str, obj
                     raise ValueError(
                         f"Truncated/invalid trace at {path}:{line_number}"
                     ) from error
-                if run_id is not None and event.get("run_id") != run_id:
-                    continue
                 identity = (event["instance_id"], event.get("sequence"))
                 if identity[1] is not None:
                     if identity in seen:
@@ -44,16 +42,13 @@ def read_events(paths: list[Path], run_id: str | None) -> Iterator[dict[str, obj
                 yield event
 
 
-def report(
-    paths: list[Path], prefix_hash: str, run_id: str | None = None
-) -> dict[str, object]:
+def report(paths: list[Path], prefix_hash: str) -> dict[str, object]:
     """Return matching removal summaries without merging distinct residencies."""
     return {
         "prefix_hash": prefix_hash,
-        "run_id": run_id,
         "removals": [
             event
-            for event in read_events(paths, run_id)
+            for event in read_events(paths)
             if event.get("event") == "hash_removed"
             and (
                 event.get("prefix_hash") == prefix_hash
@@ -66,11 +61,10 @@ def report(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hash", required=True, help="Full prefix hash in hex")
-    parser.add_argument("--run-id")
     parser.add_argument("logs", nargs="+", type=Path)
     args = parser.parse_args()
     try:
-        result = report(args.logs, args.hash.lower(), args.run_id)
+        result = report(args.logs, args.hash.lower())
     except (ValueError, OSError) as error:
         parser.error(str(error))
     json.dump(result, sys.stdout, indent=2)
