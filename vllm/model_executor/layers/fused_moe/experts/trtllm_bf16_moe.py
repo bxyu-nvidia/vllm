@@ -206,7 +206,7 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
 
         topk_ids = topk_ids.to(dtype=torch.int32)
 
-        result = flashinfer.fused_moe.trtllm_bf16_routed_moe(
+        flashinfer.fused_moe.trtllm_bf16_routed_moe(
             topk_ids=(topk_ids, topk_weights),
             hidden_states=hidden_states,
             gemm1_weights=view_as_block_major_k(w1),
@@ -224,9 +224,8 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
             weight_layout=WeightLayout.BlockMajorK,
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
+            output=output,
         )
-        # FlashInfer's BF16 routed wrapper does not expose an output= argument.
-        output.copy_(result[0] if isinstance(result, list) else result)
 
 
 class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonolithic):
