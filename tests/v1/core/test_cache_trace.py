@@ -18,6 +18,7 @@ pytestmark = pytest.mark.cpu_test
 @pytest.fixture
 def traced_pool(monkeypatch):
     monkeypatch.setenv("VLLM_MAMBA_CACHE_TRACE", "1")
+    monkeypatch.delenv("VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT", raising=False)
     init_none_hash(sha256)
     records: list[dict[str, object]] = []
     pool = BlockPool(4, True, 2)
@@ -219,3 +220,103 @@ def test_report_keeps_distinct_records_with_same_process_local_sequence(tmp_path
         "".join("MAMBA_CACHE_TRACE " + json.dumps(record) + "\n" for record in records)
     )
     assert report([path, path], "abcd")["removals"] == records
+
+
+@pytest.mark.parametrize("emit_trace", [False, True])
+def test_post_use_eviction_waits_for_direct_completion_and_preserves_readers(
+    monkeypatch, emit_trace
+):
+    from unittest.mock import Mock
+
+    from vllm.v1.core import cache_trace
+
+    monkeypatch.setenv("VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT", "1")
+    monkeypatch.setenv("VLLM_MAMBA_CACHE_TRACE", "1" if emit_trace else "0")
+    log = Mock()
+    monkeypatch.setattr(cache_trace.logger, "info", log)
+    init_none_hash(sha256)
+    pool = BlockPool(8, True, 2)
+    trace = pool.trace
+    assert trace is not None
+    trace.groups = {0: ["mamba"]}
+    producer, block, _ = register(pool)
+    consumer = make_request("consumer", [1, 2, 3, 4, 7, 8, 9, 10], 2, sha256)
+    pool.touch([block, block])  # Producer plus two active readers.
+    trace.adopt("consumer", [block], 4)
+    trace.adopt("other_reader", [block], 4)
+    free_before = pool.get_num_free_blocks()
+
+    consumer.num_computed_tokens = 8
+    consumer.num_in_flight_tokens = 4
+    trace.progress(consumer)
+    assert pool.get_cached_block(producer.block_hashes[1], [0]) == [block]
+    consumer.num_in_flight_tokens = 3  # Resumed, incomplete direct hash.
+    trace.progress(consumer)
+    assert pool.get_cached_block(producer.block_hashes[1], [0]) == [block]
+    consumer.num_in_flight_tokens = 2  # First direct hash is now complete.
+    trace.progress(consumer)
+    assert pool.get_cached_block(producer.block_hashes[1], [0]) is None
+    assert block.ref_cnt == 3
+    assert pool.get_num_free_blocks() == free_before
+    assert not trace.entries
+    assert log.call_count == int(emit_trace)
+    if emit_trace:
+        record = json.loads(log.call_args.args[1])
+        assert record["computed_hash_count_direct"] == 1
+        assert record["computed_hash_count_descendants"] == 1
+        assert record["checkpoint_resume_count"] == 1
+    trace.progress(consumer)
+    assert log.call_count == int(emit_trace)
+
+    pool.free_blocks([block, block])
+    assert block.ref_cnt == 1
+    assert pool.get_num_free_blocks() == free_before
+    pool.free_blocks([block])
+    assert pool.get_num_free_blocks() == free_before + 1
+    assert pool.get_new_blocks(1) == [block]
+
+
+def test_post_use_eviction_follows_copied_state_and_keeps_reused_source(monkeypatch):
+    monkeypatch.setenv("VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT", "1")
+    monkeypatch.delenv("VLLM_MAMBA_CACHE_TRACE", raising=False)
+    init_none_hash(sha256)
+    pool = BlockPool(8, True, 2)
+    trace = pool.trace
+    trace.groups = {0: ["mamba"]}
+    producer, source, _ = register(pool)
+    consumer = make_request("consumer", [1, 2, 3, 4, 7, 8], 2, sha256)
+    trace.adopt("consumer", [source], 4)
+    destination = pool.get_new_blocks(1)[0]
+    pool.move_block_hashes(source, destination)
+    pool.free_blocks([destination])  # Cached CoW copy, with no remaining reader.
+    replacement = make_request("replacement", [11, 12, 13, 14], 2, sha256)
+    pool.cache_partial_block(replacement, source, 4, 0, 6)
+    consumer.num_computed_tokens = 6
+    trace.progress(consumer)
+    assert pool.get_cached_block(producer.block_hashes[1], [0]) is None
+    assert pool.get_cached_block(replacement.block_hashes[1], [0]) == [source]
+    assert source.ref_cnt == 1
+    assert pool.get_new_blocks(1) == [destination]
+
+
+def test_post_use_eviction_ignores_failed_loads_and_non_mamba_groups(monkeypatch):
+    monkeypatch.setenv("VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT", "1")
+    monkeypatch.delenv("VLLM_MAMBA_CACHE_TRACE", raising=False)
+    init_none_hash(sha256)
+    pool = BlockPool(8, True, 2)
+    trace = pool.trace
+    trace.groups = {0: ["mamba"]}
+    request, block, _ = register(pool, "consumer")
+    attention = pool.get_new_blocks(1)[0]
+    pool.cache_partial_block(request, attention, 4, 1, 6)
+    trace.expect_external("consumer", 4)
+    trace.loaded(request, [block, attention])
+    assert pool.get_cached_block(request.block_hashes[1], [0]) == [block]
+    trace.detach("consumer")  # Failed/preempted work cannot trigger eviction.
+    request.num_computed_tokens = 6
+    trace.progress(request)
+    assert pool.get_cached_block(request.block_hashes[1], [0]) == [block]
+    trace.adopt("consumer", [block, attention], 4)
+    trace.progress(request)
+    assert pool.get_cached_block(request.block_hashes[1], [0]) is None
+    assert pool.get_cached_block(request.block_hashes[1], [1]) == [attention]

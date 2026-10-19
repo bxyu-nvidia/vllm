@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Keep Mamba accounting in memory; emit one JSON summary on hash removal.
+"""Observe Mamba reuse for optional removal summaries and post-use eviction.
 
 Counts and downstream hashes cover one GPU residency/cache group, up to removal.
 Downstream hashes identify confirmed computed prefixes, not necessarily cached
@@ -48,7 +48,11 @@ class CacheTrace:
     """Observe scheduler completions silently until a cached hash is removed."""
 
     def __init__(
-        self, *, sink: Callable[[dict[str, object]], None] | None = None
+        self,
+        *,
+        sink: Callable[[dict[str, object]], None] | None = None,
+        emit_events: bool = True,
+        on_direct_descendant: Callable[[int], None] | None = None,
     ) -> None:
         self.groups: dict[int, list[str]] = {}
         self.generations: dict[int, int] = {}
@@ -58,6 +62,8 @@ class CacheTrace:
         self.active: dict[str, list[tuple[Checkpoint, int]]] = {}
         self.external: dict[str, int] = {}
         self._sink = sink
+        self._emit_events = emit_events
+        self._on_direct_descendant = on_direct_descendant
         self._sequence = 0
 
     def register(
@@ -126,6 +132,7 @@ class CacheTrace:
         if waiting:
             self.pending[request.request_id] = waiting
         active = []
+        evict_block_ids: set[int] = set()
         for entry, position in self.active.get(request.request_id, []):
             if entry.removed:
                 continue
@@ -135,14 +142,22 @@ class CacheTrace:
             # is a direct child; later boundaries are descendants.
             if start == entry.prefix_length // entry.hash_block_size and end > start:
                 entry.direct_hashes.add(request.block_hashes[start].hex())
+                if self._on_direct_descendant is not None:
+                    evict_block_ids.add(entry.block_id)
             entry.computed_hashes.update(
                 h.hex() for h in request.block_hashes[start:end]
             )
-            active.append((entry, max(position, end * entry.hash_block_size)))
+            if entry.block_id not in evict_block_ids:
+                active.append((entry, max(position, end * entry.hash_block_size)))
         if active:
             self.active[request.request_id] = active
         else:
             self.active.pop(request.request_id, None)
+        # Eviction emits the final counters and may remove aliases of the same
+        # state. Do it after completing this request's accounting.
+        if self._on_direct_descendant is not None:
+            for block_id in evict_block_ids:
+                self._on_direct_descendant(block_id)
 
     def remove(self, block_id: int, keys: Iterable[bytes], reason: str) -> None:
         for key in keys:
@@ -168,9 +183,9 @@ class CacheTrace:
                 "computed_hash_count_direct": len(entry.direct_hashes),
                 "computed_hash_count_descendants": len(entry.computed_hashes),
             }
-            if self._sink is not None:
+            if self._emit_events and self._sink is not None:
                 self._sink(record)
-            else:
+            elif self._emit_events:
                 logger.info(
                     "MAMBA_CACHE_TRACE %s", json.dumps(record, separators=(",", ":"))
                 )
