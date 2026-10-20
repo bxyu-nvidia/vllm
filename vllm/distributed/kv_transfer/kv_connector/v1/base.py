@@ -634,6 +634,13 @@ class KVConnectorBase_V1(ABC):
         """
         return False, None
 
+    def request_preempted(self, request_id: str) -> None:
+        """Release scheduler-only buffered state before the request is freed.
+
+        In-flight transfers must keep their references until worker completion.
+        """
+        return
+
     def register_finished_partial_tail(
         self,
         request: "Request",
