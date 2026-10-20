@@ -434,3 +434,28 @@ def test_protection_is_per_group_and_prevents_alias_eviction(monkeypatch):
     trace.progress(consumer)
     assert pool.get_cached_block(producer.block_hashes[0], [0]) == [block]
     assert pool.get_cached_block(producer.block_hashes[1], [0]) == [block]
+
+
+def test_direct_use_observer_reports_same_child_after_gpu_removal(monkeypatch):
+    """Two admitted readers must protect the store even after GPU eviction."""
+    monkeypatch.setenv("VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT", "1")
+    init_none_hash(sha256)
+    pool = BlockPool(8, True, 2)
+    trace = pool.trace
+    trace.groups = {0: ["mamba"]}
+    reports = []
+    trace.on_direct_use = lambda group, prefix: reports.append((group, prefix))
+    producer, block, _ = register(pool)
+    readers = [make_request(name, [1, 2, 3, 4, 7, 8], 2, sha256) for name in ["a", "b"]]
+    for reader in readers:
+        trace.adopt(reader.request_id, [block], 4)
+        reader.num_computed_tokens = 6
+        reader.num_in_flight_tokens = 2
+        trace.progress(reader)
+    assert not reports
+    for reader in readers:
+        reader.num_in_flight_tokens = 0
+        trace.progress(reader)
+        trace.progress(reader)
+    assert reports == [(0, producer.block_hashes[1].hex())] * 2
+    assert pool.get_cached_block(producer.block_hashes[1], [0]) is None

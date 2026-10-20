@@ -65,6 +65,9 @@ class CacheTrace:
         self._sink = sink
         self._emit_events = emit_events
         self._on_direct_descendant = on_direct_descendant
+        # Optional connector observer; report both uses, including completions
+        # after the first use removed the GPU residency.
+        self.on_direct_use: Callable[[int, str], None] | None = None
         self._sequence = 0
         # Saturated use counts survive residency changes. Pending uses also
         # survive hash removal: an already-admitted reader can finish later.
@@ -145,6 +148,8 @@ class CacheTrace:
                 and child_index < len(request.block_hashes)
             ):
                 self._direct_use_counts[key] = self._direct_use_counts.get(key, 0) + 1
+                if self.on_direct_use is not None:
+                    self.on_direct_use(entry.group_id, entry.prefix_hash)
             else:
                 waiting[key] = entry
         if waiting:

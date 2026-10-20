@@ -46,6 +46,8 @@ def _make_bare_scheduler(
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = kv_role
     scheduler.save_decode_cache = save_decode_cache
+    scheduler.mamba_evict_on_direct_descendant = False
+    scheduler._mamba_direct_uses = []
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
     scheduler.enable_lookup = True
@@ -1764,3 +1766,32 @@ def test_worker_metadata_aggregates_completions_across_ranks():
         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+
+
+def test_direct_use_reports_mapped_mamba_groups_once_in_metadata(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaDirectUse,
+    )
+
+    monkeypatch.setenv("VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT", "1")
+    scheduler = _make_bare_scheduler()
+    scheduler.mamba_evict_on_direct_descendant = True
+    scheduler._store_group_id_by_kv_cache_group_id = {3: 0, 7: 1}
+    scheduler.bind_gpu_block_pool(scheduler._gpu_block_pool)
+    observer = scheduler._gpu_block_pool.trace.on_direct_use
+    observer(3, "attention")
+    observer(8, "nonprefix")
+    observer(7, "mamba")
+    observer(7, "mamba")
+    assert scheduler.has_pending_push_work()
+    meta = scheduler.build_connector_meta(_make_offload_only_output([]))
+    assert len(meta.mamba_direct_uses) == 2
+    first, second = meta.mamba_direct_uses
+    assert isinstance(first, MambaDirectUse)
+    assert first.group_id == second.group_id == 1
+    assert first.prefix_hash == second.prefix_hash == "mamba"
+    assert first.event_id != second.event_id
+    assert not scheduler.has_pending_push_work()
+    assert not scheduler.build_connector_meta(
+        _make_offload_only_output([])
+    ).mamba_direct_uses

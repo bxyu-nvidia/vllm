@@ -48,6 +48,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  
     KeyMetadata,
     LBHNCStoreLayout,
     LBNHCStoreLayout,
+    MambaDirectUse,
     MooncakeLookupResult,
     MooncakeStoreConnectorMetadata,
     MooncakeStoreWorkerMetadata,
@@ -1391,6 +1392,11 @@ class MooncakeStoreWorker:
         assert kv_role is not None
         self.kv_role = kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._mamba_policy_enabled = extra_config.get(
+            "mamba_evict_on_direct_descendant", False
+        )
+        self._mamba_policy_executor: ThreadPoolExecutor | None = None
+        self._mamba_policy_failed = False
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
             extra_config.get("save_decode_cache", False)
         )
@@ -1420,6 +1426,17 @@ class MooncakeStoreWorker:
         local_ip = get_ip()
         local_hostname = rdma_utils.get_requester_local_hostname(local_ip)
         setup_mooncake_store(self.store, store_config, local_hostname)
+        if self._mamba_policy_enabled:
+            if not callable(getattr(self.store, "batch_report_mamba_direct_use", None)):
+                raise RuntimeError(
+                    "Mamba eviction requires a Mooncake wheel with "
+                    "batch_report_mamba_direct_use support"
+                )
+            if parallel_config.rank == 0:
+                self._mamba_policy_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="mooncake-mamba-eviction"
+                )
+                logger.info("Mooncake Mamba direct-use reporting enabled")
 
         preferred_segment = rdma_utils.get_configured_preferred_segment(extra_config)
         self.preferred_segment = preferred_segment
@@ -1506,7 +1523,8 @@ class MooncakeStoreWorker:
                 "(global_segment_size=%d), KV transfer disabled.",
                 store_config.global_segment_size,
             )
-            return
+            if not self._mamba_policy_enabled:
+                return
 
         self.coord = MooncakeStoreCoordinator.from_kv_cache_config(
             kv_cache_config, vllm_config, self.block_size, self.hash_block_size
@@ -1934,6 +1952,57 @@ class MooncakeStoreWorker:
             "Started %d Mooncake KV-load receive thread(s)", self.num_recv_threads
         )
 
+    def _report_mamba_direct_uses(self, uses: list[MambaDirectUse]) -> None:
+        if self._mamba_policy_failed:
+            return
+        keys: list[str] = []
+        event_ids: list[str] = []
+        for use in uses:
+            # Only the engine's rank 0 reports, expanding across all stored
+            # shards. Namespace construction matches lookup and save exactly.
+            if not isinstance(
+                self._kv_cache_groups[use.group_id].kv_cache_spec, MambaSpec
+            ):
+                continue
+            for prefix in self._lookup_key_prefixes[use.group_id]:
+                keys.append(PoolKey.build_key_string(prefix, use.prefix_hash))
+                event_ids.append(use.event_id)
+        if not keys:
+            return
+        for attempt in range(3):
+            try:
+                results = self.store.batch_report_mamba_direct_use(keys, event_ids)
+                if len(results) != len(keys):
+                    raise RuntimeError("Mooncake returned an invalid policy response")
+                failed = [i for i, result in enumerate(results) if result not in (1, 2)]
+                if not failed:
+                    return
+                # Disabled/unsupported policy is a configuration error.
+                if any(results[i] == -1012 for i in failed):
+                    raise ValueError(
+                        "Enable MOONCAKE_MAMBA_EVICT_ON_DIRECT_DESCENDANT=1 "
+                        "on the updated Mooncake master"
+                    )
+                keys = [keys[i] for i in failed]
+                event_ids = [event_ids[i] for i in failed]
+                if attempt == 2:
+                    logger.error(
+                        "Mooncake Mamba direct-use reporting failed for %d keys: %s",
+                        len(keys),
+                        results,
+                    )
+            except ValueError:
+                self._mamba_policy_failed = True
+                logger.exception(
+                    "Mooncake Mamba eviction disabled: configuration error"
+                )
+                return
+            except Exception:
+                if attempt == 2:
+                    logger.exception("Mooncake Mamba direct-use reporting failed")
+            if attempt < 2:
+                time.sleep(0.1 * (attempt + 1))
+
     def start_load_kv(self, metadata: MooncakeStoreConnectorMetadata):
         """Issue async loads.
 
@@ -1941,6 +2010,10 @@ class MooncakeStoreWorker:
         (SchedulerOutput.has_sync_kv_loads), keeping load submission off
         the critical path while preserving compute-I/O overlap.
         """
+        if metadata.mamba_direct_uses and self._mamba_policy_executor is not None:
+            self._mamba_policy_executor.submit(
+                self._report_mamba_direct_uses, metadata.mamba_direct_uses
+            )
         if self._capacity_only:
             return
 
@@ -2273,6 +2346,10 @@ class MooncakeStoreWorker:
         store = getattr(self, "store", None)
         if store is None:
             return
+        executor = getattr(self, "_mamba_policy_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
+            self._mamba_policy_executor = None
         self.store = None
         deadline = time.monotonic() + 5.0
         for thread in (self.kv_send_thread, *self.kv_recv_threads):

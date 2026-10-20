@@ -3711,6 +3711,7 @@ def _make_bare_worker(
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
     worker._capacity_only = False
+    worker._mamba_policy_failed = False
     worker.block_size = block_size
     worker._is_hma_required = False
     worker.tp_rank = 0
@@ -5192,3 +5193,139 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+def test_direct_use_reports_only_mamba_shards_and_retries_stable_ids():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaDirectUse,
+    )
+
+    w = _make_bare_worker()
+    w._kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["attention"],
+            FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=16,
+                shapes=((1,),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        ),
+    ]
+    w._lookup_key_prefixes = (
+        ("attention",),
+        ("model@tp0@group:1", "model@tp1@group:1"),
+    )
+    w.store.batch_report_mamba_direct_use.side_effect = [[1, -1], [2]]
+    w._report_mamba_direct_uses(
+        [
+            MambaDirectUse(0, "ignore", "attention-event"),
+            MambaDirectUse(1, "abc", "one-use"),
+        ]
+    )
+    calls = w.store.batch_report_mamba_direct_use.call_args_list
+    assert len(calls) == 2
+    assert calls[0].args == (
+        ["model@tp0@group:1@abc", "model@tp1@group:1@abc"],
+        ["one-use", "one-use"],
+    )
+    assert calls[1].args == (["model@tp1@group:1@abc"], ["one-use"])
+
+
+def test_capacity_only_worker_reports_uses_without_loading_or_saving():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaDirectUse,
+        MooncakeStoreConnectorMetadata,
+    )
+
+    w = _make_bare_worker(kv_role="kv_consumer")
+    w._capacity_only = True
+    w._report_mamba_direct_uses = MagicMock()
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    meta.mamba_direct_uses = [MambaDirectUse(1, "abc", "use-id")]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        w._mamba_policy_executor = executor
+        w.start_load_kv(meta)
+        w.wait_for_save(meta)
+    w._report_mamba_direct_uses.assert_called_once_with(meta.mamba_direct_uses)
+    assert w.recv_request_queue.empty()
+    assert w.kv_send_thread is None
+
+
+def test_direct_use_reports_skip_nonleader_workers():
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaDirectUse,
+        MooncakeStoreConnectorMetadata,
+    )
+
+    w = _make_bare_worker()
+    w._mamba_policy_executor = None
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    meta.mamba_direct_uses = [MambaDirectUse(0, "abc", "use-id")]
+    w.start_load_kv(meta)
+    w.store.batch_report_mamba_direct_use.assert_not_called()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_capacity_only_policy_init_builds_keys_without_enabling_transfers(
+    monkeypatch, enabled, rank
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
+        MambaDirectUse,
+        MooncakeStoreConnectorMetadata,
+    )
+
+    store = MagicMock()
+    store.setup.return_value = 0
+    store.batch_report_mamba_direct_use.side_effect = lambda keys, event_ids: [1] * len(
+        keys
+    )
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch, tp_rank=rank, tp_size=2)
+    monkeypatch.setattr(
+        worker.MooncakeStoreConfig,
+        "load_from_config",
+        staticmethod(lambda: _make_config()),
+    )
+    config = _make_vllm_config(
+        kv_role="kv_consumer",
+        extra_config={
+            "enable_lookup": False,
+            "mamba_evict_on_direct_descendant": enabled,
+        },
+    )
+    config.parallel_config.rank = rank
+    config.cache_config.block_size = 800
+    config.cache_config.enable_prefix_caching = True
+    config.cache_config.prefix_match_unit = None
+    w = worker.MooncakeStoreWorker(config, _make_qsa_hybrid_kv_cache_config())
+    assert w._capacity_only and not w.can_put
+    assert bool(w._mamba_policy_executor) == (enabled and rank == 0)
+    w.register_kv_caches({})
+    meta = MooncakeStoreConnectorMetadata(set(), set())
+    if enabled:
+        meta.mamba_direct_uses = [MambaDirectUse(1, "abc", "use-id")]
+    w.start_load_kv(meta)
+    w.wait_for_save(meta)
+    w.close()  # Flush queued reports before closing the store.
+    if enabled and rank == 0:
+        keys, event_ids = store.batch_report_mamba_direct_use.call_args.args
+        assert len(keys) == 2
+        assert all("@group:1@abc" in key for key in keys)
+        assert event_ids == ["use-id", "use-id"]
+    else:
+        store.batch_report_mamba_direct_use.assert_not_called()
+    store.batch_put_from_multi_buffers.assert_not_called()
+    store.batch_get_into_multi_buffers.assert_not_called()

@@ -882,6 +882,13 @@ class MooncakeStoreWorkerMetadata(KVConnectorWorkerMetadata):
         return self
 
 
+@dataclass(frozen=True)
+class MambaDirectUse:
+    group_id: int
+    prefix_hash: str
+    event_id: str
+
+
 class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
     """Metadata passed from scheduler to worker."""
 
@@ -891,6 +898,7 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
         preempted_req_ids: set[str],
     ):
         self.requests: list[ReqMeta] = []
+        self.mamba_direct_uses: list[MambaDirectUse] = []
         self.unfinished_request_ids = unfinished_request_ids
         self.preempted_req_ids = preempted_req_ids
 

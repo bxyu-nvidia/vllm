@@ -6,7 +6,9 @@
 """Scheduler-side logic for MooncakeStoreConnector."""
 
 from collections.abc import Sequence
+from uuid import uuid4
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
@@ -17,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (  # noqa: E501
     BoundaryPut,
     LoadSpec,
+    MambaDirectUse,
     MooncakeStoreConnectorMetadata,
     MooncakeStoreWorkerMetadata,
     ReqMeta,
@@ -133,7 +136,13 @@ def _partial_tail_non_mamba_puts(
 
 
 class MooncakeStoreScheduler:
-    """Scheduler-side component for MooncakeStoreConnector."""
+    """Scheduler-side component for MooncakeStoreConnector.
+
+    Opt-in ``mamba_evict_on_direct_descendant`` reports completed uses to the
+    master. Requires the GPU policy and an updated Mooncake wheel/master with
+    ``MOONCAKE_MAMBA_EVICT_ON_DIRECT_DESCENDANT=1``. Shared protection lasts for
+    the master's lifetime; restart engines too when restarting the master.
+    """
 
     def __init__(
         self,
@@ -148,6 +157,18 @@ class MooncakeStoreScheduler:
         # Skips lookup CPU cost on instances that never load KV from the store.
         self.enable_lookup = kvc_extra_config.get("enable_lookup", True)
         self.save_decode_cache = kvc_extra_config.get("save_decode_cache", False)
+        self.mamba_evict_on_direct_descendant = kvc_extra_config.get(
+            "mamba_evict_on_direct_descendant", False
+        )
+        if (
+            self.mamba_evict_on_direct_descendant
+            and not envs.VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT
+        ):
+            raise ValueError(
+                "Mooncake mamba_evict_on_direct_descendant requires "
+                "VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT=1"
+            )
+        self._mamba_direct_uses: list[MambaDirectUse] = []
         kv_event_config = vllm_config.kv_events_config
         self.enable_kv_events = bool(
             kv_event_config and kv_event_config.enable_kv_cache_events
@@ -197,6 +218,16 @@ class MooncakeStoreScheduler:
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
+        if self.mamba_evict_on_direct_descendant:
+            assert gpu_block_pool.trace is not None
+            gpu_block_pool.trace.on_direct_use = self._record_mamba_direct_use
+
+    def _record_mamba_direct_use(self, group_id: int, prefix_hash: str) -> None:
+        store_group = self._store_group_id_by_kv_cache_group_id.get(group_id)
+        if store_group in self._boundary_state_group_ids:
+            self._mamba_direct_uses.append(
+                MambaDirectUse(store_group, prefix_hash, uuid4().hex)
+            )
 
     def get_num_new_matched_tokens(
         self,
@@ -316,6 +347,11 @@ class MooncakeStoreScheduler:
         meta = MooncakeStoreConnectorMetadata(
             self._unfinished_request_ids,
             preempted_ids,
+        )
+
+        meta.mamba_direct_uses, self._mamba_direct_uses = (
+            self._mamba_direct_uses,
+            [],
         )
 
         # Handle new requests
@@ -741,12 +777,11 @@ class MooncakeStoreScheduler:
     def has_pending_push_work(self) -> bool:
         """Keep the engine stepping while any store job still holds block refs.
 
-        Completions only reach the scheduler as worker metadata on a step, so an
-        engine that quiesced with jobs in flight would leave those references
-        held indefinitely. Nothing else keeps it alive now that a finishing
-        request no longer defers its own free.
+        Completions only reach the scheduler as worker metadata on a step.
+        Pending direct-use reports also need a step to reach worker rank 0,
+        including reports produced by the last finishing request.
         """
-        return bool(self._pinned_saves)
+        return bool(self._pinned_saves or self._mamba_direct_uses)
 
     def reset_store(self) -> bool:
         """Trigger a global ``remove_all(force=True)`` on the Mooncake master.
