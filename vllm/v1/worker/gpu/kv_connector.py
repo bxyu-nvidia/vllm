@@ -16,6 +16,7 @@ from vllm.forward_context import (
     is_forward_context_available,
     set_forward_context,
 )
+from vllm.v1.metrics.phase_timing import PhaseTimer, timed_phase
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     KVConnectorOutput,
@@ -29,6 +30,8 @@ if TYPE_CHECKING:
 
 class KVConnector:
     """KVConnector interface used by GPUModelRunner."""
+
+    phase_timing: PhaseTimer | None = None
 
     def pre_forward(
         self,
@@ -67,6 +70,7 @@ class ActiveKVConnector(KVConnector):
         self._pending_load_kwargs: dict[str, Any] | None = None
         self._disabled = False
 
+    @timed_phase("kv_pre_forward", cuda=True)
     def pre_forward(
         self,
         scheduler_output: "SchedulerOutput",
@@ -110,6 +114,7 @@ class ActiveKVConnector(KVConnector):
             load_kwargs["attn_metadata"] = attn_metadata
         return load_kwargs
 
+    @timed_phase("kv_start_load_kv", cuda=True)
     def _start_load_kv(self) -> None:
         load_kwargs = self._pending_load_kwargs
         assert load_kwargs is not None
@@ -121,6 +126,7 @@ class ActiveKVConnector(KVConnector):
             with set_forward_context(None, self.vllm_config):
                 self.kv_connector.start_load_kv(get_forward_context(), **load_kwargs)
 
+    @timed_phase("kv_finish_forward", cuda=True)
     def finish_forward(self) -> None:
         if not self._disabled:
             self.kv_connector.finish_forward()
@@ -128,6 +134,7 @@ class ActiveKVConnector(KVConnector):
     def reset_capture_state(self) -> None:
         self.kv_connector.reset_capture_state()
 
+    @timed_phase("kv_post_forward", cuda=True)
     def post_forward(self, finished_req_ids: set[str]) -> KVConnectorOutput | None:
         if self._disabled:
             return None

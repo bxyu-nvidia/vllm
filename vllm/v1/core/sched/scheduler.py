@@ -61,6 +61,11 @@ from vllm.v1.kv_cache_interface import (
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+from vllm.v1.metrics.phase_timing import (
+    make_phase_timer,
+    measure_phase,
+    timed_phase,
+)
 from vllm.v1.metrics.stats import (
     KV_FETCH_COMPLETED_WAITING,
     KV_FETCH_IN_PROGRESS,
@@ -94,6 +99,7 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        self.phase_timing = make_phase_timer(vllm_config, component="scheduler")
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -588,6 +594,7 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    @timed_phase("schedule")
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -773,7 +780,10 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Schedule newly needed KV blocks for the request.
-            with record_function_or_nullcontext("schedule: allocate_slots"):
+            with (
+                record_function_or_nullcontext("schedule: allocate_slots"),
+                measure_phase(self, "allocate_running_slots"),
+            ):
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
@@ -1253,24 +1263,25 @@ class Scheduler(SchedulerInterface):
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_tokens_past_hit,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    skip_zeroing_group_ids=(
-                        self.connector.get_loaded_kv_cache_group_ids(request)
-                        if load_kv_async and self.connector is not None
-                        else ()
-                    ),
-                    num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
-                    reserved_blocks=reserved_blocks,
-                    has_scheduled_reqs=bool(self.running),
-                )
+                with measure_phase(self, "allocate_waiting_slots"):
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_tokens_past_hit,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        skip_zeroing_group_ids=(
+                            self.connector.get_loaded_kv_cache_group_ids(request)
+                            if load_kv_async and self.connector is not None
+                            else ()
+                        ),
+                        num_encoder_tokens=num_encoder_tokens,
+                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                        reserved_blocks=reserved_blocks,
+                        has_scheduled_reqs=bool(self.running),
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -1555,6 +1566,7 @@ class Scheduler(SchedulerInterface):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
 
+    @timed_phase("build_kv_connector_meta")
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -2025,6 +2037,7 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids, bitmask, num_acceptable_drafts
         )
 
+    @timed_phase("update_from_output")
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -3004,6 +3017,8 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        if (timer := getattr(self, "phase_timing", None)) is not None:
+            timer.flush(force=True)
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

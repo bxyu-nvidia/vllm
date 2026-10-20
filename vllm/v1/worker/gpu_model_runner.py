@@ -154,6 +154,11 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.metrics.phase_timing import (
+    make_phase_timer,
+    measure_phase,
+    timed_phase,
+)
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -477,6 +482,9 @@ class GPUModelRunner(
         device: torch.device,
     ):
         self.vllm_config = vllm_config
+        self.phase_timing = make_phase_timer(
+            vllm_config, component="worker_v1", device=device
+        )
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -2001,6 +2009,7 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    @timed_phase("prepare_inputs", cuda=True)
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3708,6 +3717,7 @@ class GPUModelRunner(
         finally:
             self.prepare_inputs_event.record()
 
+    @timed_phase("forward", cuda=True)
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -4028,6 +4038,7 @@ class GPUModelRunner(
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
     @torch.inference_mode()
+    @timed_phase("execute_model", cuda=True, step=True)
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4064,6 +4075,7 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
+            measure_phase(self, "preprocess", cuda=True),
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
@@ -4398,6 +4410,7 @@ class GPUModelRunner(
         )
 
     @torch.inference_mode
+    @timed_phase("sample_tokens", cuda=True)
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
@@ -6338,6 +6351,8 @@ class GPUModelRunner(
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
+        if (timer := getattr(self, "phase_timing", None)) is not None:
+            timer.flush(force=True)
         if current_platform.is_rocm():
             # Drop captured graphs before distributed teardown. On ROCm, delayed
             # graph destruction can surface HSA faults in the next engine startup.
