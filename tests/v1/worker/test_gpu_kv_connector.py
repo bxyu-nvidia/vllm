@@ -10,7 +10,6 @@ import torch
 import vllm.v1.worker.gpu.kv_connector as kv_connector_module
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransferResults
-from vllm.v1.metrics.phase_timing import PhaseTimer
 from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
 
 
@@ -54,16 +53,12 @@ def _scheduler_output(has_sync_kv_loads: bool) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("has_sync_kv_loads", [False, True])
-@pytest.mark.parametrize("enable_phase_timing", [False, True])
 def test_load_start_phase(
     monkeypatch: pytest.MonkeyPatch,
     has_sync_kv_loads: bool,
-    enable_phase_timing: bool,
 ):
     events: list[str] = []
     connector = _make_connector(monkeypatch, events)
-    if enable_phase_timing:
-        connector.phase_timing = PhaseTimer(labels={})
     output = _scheduler_output(has_sync_kv_loads)
 
     request_indices = torch.tensor([3, 1])

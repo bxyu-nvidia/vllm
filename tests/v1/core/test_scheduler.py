@@ -255,17 +255,10 @@ def test_pending_hisparse_spill_keeps_scheduler_alive():
         (True, 5),
     ],
 )
-@pytest.mark.parametrize("enable_phase_timing", [False, True])
-def test_schedule(
-    enable_prefix_caching: bool,
-    prompt_logprobs: int | None,
-    enable_phase_timing: bool,
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
     """Test scheduling.
     Two cases: default APC/no prompt logprobs; APC=True + prompt logprobs
     """
-    monkeypatch.setenv("VLLM_PREFILL_TIMING", "1" if enable_phase_timing else "0")
     scheduler = create_scheduler(enable_prefix_caching=enable_prefix_caching)
     requests = create_requests(num_requests=10, prompt_logprobs=prompt_logprobs)
     for request in requests:

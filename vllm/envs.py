@@ -240,9 +240,6 @@ if TYPE_CHECKING:
     VLLM_EC_SIDE_CHANNEL_HOST: str = "localhost"
     VLLM_EC_SIDE_CHANNEL_PORT: int = 5601
     VLLM_MOONCAKE_BOOTSTRAP_PORT: int = 8998
-    VLLM_PREFILL_TIMING: bool = False
-    VLLM_PREFILL_TIMING_INTERVAL_SECONDS: float = 10.0
-    VLLM_PREFILL_TIMING_SAMPLE_EVERY: int = 1
     VLLM_MAMBA_CACHE_TRACE: bool = False
     VLLM_MAMBA_EVICT_ON_DIRECT_DESCENDANT: bool = False
     VLLM_MOONCAKE_STORE_TIER_LOG: bool = False
@@ -1787,16 +1784,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Port used for Mooncake handshake between remote agents.
     "VLLM_MOONCAKE_BOOTSTRAP_PORT": lambda: int(
         os.getenv("VLLM_MOONCAKE_BOOTSTRAP_PORT", "8998")
-    ),
-    # Opt-in, nonblocking CPU/CUDA phase summaries for prefill producers.
-    # Standalone engines are included; decode-only KV consumers are excluded.
-    "VLLM_PREFILL_TIMING": lambda: os.getenv("VLLM_PREFILL_TIMING", "0").lower()
-    in ("1", "true"),
-    "VLLM_PREFILL_TIMING_INTERVAL_SECONDS": lambda: float(
-        os.getenv("VLLM_PREFILL_TIMING_INTERVAL_SECONDS", "10")
-    ),
-    "VLLM_PREFILL_TIMING_SAMPLE_EVERY": lambda: int(
-        os.getenv("VLLM_PREFILL_TIMING_SAMPLE_EVERY", "1")
     ),
     # Opt-in Mamba hash-removal summaries.
     "VLLM_MAMBA_CACHE_TRACE": lambda: os.getenv("VLLM_MAMBA_CACHE_TRACE", "0").lower()
