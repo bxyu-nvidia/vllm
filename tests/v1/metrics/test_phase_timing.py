@@ -245,18 +245,3 @@ def test_real_cuda_graph_replay_timing() -> None:
     assert result["cuda_elapsed_ms"]["forward"]["count"] == 1
     assert result["cuda_elapsed_ms"]["forward"]["total"] > 0
     assert torch.equal(tensor, torch.ones_like(tensor))
-
-
-def test_scheduled_token_samples_are_sampled_bounded_and_reset(
-    clock: SimpleNamespace,
-) -> None:
-    timer = pt.PhaseTimer(labels={}, sample_every=2)
-    for value in range(10000):
-        timer.begin_step()
-        timer.observe_batch(scheduled_tokens=value)
-    result = report(timer)
-    assert result["batch"]["scheduled_tokens"]["count"] == 5000
-    assert result["scheduled_token_samples"] == list(range(1808, 10000, 2))
-    timer.begin_step()
-    timer.observe_batch(scheduled_tokens=123)
-    assert report(timer)["scheduled_token_samples"] == [123]

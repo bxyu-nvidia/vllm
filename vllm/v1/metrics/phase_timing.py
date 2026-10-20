@@ -215,9 +215,6 @@ class PhaseTimer:
             "counts": dict(self._counts),
             "pending_cuda_ranges": len(self._pending),
         }
-        # Preserve bounded samples so analysis can pool token-size percentiles.
-        if (tokens := self._batch.get("scheduled_tokens")) is not None:
-            record["scheduled_token_samples"] = list(tokens.recent)
         logger.info("VLLM_PREFILL_TIMING %s", json.dumps(record, separators=(",", ":")))
         self._cpu.clear()
         self._gpu.clear()
