@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from pathlib import Path
+from queue import Queue
+from unittest.mock import Mock
 
 import prometheus_client
+import pytest
 from transformers import GPT2Config
 
 from vllm.config import ModelConfig, VllmConfig
@@ -70,3 +73,37 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
         assert not any(key.endswith("_bucket") for key in samples)
     finally:
         unregister_vllm_metrics()
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+def test_dp_load_stats_roundtrip_with_prefill_batching_field(lockstep: bool) -> None:
+    """Load-balancing messages must not put request counts in batching stats."""
+    from vllm.v1.engine import EngineCoreOutputs
+    from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
+    from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    core_type = DPEngineCoreProc if lockstep else EngineCoreProc
+    core = object.__new__(core_type)
+    core.publish_dp_lb_stats = True
+    core.last_counts = (0, 0)
+    core.scheduler = Mock()
+    core.scheduler.get_request_counts.return_value = (3, 7)
+    core.scheduler.get_kv_cache_usage.return_value = 0.25
+    core.output_queue = Queue()
+    core.step_counter = 11
+    core.current_wave = 2
+
+    core._maybe_publish_request_counts()
+    destination, output = core.output_queue.get_nowait()
+    decoded = MsgpackDecoder(EngineCoreOutputs).decode(MsgpackEncoder().encode(output))
+    assert destination == -1
+    stats = decoded.scheduler_stats
+    assert stats is not None
+    assert (stats.num_running_reqs, stats.num_waiting_reqs) == (3, 7)
+    assert stats.kv_cache_usage == 0.25
+    assert stats.prefill_batching_stats is None
+    if lockstep:
+        assert (stats.step_counter, stats.current_wave) == (11, 2)
+
+    core._maybe_publish_request_counts()
+    assert core.output_queue.empty()

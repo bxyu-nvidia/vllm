@@ -224,8 +224,6 @@ KV_FETCH_STAGES = (
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
-    prefill_batching_stats: PrefillBatchingStats | None = None
-
     num_running_reqs: int = 0
 
     num_waiting_reqs: int = 0  # waiting requests not deferred
@@ -256,6 +254,11 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+
+    # DP load reporting constructs the request counts positionally.
+    prefill_batching_stats: PrefillBatchingStats | None = field(
+        default=None, kw_only=True
+    )
 
 
 @dataclass
