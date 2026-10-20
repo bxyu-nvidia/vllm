@@ -715,6 +715,7 @@ class RequestTracker:
     partial_tail_sent: bool = False
     # At most one final checkpoint per group for this prefill.
     submitted_mamba_groups: set[int] = field(default_factory=set)
+    attention_save_submitted: bool = False
 
     def reset(self) -> None:
         self.token_len = 0
@@ -725,6 +726,7 @@ class RequestTracker:
         self.prefill_end_tokens = 0
         self.partial_tail_sent = False
         self.submitted_mamba_groups.clear()
+        self.attention_save_submitted = False
 
     def update(
         self,

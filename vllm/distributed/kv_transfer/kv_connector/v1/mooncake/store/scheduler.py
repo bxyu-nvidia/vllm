@@ -110,7 +110,10 @@ def _partial_tail_non_mamba_puts(
         resumed_boundary = get_mamba_prefill_checkpoint_position(
             req_meta.prefill_end_tokens, hash_block_size, coord.use_eagle
         )
-        if resumed_boundary in mamba_tails:
+        if any(
+            put.group_id in coord.mamba_group_ids and put.num_tokens == resumed_boundary
+            for put in req_meta.boundary_puts or []
+        ):
             boundary = resumed_boundary
     # Any other sub-block Mamba hand-off is a shared-prefix junction. Its
     # attention KV, EAGLE proof included, ends on an attention block end no later
@@ -202,6 +205,10 @@ class MooncakeStoreScheduler:
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
         self._finished_partial_tail_metas: dict[str, ReqMeta] = {}
+
+    @property
+    def _save_attention_with_mamba(self) -> bool:
+        return bool(self._boundary_state_group_ids) and not self.save_decode_cache
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         self._gpu_block_pool = gpu_block_pool
@@ -363,7 +370,7 @@ class MooncakeStoreScheduler:
                 load_spec=load_spec,
                 # A consumer may write decode KV without becoming a prefill
                 # producer. Loads are still carried by the same metadata.
-                skip_save=is_consumer,
+                skip_save=is_consumer or self._save_attention_with_mamba,
                 block_hashes=request_real.block_hashes,
                 num_prompt_tokens=request_real.num_prompt_tokens,
                 save_partial_tail=self.enable_partial_hash_hits,
@@ -415,7 +422,7 @@ class MooncakeStoreScheduler:
                         request_tracker,
                         self._block_size,
                         load_spec=load_spec,
-                        skip_save=is_consumer,
+                        skip_save=is_consumer or self._save_attention_with_mamba,
                         block_hashes=request_real.block_hashes,
                         num_prompt_tokens=request_real.num_prompt_tokens,
                         save_partial_tail=self.enable_partial_hash_hits,
@@ -458,7 +465,7 @@ class MooncakeStoreScheduler:
                         request_tracker,
                         self._block_size,
                         load_spec=None,
-                        skip_save=False,
+                        skip_save=self._save_attention_with_mamba,
                         block_hashes=unfinished_req.block_hashes,
                         num_prompt_tokens=unfinished_req.num_prompt_tokens,
                         save_partial_tail=self.enable_partial_hash_hits,
@@ -565,7 +572,38 @@ class MooncakeStoreScheduler:
             if req_meta.store_job_id is not None:
                 assert req_meta.store_job_id in self._pinned_saves
                 continue
-            if tail := _partial_tail_non_mamba_puts(coord, req_meta, block_sizes):
+            save_attention = True
+            if self._save_attention_with_mamba:
+                assert any(
+                    put.group_id in self._boundary_state_group_ids
+                    for put in req_meta.boundary_puts or []
+                ), "Hybrid attention saves require a final Mamba checkpoint"
+                tracker = self._request_trackers[req_meta.req_id]
+                save_attention = not tracker.attention_save_submitted
+                req_meta.token_len_chunk = 0
+                if save_attention:
+                    assert req_meta.completed_token_len is not None
+                    # No earlier attention saves ran. Send the whole available
+                    # prefix plus its tail, not just the final prefill chunk.
+                    token_len = min(
+                        tracker.prefill_end_tokens, req_meta.completed_token_len
+                    )
+                    req_meta.token_len_chunk = (
+                        token_len // self._block_size * self._block_size
+                    )
+                    if tracker.token_ids is not None:
+                        req_meta.token_ids = tracker.token_ids[
+                            : req_meta.token_len_chunk
+                        ]
+                        req_meta.token_ids_start = 0
+                    # Even an aligned Mamba checkpoint can need an EAGLE
+                    # proof block beyond the ordinary prefix save boundary.
+                    req_meta.publish_partial_tail = self.enable_partial_hash_hits
+                    tracker.attention_save_submitted = True
+                    tracker.num_saved_tokens = req_meta.token_len_chunk
+            if save_attention and (
+                tail := _partial_tail_non_mamba_puts(coord, req_meta, block_sizes)
+            ):
                 req_meta.boundary_puts = [*tail, *(req_meta.boundary_puts or [])]
             req_meta.store_job_id = store_job_id = self._next_store_job_id
             self._next_store_job_id += 1
@@ -681,28 +719,12 @@ class MooncakeStoreScheduler:
             boundary_puts=mamba_puts,
             completed_token_len=request.num_computed_tokens,
         )
-        coord = self._store_coord
-        req_meta.boundary_puts = [
-            *_partial_tail_non_mamba_puts(
-                coord,
-                req_meta,
-                [g.kv_cache_spec.block_size for g in coord.kv_cache_groups],
-            ),
-            *mamba_puts,
-        ]
-        pinned_block_ids = list(
-            dict.fromkeys(put.block_id for put in req_meta.boundary_puts)
-        )
-        pool = self._gpu_block_pool
-        assert pool is not None, (
-            "GPU block pool must be bound before a finish-time handoff"
-        )
         assert request.request_id not in self._finished_partial_tail_metas
-        store_job_id = self._next_store_job_id
-        self._next_store_job_id += 1
-        self._pinned_saves[store_job_id] = (pinned_block_ids, self._num_workers)
-        pool.touch([pool.blocks[block_id] for block_id in pinned_block_ids])
-        req_meta.store_job_id = store_job_id
+        # Take the same full-prefix and tail references as an ordinary handoff
+        # before request cleanup can reclaim their GPU blocks.
+        save_meta = MooncakeStoreConnectorMetadata(set(), set())
+        save_meta.add_request(req_meta)
+        self._reference_save_blocks(save_meta)
         self._finished_partial_tail_metas[request.request_id] = req_meta
         tracker.has_pending_offload = True
         # The store job owns exact block refs, so request cleanup need not wait.

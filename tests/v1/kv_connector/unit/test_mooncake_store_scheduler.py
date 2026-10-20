@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -12,6 +13,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator imp
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
     BoundaryPut,
+    ChunkedTokenDatabase,
+    KeyMetadata,
     LoadSpec,
     MooncakeLookupResult,
     MooncakeStoreConnectorMetadata,
@@ -22,6 +25,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (
     MooncakeStoreScheduler,
     _partial_tail_non_mamba_puts,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
+    KVCacheStoreSendingThread,
 )
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -42,6 +48,7 @@ def _make_bare_scheduler(
     enable_partial_hash_hits: bool = False,
     kv_role: str = "kv_both",
     save_decode_cache: bool = False,
+    with_mamba: bool = True,
 ) -> MooncakeStoreScheduler:
     scheduler = object.__new__(MooncakeStoreScheduler)
     scheduler.kv_role = kv_role
@@ -92,6 +99,14 @@ def _make_bare_scheduler(
         hash_block_size,
         enable_partial_hash_hits=enable_partial_hash_hits,
     )
+    if not with_mamba:
+        scheduler._boundary_state_group_ids = frozenset()
+        scheduler._store_coord = MooncakeStoreCoordinator(
+            scheduler._store_coord.kv_cache_groups[:1],
+            max(16, hash_block_size),
+            hash_block_size,
+            enable_partial_hash_hits=enable_partial_hash_hits,
+        )
     return scheduler
 
 
@@ -175,7 +190,7 @@ def _make_new_scheduler_output() -> SimpleNamespace:
 
 def test_scheduler_only_tracks_token_ids_for_kv_events():
     for enable_kv_events in (False, True):
-        scheduler = _make_bare_scheduler()
+        scheduler = _make_bare_scheduler(with_mamba=False)
         scheduler.enable_kv_events = enable_kv_events
         scheduler._unfinished_requests["req-0"] = (
             _make_new_scheduler_output().request,
@@ -402,7 +417,7 @@ def test_cached_request_with_spec_decode_does_not_save_scheduled_drafts():
 
 
 def test_cached_request_without_spec_decode_keeps_current_step_save_overlap():
-    scheduler = _make_bare_scheduler()
+    scheduler = _make_bare_scheduler(with_mamba=False)
     _add_unfinished_request(
         scheduler,
         token_ids=list(range(48)),
@@ -689,7 +704,7 @@ def test_resumed_from_preemption_with_load_skips_save():
 
 def test_resumed_from_preemption_without_load_still_saves():
     # No load_spec → behavior is unchanged: save proceeds.
-    scheduler = _make_bare_scheduler()
+    scheduler = _make_bare_scheduler(with_mamba=False)
     _make_resumed_unfinished_request(
         scheduler,
         token_ids=list(range(48)),
@@ -721,7 +736,7 @@ def test_running_request_not_in_resumed_req_ids_appends_blocks():
     path's block_ids[start // block_size] runs off the end (the
     "list index out of range" / token_len >> len(block_ids) bug).
     """
-    scheduler = _make_bare_scheduler()
+    scheduler = _make_bare_scheduler(with_mamba=False)
     _add_unfinished_request(
         scheduler,
         token_ids=list(range(48)),
@@ -1245,10 +1260,7 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job(
     # before the next connector metadata build.
     assert delay_free is False
     proof_end = 48 if use_eagle else 44
-    expected = attention_ids[
-        32 // attention_block_size : (proof_end + attention_block_size - 1)
-        // attention_block_size
-    ]
+    expected = attention_ids
     pool.free_blocks([pool.blocks[i] for i in owned_ids])
     assert all(
         pool.blocks[i].ref_cnt == (1 if i in expected else 0) for i in attention_ids
@@ -1274,7 +1286,7 @@ def test_finished_partial_tail_is_pre_pinned_as_store_job(
     assert len(meta.requests) == 1
     req_meta = meta.requests[0]
     assert req_meta.req_id == "req-0"
-    assert req_meta.token_len_chunk == 0
+    assert req_meta.token_len_chunk == prompt_tokens // 16 * 16
     assert req_meta.block_ids == block_ids
     assert req_meta.block_hashes == request.block_hashes
     assert req_meta.boundary_puts == [
@@ -1506,7 +1518,7 @@ def test_resumed_prefill_claims_boundaries_past_prompt_length():
     # Its attention tail must follow the resumed boundary, not the old prompt.
     assert meta.requests[0].boundary_puts == [(0, 4, 36), (1, 9, 36)]
     store_job_id = meta.requests[0].store_job_id
-    assert scheduler._pinned_saves[store_job_id][0] == [4, 9]
+    assert scheduler._pinned_saves[store_job_id][0] == [4, 9, 2, 3]
     assert scheduler._gpu_block_pool.blocks[7].ref_cnt == 0
     scheduler.update_connector_output(_make_worker_output({store_job_id: 1}))
     assert all(scheduler._gpu_block_pool.blocks[i].ref_cnt == 0 for i in (4, 9))
@@ -1515,9 +1527,9 @@ def test_resumed_prefill_claims_boundaries_past_prompt_length():
 def test_boundary_state_job_pins_exact_blocks_once():
     scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
     _register_offload_request(scheduler, prefill_end_tokens=64, num_prompt_tokens=64)
-    scheduler._request_trackers["req-0"].allocated_block_ids = ([7],)
+    scheduler._request_trackers["req-0"].allocated_block_ids = ([0],)
     out = _make_offload_only_output(
-        [(1, 7, 16), (1, 8, 32), (1, 9, 60), (1, 9, 60)], block_ids=([7],)
+        [(1, 7, 16), (1, 8, 32), (1, 9, 60), (1, 9, 60)], block_ids=([0],)
     )
 
     meta = scheduler.build_connector_meta(out)
@@ -1672,7 +1684,9 @@ def test_resumed_partial_tail_uses_exact_boundary():
     assert meta.requests[0].num_prompt_tokens == 13
     assert meta.requests[0].prefill_end_tokens == 20
     tracker = scheduler._request_trackers["req-0"]
-    assert tracker.num_saved_tokens == 0
+    assert tracker.num_saved_tokens == 16
+    assert tracker.attention_save_submitted
+    assert meta.requests[0].token_len_chunk == 16
     assert tracker.has_pending_offload is True
 
 
@@ -1744,7 +1758,7 @@ def test_store_job_blocks_are_released_once_every_rank_reports():
     # dropped once the last of them reports. Until then the engine has to keep
     # stepping: a completion only reaches the scheduler as worker metadata
     # attached to a step, and a finishing request no longer defers its own free.
-    scheduler = _make_bare_scheduler()
+    scheduler = _make_bare_scheduler(with_mamba=False)
     scheduler._num_workers = 2
     _add_unfinished_request(
         scheduler,
@@ -1979,3 +1993,148 @@ def test_missing_final_checkpoint_logged_once_at_cleanup(
         calls = log.call_count
         scheduler.build_connector_meta(cleanup)
         assert log.call_count == calls
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_attention_waits_for_final_mamba_and_saves_the_full_prefix(use_eagle):
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    scheduler._store_group_ids = (0, 1)
+    prefill_end = 69 if use_eagle else 65
+    groups = scheduler._store_coord.kv_cache_groups
+    scheduler._store_coord = MooncakeStoreCoordinator(
+        [
+            KVCacheGroupSpec(
+                ["attention"], groups[0].kv_cache_spec, is_eagle_group=use_eagle
+            ),
+            groups[1],
+        ],
+        16,
+        4,
+        use_eagle=use_eagle,
+        enable_partial_hash_hits=True,
+    )
+    _register_offload_request(
+        scheduler, prefill_end_tokens=prefill_end, num_prompt_tokens=prefill_end
+    )
+    request = scheduler._unfinished_requests["req-0"][0]
+    request.all_token_ids = list(range(prefill_end))
+    request.block_hashes = [bytes([i]) for i in range(prefill_end // 4)]
+    tracker = scheduler._request_trackers["req-0"]
+    tracker.token_len = 0
+    tracker.num_saved_tokens = 0
+    tracker.allocated_block_ids = ([1, 2, 3, 4, 5], [0])
+    tracker.token_ids = []
+    for start, end, handoffs in (
+        (0, 24, [(1, 7, 16)]),
+        (24, 48, [(1, 8, 32)]),
+        (48, prefill_end, [(1, 9, 64)]),
+    ):
+        out = _make_offload_only_output(handoffs, tracker.allocated_block_ids)
+        out.scheduled_cached_reqs = SimpleNamespace(
+            req_ids=["req-0"],
+            new_block_ids=[()],
+            num_computed_tokens=[start],
+            resumed_req_ids=set(),
+        )
+        out.num_scheduled_tokens = {"req-0": end - start}
+        meta = scheduler.build_connector_meta(out)
+        if end < prefill_end:
+            assert meta.requests == []
+            assert tracker.num_saved_tokens == 0
+            assert all(block.ref_cnt == 0 for block in scheduler._gpu_block_pool.blocks)
+    assert len(meta.requests) == 1
+    req_meta = meta.requests[0]
+    assert req_meta.token_len_chunk == 64
+    assert req_meta.boundary_puts == (
+        [(0, 5, 68), (1, 9, 64)] if use_eagle else [(1, 9, 64)]
+    )
+    assert req_meta.token_ids == list(range(64))
+    assert tracker.attention_save_submitted
+
+    # Exercise the real send path: the final job must write the earlier
+    # attention blocks too, even though no intermediate jobs were submitted.
+    store = MagicMock()
+    written = set()
+    store.batch_is_exist.side_effect = lambda keys: [int(k in written) for k in keys]
+
+    def put(keys, *args):
+        written.update(keys)
+        return [0] * len(keys)
+
+    store.batch_put_from_multi_buffers.side_effect = put
+    token_dbs = []
+    for group in (0, 1):
+        db = ChunkedTokenDatabase(
+            KeyMetadata("m", 0, 0, 0, 0, group_id=group),
+            block_size=16,
+            hash_block_size=4,
+        )
+        db.set_kv_caches_base_addr([group * 10_000])
+        db.set_block_len([512])
+        token_dbs.append(db)
+    send = KVCacheStoreSendingThread(
+        store=store,
+        coord=scheduler._store_coord,
+        token_databases=token_dbs,
+        block_size=16,
+        tp_rank=0,
+        group_put_steps=[1, 1],
+        kv_role="kv_both",
+        ready_event=threading.Event(),
+        replicate_config=MagicMock(),
+    )
+    send.add_request(req_meta)
+    send._handle_request(send.request_queue.get())
+    attention_hash_indices = (3, 7, 11, 15, 16) if use_eagle else (3, 7, 11, 15)
+    assert written == {
+        *(
+            token_dbs[0].key_for(request.block_hashes[i])
+            for i in attention_hash_indices
+        ),
+        token_dbs[1].key_for(request.block_hashes[15]),
+    }
+    scheduler.update_connector_output(_make_worker_output({req_meta.store_job_id: 1}))
+    assert all(block.ref_cnt == 0 for block in scheduler._gpu_block_pool.blocks)
+    assert (
+        scheduler.build_connector_meta(
+            _make_offload_only_output([(1, 10, 64)], tracker.allocated_block_ids)
+        ).requests
+        == []
+    )
+
+
+def test_later_mamba_group_does_not_resubmit_attention():
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    scheduler._boundary_state_group_ids = frozenset({1, 2})
+    scheduler._store_group_id_by_kv_cache_group_id = {0: 0, 1: 1, 2: 2}
+    groups = scheduler._store_coord.kv_cache_groups
+    scheduler._store_coord = MooncakeStoreCoordinator(
+        [*groups, KVCacheGroupSpec(["mamba2"], groups[1].kv_cache_spec)],
+        16,
+        4,
+        enable_partial_hash_hits=True,
+    )
+    _register_offload_request(scheduler, prefill_end_tokens=45, num_prompt_tokens=45)
+    first = scheduler.build_connector_meta(
+        _make_offload_only_output([(1, 7, 44)], ([1, 2, 3],))
+    ).requests[0]
+    second = scheduler.build_connector_meta(
+        _make_offload_only_output([(2, 8, 44)], ([1, 2, 3],))
+    ).requests[0]
+    assert first.token_len_chunk == 32
+    assert first.boundary_puts == [(0, 3, 44), (1, 7, 44)]
+    assert second.token_len_chunk == 0
+    assert second.boundary_puts == [(2, 8, 44)]
+    assert scheduler._pinned_saves[second.store_job_id][0] == [8]
+
+
+def test_hybrid_prompt_completion_without_mamba_queues_no_attention():
+    scheduler = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    out = _make_new_scheduler_output()
+    scheduler._unfinished_requests["req-0"] = (out.request, ([0, 1],))
+    meta = scheduler.build_connector_meta(out)
+    assert meta.requests == []
+    tracker = scheduler._request_trackers["req-0"]
+    assert not tracker.attention_save_submitted
+    assert not tracker.partial_tail_sent
+    assert scheduler._pinned_saves == {}
