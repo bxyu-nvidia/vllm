@@ -262,6 +262,8 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    batch_underfill_reasons: list[str] = field(default_factory=list)
+
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None
 
     # Request IDs that are preempted in this step.

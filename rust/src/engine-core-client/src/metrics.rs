@@ -8,8 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use vllm_metrics::{
     CacheHitSourceLabels, EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric,
     LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
-    MooncakeOperationHistogramFamily, MooncakeOperationLabels, RequestMetrics,
-    SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
+    MooncakeOperationHistogramFamily, MooncakeOperationLabels, PREFILL_UNDERFILL_REASONS,
+    RequestMetrics, SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge,
+    WaitingReasonLabels,
 };
 
 use crate::protocol::stats::{
@@ -46,6 +47,8 @@ pub(crate) struct SchedulerStatsRecorder {
 
 /// Per-engine cached metric handles used while recording `SchedulerStats`.
 struct SchedulerStatsHandles {
+    prefill_batching: BTreeMap<&'static str, U64Counter>,
+    prefill_underfill_reasons: BTreeMap<&'static str, U64Counter>,
     // Base labels reused for dynamic child labels.
     labels: EngineLabels,
 
@@ -153,6 +156,26 @@ fn resolve_scheduler_stats_handles(
     };
 
     SchedulerStatsHandles {
+        prefill_batching: metrics
+            .prefill_batching
+            .iter()
+            .map(|(name, family)| (*name, family.get_or_create_owned(&labels)))
+            .collect(),
+        prefill_underfill_reasons: PREFILL_UNDERFILL_REASONS
+            .into_iter()
+            .map(|reason| {
+                (
+                    reason,
+                    metrics.prefill_underfilled_batches_by_reason.get_or_create_owned(
+                        &WaitingReasonLabels {
+                            model_name: model_name.to_string(),
+                            engine,
+                            reason,
+                        },
+                    ),
+                )
+            })
+            .collect(),
         scheduler_running: metrics.scheduler_running.get_or_create_owned(&labels),
         scheduler_waiting: metrics.scheduler_waiting.get_or_create_owned(&labels),
         scheduler_waiting_capacity: metrics
@@ -220,6 +243,29 @@ fn resolve_scheduler_stats_handles(
 
 /// Record scheduler-stats values through pre-resolved metric handles.
 fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &SchedulerStats) {
+    if let Some(batching) = &stats.prefill_batching_stats {
+        for (name, value) in [
+            ("completed_requests", batching.completed_requests),
+            ("request_forwards", batching.request_forwards),
+            ("request_tokens", batching.request_tokens),
+            (
+                "request_forward_observations",
+                batching.request_forward_observations,
+            ),
+            ("batch_tokens", batching.batch_tokens),
+            ("batch_requests", batching.batch_requests),
+            ("batches", batching.batches),
+            ("unused_token_slots", batching.unused_token_slots),
+            ("underfilled_batches", batching.underfilled_batches),
+        ] {
+            handles.prefill_batching[name].inc_by(value);
+        }
+        for (reason, count) in &batching.underfilled_reasons {
+            if let Some(counter) = handles.prefill_underfill_reasons.get(reason.as_str()) {
+                counter.inc_by(*count);
+            }
+        }
+    }
     // Scheduler state gauges.
     handles.scheduler_running.set(stats.num_running_reqs);
     handles
@@ -557,5 +603,57 @@ mod tests {
             rendered
                 .contains("vllm:nixl_xfer_time_seconds_count{model_name=\"model\",engine=\"0\"} 2")
         );
+    }
+}
+
+#[cfg(test)]
+mod prefill_batching_tests {
+    use super::*;
+    use crate::protocol::stats::PrefillBatchingStats;
+    use vllm_metrics::Metrics;
+
+    #[test]
+    fn prefill_batching_exports_delta_counters_without_histograms() {
+        let metrics = Metrics::new();
+        let handles = resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let stats = SchedulerStats {
+            prefill_batching_stats: Some(PrefillBatchingStats {
+                completed_requests: 1,
+                request_forwards: 3,
+                request_tokens: 320,
+                request_forward_observations: 3,
+                batch_tokens: 320,
+                batch_requests: 3,
+                batches: 3,
+                unused_token_slots: 64,
+                underfilled_batches: 1,
+                underfilled_reasons: BTreeMap::from([("request_tail".to_owned(), 1)]),
+            }),
+            ..Default::default()
+        };
+        // Exercise the DTO encoding used by Python's stats transport.
+        let wire = rmp_serde::to_vec_named(&stats).unwrap();
+        let decoded: SchedulerStats = rmp_serde::from_slice(&wire).unwrap();
+        record_scheduler_stats_with_handles(&handles, &decoded);
+        record_scheduler_stats_with_handles(&handles, &SchedulerStats::default());
+        let rendered = metrics.render().unwrap();
+        let lines = rendered
+            .lines()
+            .filter(|line| line.starts_with("vllm:prefill_") && !line.contains("by_reason"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        expect_test::expect![[r#"
+            vllm:prefill_completed_requests_total{model_name="model",engine="0"} 1
+            vllm:prefill_request_forwards_total{model_name="model",engine="0"} 3
+            vllm:prefill_request_tokens_total{model_name="model",engine="0"} 320
+            vllm:prefill_request_forward_observations_total{model_name="model",engine="0"} 3
+            vllm:prefill_batch_tokens_total{model_name="model",engine="0"} 320
+            vllm:prefill_batch_requests_total{model_name="model",engine="0"} 3
+            vllm:prefill_batches_total{model_name="model",engine="0"} 3
+            vllm:prefill_unused_token_slots_total{model_name="model",engine="0"} 64
+            vllm:prefill_underfilled_batches_total{model_name="model",engine="0"} 1"#]]
+        .assert_eq(&lines);
+        assert!(rendered.contains("reason=\"request_tail\"} 1"));
+        assert!(!rendered.contains("prefill_batch_tokens_bucket"));
     }
 }

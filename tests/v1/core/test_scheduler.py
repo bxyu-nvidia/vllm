@@ -7579,3 +7579,139 @@ def test_diffusion_read_deferral_keeps_a_longer_pp_wait():
     # Deferring this step alone would ask for 6. The PP wait to 7 stands.
     assert "read" not in scheduler.schedule().num_scheduled_tokens
     assert read.next_decode_eligible_step == 7
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_prefill_batching_counts_chunks_and_excludes_decode(async_scheduling):
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        max_num_batched_tokens=128,
+        max_model_len=1024,
+        async_scheduling=async_scheduling,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=320, max_tokens=5)
+    scheduler.add_request(request)
+    for chunk, finishes in [(128, False), (128, False), (64, True)]:
+        scheduled = scheduler.schedule()
+        stats = scheduler.make_stats().prefill_batching_stats
+        assert stats.batch_tokens == chunk
+        assert stats.batches == stats.batch_requests == 1
+        assert stats.request_tokens == chunk
+        assert stats.request_forward_observations == 1
+        assert stats.unused_token_slots == 128 - chunk
+        assert stats.underfilled_batches == int(chunk < 128)
+        if chunk < 128:
+            assert stats.underfilled_reasons == {"request_tail": 1}
+        outputs = scheduler.update_from_output(
+            scheduled,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[42] if finishes else []],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+        completion = next(iter(outputs.values())).scheduler_stats.prefill_batching_stats
+        assert completion.completed_requests == int(finishes)
+        assert completion.request_forwards == (3 if finishes else 0)
+    scheduler.schedule()  # A subsequent decode step must not enter prefill averages.
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.batches == stats.request_forward_observations == 0
+    assert scheduler.make_stats().prefill_batching_stats.request_forwards == 0
+
+
+def test_prefill_batching_underfill_records_alignment_and_request_limit(monkeypatch):
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        max_num_seqs=1,
+        max_num_batched_tokens=256,
+        max_model_len=1024,
+    )
+    for request in create_requests(num_requests=2, num_tokens=200):
+        scheduler.add_request(request)
+    scheduler.need_mamba_block_aligned_split = True
+    monkeypatch.setattr(
+        scheduler,
+        "_mamba_block_aligned_split",
+        lambda request, tokens, *args: min(tokens, 64),
+    )
+    scheduler.schedule()
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.batch_tokens == 64
+    assert stats.underfilled_reasons["mamba_alignment"] == 1
+    assert stats.underfilled_reasons["request_limit"] == 1
+    assert stats.underfilled_batches == 1  # Reasons overlap, batches don't.
+
+
+def test_prefill_batching_excludes_async_cache_load_steps():
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        max_num_batched_tokens=256,
+        max_model_len=1024,
+        use_kv_connector=mock_kv(matched_tokens=128, is_async=True),
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=256)
+    scheduler.add_request(request)
+    scheduled = scheduler.schedule()
+    assert scheduled.total_num_scheduled_tokens == 0
+    assert scheduler.make_stats().prefill_batching_stats.batches == 0
+    scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            kv_connector_output=KVConnectorOutput(
+                finished_recving={request.request_id}
+            ),
+        ),
+    )
+    scheduled = scheduler.schedule()
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert scheduled.total_num_scheduled_tokens == 128
+    assert stats.batches == stats.request_forward_observations == 1
+    assert stats.request_tokens == stats.batch_tokens == 128
+    assert request.prefill_stats.num_forwards == 1
+
+
+def test_prefill_batching_excludes_decode_consumers():
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+        kv_role="kv_consumer",
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=32)
+    scheduler.add_request(request)
+    scheduled = scheduler.schedule()
+    assert scheduled.total_num_scheduled_tokens == 32
+    assert scheduler.make_stats().prefill_batching_stats is None
+    outputs = scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[42]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    stats = next(iter(outputs.values())).scheduler_stats.prefill_batching_stats
+    assert stats is None
+    assert scheduled.batch_underfill_reasons == []
+
+
+def test_prefill_batching_metrics_are_disabled_by_default():
+    scheduler = create_scheduler(max_num_batched_tokens=128, max_model_len=1024)
+    (request,) = create_requests(num_requests=1, num_tokens=32)
+    scheduler.add_request(request)
+    scheduled = scheduler.schedule()
+    assert scheduled.total_num_scheduled_tokens == 32
+    assert scheduled.batch_underfill_reasons == []
+    assert request.prefill_stats.num_forwards == 0
+    assert scheduler.make_stats().prefill_batching_stats is None

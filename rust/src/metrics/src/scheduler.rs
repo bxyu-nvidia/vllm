@@ -11,6 +11,39 @@ use prometheus_client::registry::Registry;
 
 use crate::{F64Gauge, Histogram, HistogramFamily, U64Counter, U64Gauge};
 
+// Keep fields and reasons in sync with vllm/v1/metrics/batching.py.
+pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 9] = [
+    "completed_requests",
+    "request_forwards",
+    "request_tokens",
+    "request_forward_observations",
+    "batch_tokens",
+    "batch_requests",
+    "batches",
+    "unused_token_slots",
+    "underfilled_batches",
+];
+pub const PREFILL_UNDERFILL_REASONS: [&str; 18] = [
+    "mamba_alignment",
+    "long_prefill_limit",
+    "prefill_lookahead",
+    "kv_capacity",
+    "kv_lookup_pending",
+    "kv_load_pending",
+    "blocked_request",
+    "request_limit",
+    "dp_prefill_throttle",
+    "lora_limit",
+    "chunked_prefill_disabled",
+    "input_budget_reserved",
+    "scheduling_token_limit",
+    "encoder_constraint",
+    "in_flight_output",
+    "preemption",
+    "request_tail",
+    "no_other_constraint_observed",
+];
+
 const KV_CACHE_RESIDENCY_BUCKETS: [f64; 21] = [
     0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0,
     120.0, 300.0, 600.0, 1200.0, 1800.0,
@@ -228,6 +261,8 @@ impl SchedulerLogStatsAccumulator {
 
 /// Scheduler/batch-scoped Prometheus families exported from `SchedulerStats`.
 pub struct SchedulerMetrics {
+    pub prefill_batching: BTreeMap<&'static str, Family<EngineLabels, U64Counter>>,
+    pub prefill_underfilled_batches_by_reason: Family<WaitingReasonLabels, U64Counter>,
     // Scheduler state gauges.
     pub scheduler_running: Family<EngineLabels, U64Gauge>,
     pub scheduler_waiting: Family<EngineLabels, U64Gauge>,
@@ -285,6 +320,27 @@ impl SchedulerMetrics {
     /// Register the scheduler-oriented metric families into the shared
     /// registry.
     pub(crate) fn register(registry: &mut Registry) -> Self {
+        let prefill_batching = PREFILL_BATCH_COUNTER_FIELDS
+            .into_iter()
+            .map(|field| {
+                let family = Family::default();
+                registry.register(
+                    format!("vllm:prefill_{field}"),
+                    format!(
+                        "Scheduler-visible prefill {field}; excludes draft and cache-only steps"
+                    ),
+                    family.clone(),
+                );
+                (field, family)
+            })
+            .collect();
+        let prefill_underfilled_batches_by_reason = Family::default();
+        registry.register(
+            "vllm:prefill_underfilled_batches_by_reason",
+            "Constraints observed in underfilled prefill batches; reasons can overlap",
+            prefill_underfilled_batches_by_reason.clone(),
+        );
+
         // Scheduler state gauges.
         let scheduler_running = Family::default();
         registry.register(
@@ -534,6 +590,8 @@ impl SchedulerMetrics {
         );
 
         Self {
+            prefill_batching,
+            prefill_underfilled_batches_by_reason,
             scheduler_running,
             scheduler_waiting,
             scheduler_waiting_by_reason,

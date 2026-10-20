@@ -81,6 +81,7 @@ def create_scheduler(
     kv_cache_spec: KVCacheSpec | None = None,
     runner: RunnerOption = "auto",
     per_request_spec_decode_metrics: str = "none",
+    enable_prefill_batching_metrics: bool = False,
     scheduling_policy: SchedulerPolicy = "fcfs",
     diffusion_canvas_length: int | None = None,
     scheduler_cls: type[Scheduler] | None = None,
@@ -212,6 +213,7 @@ def create_scheduler(
         ec_transfer_config=ec_transfer_config,
         observability_config=ObservabilityConfig(
             per_request_spec_decode_metrics=per_request_spec_decode_metrics,
+            enable_prefill_batching_metrics=enable_prefill_batching_metrics,
         ),
     )
     if kv_cache_spec is None:
