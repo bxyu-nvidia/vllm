@@ -1743,17 +1743,7 @@ def test_scheduler_reset_prefix_cache():
     for request in requests:
         request.num_in_flight_tokens = 0
 
-    # A connector may retain a checkpoint until prefill completes. Reset must
-    # release that unsent candidate during preemption, before resetting the pool.
-    pool = scheduler.kv_cache_manager.block_pool
-    candidate = pool.get_new_blocks(1)[0]
-    scheduler.connector = Mock()
-    scheduler.connector.request_preempted.side_effect = lambda req_id: (
-        pool.free_blocks([candidate]) if req_id == requests[0].request_id else None
-    )
     assert scheduler.reset_prefix_cache(reset_running_requests=True)
-    assert candidate.ref_cnt == 0
-    assert scheduler.connector.request_preempted.call_count == len(requests)
     scheduler.aux_output_connector.reset.assert_called_once_with()
 
     # Verify requests moved from running to waiting

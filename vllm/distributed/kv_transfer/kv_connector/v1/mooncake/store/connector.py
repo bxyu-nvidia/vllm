@@ -265,15 +265,9 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
-        assert self.connector_scheduler is not None
-        self.connector_scheduler.request_finished(request, block_ids)
         # An in-flight store job holds its own reference on the blocks it reads,
         # so a finishing request never has to defer freeing them.
         return False, None
-
-    def request_preempted(self, request_id: str) -> None:
-        assert self.connector_scheduler is not None
-        self.connector_scheduler.request_preempted(request_id)
 
     def register_finished_partial_tail(
         self,

@@ -154,14 +154,6 @@ KVConnectorFactory.register_connector(
 )
 
 
-def test_preemption_notifies_every_connector():
-    connector = object.__new__(MultiConnector)
-    connector._connectors = [MagicMock(), MagicMock()]
-    connector.request_preempted("req-0")
-    for child in connector._connectors:
-        child.request_preempted.assert_called_once_with("req-0")
-
-
 def test_register_finished_partial_tail_notifies_every_connector():
     connector = object.__new__(MultiConnector)
     first = MagicMock(spec_set=KVConnectorBase_V1)

@@ -63,8 +63,6 @@ def _partial_tail_non_mamba_puts(
     coord: MooncakeStoreCoordinator,
     req_meta: ReqMeta,
     block_sizes: Sequence[int],
-    *,
-    checkpoint_boundary: int | None = None,
 ) -> list[BoundaryPut]:
     """Locate the non-Mamba blocks a partial-tail save publishes.
 
@@ -95,11 +93,7 @@ def _partial_tail_non_mamba_puts(
     ]
     # The tail is due on the save that first covers the prompt, or when Mamba
     # hands off its checkpoint state.
-    if (
-        checkpoint_boundary is None
-        and not mamba_tails
-        and not req_meta.publish_partial_tail
-    ):
+    if not mamba_tails and not req_meta.publish_partial_tail:
         return []
     prompt_tokens = req_meta.num_prompt_tokens
     completed = req_meta.completed_token_len
@@ -107,21 +101,21 @@ def _partial_tail_non_mamba_puts(
     hash_block_size = coord.hash_block_size
     # Core drops the Mamba checkpoint whenever EAGLE block drop is on, whichever
     # groups carry the eagle flag.
-    boundary = (
-        checkpoint_boundary
-        if checkpoint_boundary is not None
-        else get_mamba_prefill_checkpoint_position(
-            prompt_tokens, hash_block_size, coord.use_eagle
-        )
+    boundary = get_mamba_prefill_checkpoint_position(
+        prompt_tokens, hash_block_size, coord.use_eagle
     )
+    # Resumed prefills include previously generated tokens. Match their exact
+    # checkpoint handoff while preserving the original prompt-tail save.
+    if req_meta.prefill_end_tokens is not None:
+        resumed_boundary = get_mamba_prefill_checkpoint_position(
+            req_meta.prefill_end_tokens, hash_block_size, coord.use_eagle
+        )
+        if resumed_boundary in mamba_tails:
+            boundary = resumed_boundary
     # Any other sub-block Mamba hand-off is a shared-prefix junction. Its
     # attention KV, EAGLE proof included, ends on an attention block end no later
     # than this checkpoint's proof, so the normal and prompt-tail saves store it.
-    if (
-        checkpoint_boundary is None
-        and not req_meta.publish_partial_tail
-        and boundary not in mamba_tails
-    ):
+    if not req_meta.publish_partial_tail and boundary not in mamba_tails:
         return []
     num_hashes = len(req_meta.block_hashes)
     if boundary == 0 or boundary // hash_block_size > num_hashes:
@@ -314,9 +308,9 @@ class MooncakeStoreScheduler:
         can_process_cached = not is_consumer or self.save_decode_cache
 
         for finished_req_id in scheduler_output.finished_req_ids:
+            self._log_missing_final_mamba_checkpoint(finished_req_id)
             self.client.discard(finished_req_id)
             self.load_specs.pop(finished_req_id, None)
-            self._discard_pending_mamba(finished_req_id)
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
             self._unfinished_request_ids.discard(finished_req_id)
@@ -325,7 +319,6 @@ class MooncakeStoreScheduler:
         for req_id in preempted_ids:
             self.load_specs.pop(req_id, None)
             if request_tracker := self._request_trackers.get(req_id):
-                self._discard_pending_mamba(req_id)
                 request_tracker.reset()
             self._unfinished_requests.pop(req_id, None)
 
@@ -514,25 +507,15 @@ class MooncakeStoreScheduler:
             and block_state.boundary_state_offloads
             and not is_consumer
         ):
-            self._handle_boundary_state_offloads(block_state.boundary_state_offloads)
-
-        for req_id, tracker in self._request_trackers.items():
-            if tracker.pending_mamba_puts and req_id in self._unfinished_requests:
-                pending_request, _ = self._unfinished_requests[req_id]
-                if (
-                    pending_request.num_computed_tokens
-                    - pending_request.num_in_flight_tokens
-                    >= tracker.prefill_end_tokens
-                    and block_state is not None
-                ):
-                    pending_block_ids = block_state.get_block_ids(req_id)
-                    if pending_block_ids is not None:
-                        self._queue_final_mamba_save(pending_request, pending_block_ids)
+            self._handle_boundary_state_offloads(
+                block_state.boundary_state_offloads, meta
+            )
 
         self._apply_current_save_block_ids(meta, scheduler_output)
 
-        # Final Mamba jobs already own their source pins and block snapshots,
-        # including jobs registered at request finish before its cleanup.
+        # Finish-time handoffs arrive after the producing step's metadata was
+        # built. Their exact blocks were pinned when they were registered, so
+        # they remain valid after request cleanup and need no current snapshot.
         for req_meta in self._finished_partial_tail_metas.values():
             meta.add_request(req_meta)
         self._finished_partial_tail_metas.clear()
@@ -612,60 +595,79 @@ class MooncakeStoreScheduler:
             self._pinned_saves[store_job_id] = (block_ids, self._num_workers)
             pool.touch([pool.blocks[block_id] for block_id in block_ids])
 
-    def _discard_pending_mamba(self, req_id: str) -> None:
-        tracker = self._request_trackers.get(req_id)
-        if tracker is None or not tracker.pending_mamba_puts:
+    def _log_missing_final_mamba_checkpoint(self, req_id: str) -> None:
+        # Finish-time handoffs are registered before request cleanup. Checking
+        # here avoids reporting a missing state while its forward is in flight.
+        if self.kv_role == "kv_consumer" or not self._boundary_state_group_ids:
             return
-        pool = self._gpu_block_pool
-        assert pool is not None
-        pool.free_blocks(
-            pool.blocks[put.block_id] for put in tracker.pending_mamba_puts.values()
-        )
-        tracker.pending_mamba_puts.clear()
-
-    def _retain_latest_mamba(
-        self, req_id: str, entries: list[tuple[int, int, int]]
-    ) -> None:
         tracker = self._request_trackers.get(req_id)
-        if tracker is None or self.kv_role == "kv_consumer":
+        req_tuple = self._unfinished_requests.get(req_id)
+        if tracker is None or req_tuple is None or tracker.prefill_end_tokens <= 0:
             return
+        request = req_tuple[0]
+        completed = request.num_computed_tokens - request.num_in_flight_tokens
+        if completed < tracker.prefill_end_tokens:
+            return
+        missing_groups = self._boundary_state_group_ids - tracker.submitted_mamba_groups
         alignment = (
             self._hash_block_size if self.enable_partial_hash_hits else self._block_size
         )
         final_boundary = get_mamba_prefill_checkpoint_position(
             tracker.prefill_end_tokens, alignment, self._store_coord.use_eagle
         )
-        pool = self._gpu_block_pool
-        assert pool is not None
+        if missing_groups and final_boundary > 0:
+            logger.info(
+                "MooncakeFinalMambaCheckpointMissing req_id=%s "
+                "prefill_end_tokens=%d target_boundary=%d missing_groups=%s: "
+                "no final checkpoint save was queued for these groups; "
+                "earlier checkpoints were not retained as fallback",
+                req_id,
+                tracker.prefill_end_tokens,
+                final_boundary,
+                sorted(missing_groups),
+            )
+
+    def _claim_final_mamba_puts(
+        self, tracker: RequestTracker, entries: list[tuple[int, int, int]]
+    ) -> list[BoundaryPut]:
+        """Select the known final checkpoint without retaining intermediate states."""
+        alignment = (
+            self._hash_block_size if self.enable_partial_hash_hits else self._block_size
+        )
+        final_boundary = get_mamba_prefill_checkpoint_position(
+            tracker.prefill_end_tokens, alignment, self._store_coord.use_eagle
+        )
+        if final_boundary == 0:
+            return []
+        puts: list[BoundaryPut] = []
         for group_id, block_id, boundary in entries:
             store_group_id = self._store_group_id_by_kv_cache_group_id.get(group_id)
             if (
-                store_group_id not in self._boundary_state_group_ids
-                or store_group_id in tracker.submitted_mamba_groups
+                boundary != final_boundary
                 or block_id == NULL_BLOCK_ID
-                or not 0 < boundary <= final_boundary
+                or store_group_id not in self._boundary_state_group_ids
+                or store_group_id in tracker.submitted_mamba_groups
             ):
                 continue
-            previous = tracker.pending_mamba_puts.get(store_group_id)
-            if previous is not None and previous.num_tokens >= boundary:
-                continue
-            pool.touch([pool.blocks[block_id]])
-            tracker.pending_mamba_puts[store_group_id] = BoundaryPut(
-                store_group_id, block_id, boundary
-            )
-            if previous is not None:
-                pool.free_blocks([pool.blocks[previous.block_id]])
+            puts.append(BoundaryPut(store_group_id, block_id, boundary))
+            tracker.submitted_mamba_groups.add(store_group_id)
+        return puts
 
-    def _queue_final_mamba_save(
-        self, request: Request, block_ids: tuple[list[int], ...]
-    ) -> None:
+    def register_finished_partial_tail(
+        self,
+        request: Request,
+        block_ids: tuple[list[int], ...],
+        partial_tail_offloads: list[tuple[int, int, int]],
+    ) -> bool:
+        """Queue and pin a finish-time tail for the next connector step."""
+        if self.kv_role == "kv_consumer" or not partial_tail_offloads:
+            return False
         tracker = self._request_trackers.get(request.request_id)
-        if tracker is None or not tracker.pending_mamba_puts:
-            return
-        completed = request.num_computed_tokens - request.num_in_flight_tokens
-        if completed < tracker.prefill_end_tokens:
-            return
-        mamba_puts = list(tracker.pending_mamba_puts.values())
+        if tracker is None or not any(block_ids):
+            return False
+        mamba_puts = self._claim_final_mamba_puts(tracker, partial_tail_offloads)
+        if not mamba_puts:
+            return False
         req_meta = ReqMeta(
             req_id=request.request_id,
             token_len_chunk=0,
@@ -677,74 +679,73 @@ class MooncakeStoreScheduler:
             num_prompt_tokens=request.num_prompt_tokens,
             prefill_end_tokens=tracker.prefill_end_tokens,
             boundary_puts=mamba_puts,
-            completed_token_len=completed,
+            completed_token_len=request.num_computed_tokens,
         )
-        # A fallback checkpoint or a resumed prefill may end at a different
-        # boundary from the original prompt. Save its exact attention support.
-        tail = list(
-            dict.fromkeys(
-                put
-                for boundary in sorted({put.num_tokens for put in mamba_puts})
-                for put in _partial_tail_non_mamba_puts(
-                    self._store_coord,
-                    req_meta,
-                    [
-                        g.kv_cache_spec.block_size
-                        for g in self._store_coord.kv_cache_groups
-                    ],
-                    checkpoint_boundary=boundary,
-                )
-            )
+        coord = self._store_coord
+        req_meta.boundary_puts = [
+            *_partial_tail_non_mamba_puts(
+                coord,
+                req_meta,
+                [g.kv_cache_spec.block_size for g in coord.kv_cache_groups],
+            ),
+            *mamba_puts,
+        ]
+        pinned_block_ids = list(
+            dict.fromkeys(put.block_id for put in req_meta.boundary_puts)
         )
         pool = self._gpu_block_pool
-        assert pool is not None
-        # Transfer candidate pins to the job; acquire only the attention pins.
-        pinned_block_ids = [put.block_id for put in mamba_puts]
-        for block_id in dict.fromkeys(put.block_id for put in tail):
-            if block_id not in pinned_block_ids:
-                pool.touch([pool.blocks[block_id]])
-                pinned_block_ids.append(block_id)
-        req_meta.boundary_puts = [*tail, *mamba_puts]
+        assert pool is not None, (
+            "GPU block pool must be bound before a finish-time handoff"
+        )
+        assert request.request_id not in self._finished_partial_tail_metas
         store_job_id = self._next_store_job_id
         self._next_store_job_id += 1
-        req_meta.store_job_id = store_job_id
         self._pinned_saves[store_job_id] = (pinned_block_ids, self._num_workers)
-        assert request.request_id not in self._finished_partial_tail_metas
+        pool.touch([pool.blocks[block_id] for block_id in pinned_block_ids])
+        req_meta.store_job_id = store_job_id
         self._finished_partial_tail_metas[request.request_id] = req_meta
-        tracker.submitted_mamba_groups.update(tracker.pending_mamba_puts)
-        tracker.pending_mamba_puts.clear()
         tracker.has_pending_offload = True
-
-    def register_finished_partial_tail(
-        self,
-        request: Request,
-        block_ids: tuple[list[int], ...],
-        partial_tail_offloads: list[tuple[int, int, int]],
-    ) -> bool:
-        """Include the finish-time checkpoint before selecting the final state."""
-        self._retain_latest_mamba(request.request_id, partial_tail_offloads)
-        self._queue_final_mamba_save(request, block_ids)
+        # The store job owns exact block refs, so request cleanup need not wait.
         return False
-
-    def request_preempted(self, request_id: str) -> None:
-        """Release unsent candidates immediately, including during cache reset."""
-        self._discard_pending_mamba(request_id)
-
-    def request_finished(
-        self, request: Request, block_ids: tuple[list[int], ...]
-    ) -> None:
-        """Save completed prefills before cleanup; discard aborted candidates."""
-        self._queue_final_mamba_save(request, block_ids)
-        self._discard_pending_mamba(request.request_id)
 
     def _handle_boundary_state_offloads(
         self,
         offloads: dict[str, list[tuple[int, int, int]]],
+        meta: MooncakeStoreConnectorMetadata,
     ) -> None:
-        """Retain only the newest candidate; publish after prefill completes."""
+        """Attach the final checkpoint to this step's existing save when possible.
+
+        The producing step's connector event fences the exact CoW block. If no
+        ordinary save is due, an offload-only job uses the same transfer and
+        pinning path. Intermediate checkpoints acquire no store references.
+        """
+        save_metas = {m.req_id: m for m in meta.requests if m.can_save}
         for req_id, entries in offloads.items():
-            if req_id in self._unfinished_requests:
-                self._retain_latest_mamba(req_id, entries)
+            tracker = self._request_trackers.get(req_id)
+            req_tuple = self._unfinished_requests.get(req_id)
+            if tracker is None or req_tuple is None:
+                logger.debug("Dropping boundary-state offload for request %s", req_id)
+                continue
+            accepted = self._claim_final_mamba_puts(tracker, entries)
+            if not accepted:
+                continue
+            tracker.has_pending_offload = True
+            if (req_meta := save_metas.get(req_id)) is not None:
+                req_meta.boundary_puts = accepted
+                continue
+            meta.add_request(
+                ReqMeta(
+                    req_id=req_id,
+                    token_len_chunk=0,
+                    block_ids=tracker.allocated_block_ids,
+                    block_hashes=req_tuple[0].block_hashes,
+                    can_save=True,
+                    num_prompt_tokens=req_tuple[0].num_prompt_tokens,
+                    prefill_end_tokens=tracker.prefill_end_tokens,
+                    boundary_puts=accepted,
+                    completed_token_len=tracker.token_len,
+                )
+            )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         """Drop the block references of store jobs every rank has finished."""

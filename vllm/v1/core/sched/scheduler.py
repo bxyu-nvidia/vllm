@@ -1586,8 +1586,6 @@ class Scheduler(SchedulerInterface):
         )
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
-        if self.connector is not None:
-            self.connector.request_preempted(request.request_id)
         if self.kv_cache_manager.block_pool.trace is not None:
             self.kv_cache_manager.block_pool.trace.detach(request.request_id)
         self._free_request_blocks(request)

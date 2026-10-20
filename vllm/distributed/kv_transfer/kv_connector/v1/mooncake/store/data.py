@@ -713,8 +713,7 @@ class RequestTracker:
     # request it includes previously-generated tokens, which are re-prefilled.
     prefill_end_tokens: int = 0
     partial_tail_sent: bool = False
-    # One pinned candidate per group until this prefill completes.
-    pending_mamba_puts: dict[int, "BoundaryPut"] = field(default_factory=dict)
+    # At most one final checkpoint per group for this prefill.
     submitted_mamba_groups: set[int] = field(default_factory=set)
 
     def reset(self) -> None:
@@ -725,7 +724,6 @@ class RequestTracker:
         self.has_pending_offload = False
         self.prefill_end_tokens = 0
         self.partial_tail_sent = False
-        assert not self.pending_mamba_puts, "Release pending Mamba pins before reset"
         self.submitted_mamba_groups.clear()
 
     def update(

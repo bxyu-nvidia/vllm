@@ -580,10 +580,6 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             lambda c: c.request_finished(request, blocks),
         )
 
-    def request_preempted(self, request_id: str) -> None:
-        for connector in self._connectors:
-            connector.request_preempted(request_id)
-
     def register_finished_partial_tail(
         self,
         request: "Request",
