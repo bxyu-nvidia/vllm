@@ -7595,6 +7595,8 @@ def test_prefill_batching_counts_chunks_and_excludes_decode(async_scheduling):
         scheduled = scheduler.schedule()
         stats = scheduler.make_stats().prefill_batching_stats
         assert stats.batch_tokens == chunk
+        assert stats.readiness_steps == stats.ready_requests == 1
+        assert stats.ready_unscheduled_requests == stats.unexamined_requests == 0
         assert stats.batches == stats.batch_requests == 1
         assert stats.request_tokens == chunk
         assert stats.request_forward_observations == 1
@@ -7619,6 +7621,7 @@ def test_prefill_batching_counts_chunks_and_excludes_decode(async_scheduling):
     scheduler.schedule()  # A subsequent decode step must not enter prefill averages.
     stats = scheduler.make_stats().prefill_batching_stats
     assert stats.batches == stats.request_forward_observations == 0
+    assert stats.readiness_steps == stats.ready_requests == 0
     assert scheduler.make_stats().prefill_batching_stats.request_forwards == 0
 
 
@@ -7660,6 +7663,8 @@ def test_prefill_batching_excludes_async_cache_load_steps():
     assert stats.batches == 0
     assert stats.delay_steps == 1
     assert stats.blocked_requests == {"kv_load_pending": 1}
+    assert stats.readiness_steps == 1
+    assert stats.ready_requests == stats.unexamined_requests == 0
     assert scheduler.schedule().total_num_scheduled_tokens == 0
     assert scheduler.make_stats().prefill_batching_stats.blocked_requests == {
         "kv_load_pending": 1
@@ -7854,6 +7859,8 @@ def test_prefill_alignment_zero_tokens_counts_blocked_request():
     stats = scheduler.make_stats().prefill_batching_stats
     assert stats.delay_steps == 1
     assert stats.blocked_requests == {"mamba_alignment": 1}
+    assert stats.ready_requests == 1
+    assert stats.ready_unscheduled_requests == stats.unexamined_requests == 0
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -7898,3 +7905,58 @@ def test_prefill_fully_cached_load_is_counted_as_waiting():
     assert scheduler.schedule().total_num_scheduled_tokens == 0
     stats = scheduler.make_stats().prefill_batching_stats
     assert stats.blocked_requests == {"kv_load_pending": 1}
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prefill_readiness_distinguishes_pending_ready_and_unexamined(
+    monkeypatch, enabled
+):
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=enabled,
+        max_num_batched_tokens=128,
+        max_model_len=1024,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+    )
+    requests = create_requests(num_requests=4, num_tokens=64)
+    for request in requests:
+        scheduler.add_request(request)
+    lookup = Mock(
+        side_effect=lambda req, local: (
+            (None, False) if req is requests[0] else (0, False)
+        )
+    )
+    monkeypatch.setattr(scheduler.connector, "get_num_new_matched_tokens", lookup)
+    scheduled = scheduler.schedule()
+    assert scheduled.num_scheduled_tokens == {
+        requests[1].request_id: 64,
+        requests[2].request_id: 64,
+    }
+    assert lookup.call_count == 3  # Metrics must not poll the fourth request.
+    stats = scheduler.make_stats().prefill_batching_stats
+    if enabled:
+        assert stats.readiness_steps == 1
+        assert stats.ready_requests == 2
+        assert stats.ready_unscheduled_requests == 0
+        assert stats.unexamined_requests == 1
+        assert stats.blocked_requests == {"kv_lookup_pending": 1}
+    else:
+        assert stats is None
+
+
+def test_prefill_ready_but_allocation_blocked_does_not_assume_rest_ready(monkeypatch):
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        max_num_batched_tokens=256,
+        max_model_len=1024,
+    )
+    for request in create_requests(num_requests=3, num_tokens=64):
+        scheduler.add_request(request)
+    allocate = Mock(return_value=None)
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_slots", allocate)
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    assert allocate.call_count == 1
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.readiness_steps == 1
+    assert stats.ready_requests == stats.ready_unscheduled_requests == 1
+    assert stats.unexamined_requests == 2
+    assert scheduler.make_stats().prefill_batching_stats.ready_requests == 0

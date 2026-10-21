@@ -321,6 +321,10 @@ pub struct PrefillBatchingStats {
     pub kv_lookup_pending_completed: u64,
     pub kv_lookup_pending_duration_ns: u64,
     pub kv_lookup_cancelled: u64,
+    pub readiness_steps: u64,
+    pub ready_requests: u64,
+    pub ready_unscheduled_requests: u64,
+    pub unexamined_requests: u64,
     pub delayed_requests: BTreeMap<String, u64>,
     pub blocked_requests: BTreeMap<String, u64>,
 }

@@ -292,6 +292,13 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
                 batching.kv_lookup_pending_duration_ns,
             ),
             ("kv_lookup_cancelled", batching.kv_lookup_cancelled),
+            ("readiness_steps", batching.readiness_steps),
+            ("ready_requests", batching.ready_requests),
+            (
+                "ready_unscheduled_requests",
+                batching.ready_unscheduled_requests,
+            ),
+            ("unexamined_requests", batching.unexamined_requests),
         ] {
             handles.prefill_batching[name].inc_by(value);
         }
@@ -673,6 +680,10 @@ mod prefill_batching_tests {
                 unused_token_slots: 64,
                 underfilled_batches: 1,
                 delay_steps: 4,
+                readiness_steps: 4,
+                ready_requests: 7,
+                ready_unscheduled_requests: 1,
+                unexamined_requests: 2,
                 kv_lookup_completed: 2,
                 kv_lookup_duration_ns: 6000000,
                 delayed_requests: [("kv_lookup_pending".to_owned(), 3)].into(),
@@ -714,7 +725,11 @@ mod prefill_batching_tests {
             vllm:prefill_kv_lookup_duration_ns_total{model_name="model",engine="0"} 6000000
             vllm:prefill_kv_lookup_pending_completed_total{model_name="model",engine="0"} 0
             vllm:prefill_kv_lookup_pending_duration_ns_total{model_name="model",engine="0"} 0
-            vllm:prefill_kv_lookup_cancelled_total{model_name="model",engine="0"} 0"#]]
+            vllm:prefill_kv_lookup_cancelled_total{model_name="model",engine="0"} 0
+            vllm:prefill_readiness_steps_total{model_name="model",engine="0"} 4
+            vllm:prefill_ready_requests_total{model_name="model",engine="0"} 7
+            vllm:prefill_ready_unscheduled_requests_total{model_name="model",engine="0"} 1
+            vllm:prefill_unexamined_requests_total{model_name="model",engine="0"} 2"#]]
         .assert_eq(&lines);
         assert!(rendered.contains("reason=\"request_tail\"} 1"));
         for reason in PREFILL_UNDERFILL_REASONS {

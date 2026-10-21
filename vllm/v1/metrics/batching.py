@@ -12,6 +12,11 @@ also cover schedules without a forward. Delay counts are request-step observatio
 not unique requests or a snapshot of the entire queue: unvisited requests are
 unknown. The denominator includes any step that examines an initial prefill,
 even if another constraint prevents it from running.
+Readiness is observed after lookup/load, alignment, and encoder/lookahead gates,
+but before KV allocation. Ready counts include scheduled requests; ready-unscheduled
+counts include allocation failures or subsequent preemption. Requests not examined
+in this step are reported separately, never assumed ready. Readiness observations
+are engine-step counts, including steps without a forward, not queue snapshots.
 """
 
 from collections import Counter
@@ -34,6 +39,10 @@ BATCH_COUNTER_FIELDS = (
     "kv_lookup_pending_completed",
     "kv_lookup_pending_duration_ns",
     "kv_lookup_cancelled",
+    "readiness_steps",
+    "ready_requests",
+    "ready_unscheduled_requests",
+    "unexamined_requests",
 )
 DELAY_REASONS = ("mamba_alignment", "kv_load_pending", "kv_lookup_pending")
 DELAY_COUNTER_FIELDS = (
@@ -88,6 +97,10 @@ class PrefillBatchingStats:
     kv_lookup_pending_completed: int = 0
     kv_lookup_pending_duration_ns: int = 0
     kv_lookup_cancelled: int = 0
+    readiness_steps: int = 0
+    ready_requests: int = 0
+    ready_unscheduled_requests: int = 0
+    unexamined_requests: int = 0
     delayed_requests: dict[str, int] = field(default_factory=dict)
     blocked_requests: dict[str, int] = field(default_factory=dict)
 

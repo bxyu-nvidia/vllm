@@ -69,6 +69,10 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
                 if reason.startswith("mamba_alignment")
             ],
         )
+        stats.readiness_steps = 3
+        stats.ready_requests = 4
+        stats.ready_unscheduled_requests = 1
+        stats.unexamined_requests = 2
         stats.kv_lookup_completed = 2
         stats.kv_lookup_duration_ns = 6_000_000
         stats.observe_delays(
@@ -87,6 +91,10 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
         assert samples["vllm:prefill_batches_total"] == 1
         assert samples["vllm:prefill_request_tokens_total"] == 96
         assert samples["vllm:prefill_request_forward_observations_total"] == 2
+        assert samples["vllm:prefill_readiness_steps_total"] == 3
+        assert samples["vllm:prefill_ready_requests_total"] == 4
+        assert samples["vllm:prefill_ready_unscheduled_requests_total"] == 1
+        assert samples["vllm:prefill_unexamined_requests_total"] == 2
         assert samples["vllm:prefill_kv_lookup_completed_total"] == 2
         assert samples["vllm:prefill_kv_lookup_duration_ns_total"] == 6_000_000
         assert samples["vllm:prefill_delay_steps_total"] == 1

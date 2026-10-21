@@ -679,6 +679,8 @@ class Scheduler(SchedulerInterface):
         )
         delay_candidates: dict[str, str] = {}
         observed_prefill = False
+        examined_prefills: set[str] = set()
+        ready_prefills: set[str] = set()
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
@@ -759,6 +761,13 @@ class Scheduler(SchedulerInterface):
                 if batch_constraints is not None:
                     batch_constraints.add("input_budget_reserved")
                 break
+
+            if (
+                self.prefill_batching_enabled
+                and request.prefill_stats is not None
+                and request.num_output_tokens == 0
+            ):
+                examined_prefills.add(request.request_id)
 
             if (
                 request.num_output_placeholders > 0
@@ -898,6 +907,12 @@ class Scheduler(SchedulerInterface):
                 # allow the lower-priority requests to be scheduled.
                 req_index += 1
                 continue
+
+            if (
+                request.request_id in examined_prefills
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                ready_prefills.add(request.request_id)
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
@@ -1063,6 +1078,13 @@ class Scheduler(SchedulerInterface):
                 request_id = request.request_id
                 if self.prefill_batching_enabled and request.prefill_stats is not None:
                     observed_prefill |= request.num_output_tokens == 0
+
+                if (
+                    self.prefill_batching_enabled
+                    and request.prefill_stats is not None
+                    and request.num_output_tokens == 0
+                ):
+                    examined_prefills.add(request_id)
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
@@ -1405,6 +1427,13 @@ class Scheduler(SchedulerInterface):
                         # The request cannot be scheduled.
                         break
 
+                if (
+                    not load_kv_async
+                    and request_id in examined_prefills
+                    and num_computed_tokens < request.num_prompt_tokens
+                ):
+                    ready_prefills.add(request_id)
+
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
                 # mismatching local and remote block counts.
@@ -1615,6 +1644,23 @@ class Scheduler(SchedulerInterface):
             batch_constraints.add("scheduling_token_limit")
 
         if self.prefill_batching_enabled:
+            # Count only; do not poll connectors or run admission checks again.
+            unexamined = sum(
+                request.prefill_stats is not None
+                and request.num_output_tokens == 0
+                and request.request_id not in examined_prefills
+                for request in itertools.chain(
+                    self.running, self.kv_holding_waiting, self.waiting
+                )
+            )
+            if observed_prefill or unexamined:
+                stats = self.prefill_batching_stats
+                stats.readiness_steps += 1
+                stats.ready_requests += len(ready_prefills)
+                stats.ready_unscheduled_requests += len(
+                    ready_prefills.difference(num_scheduled_tokens)
+                )
+                stats.unexamined_requests += unexamined
             for preempted_req in preempted_reqs:
                 delay_candidates.pop(preempted_req.request_id, None)
             self.prefill_batching_stats.observe_delays(
