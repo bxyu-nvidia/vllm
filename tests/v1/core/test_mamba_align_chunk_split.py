@@ -602,3 +602,60 @@ def test_cached_prefill_finishes_with_separate_checkpoint(
     blocks, hit, _ = manager.get_computed_blocks(sibling)
     assert hit == checkpoint_position
     assert blocks.blocks[MAMBA_GROUP_ID][-1].block_id == checkpoint_id
+
+
+@pytest.mark.parametrize(
+    "prompt,start,proposed,junction,checkpoint_blocks,expected,reasons",
+    [
+        (30000, 0, 16960, 0, 1, 8576, {"chunk_boundary"}),
+        (13000, 0, 6000, 0, 1, 0, {"budget_too_small"}),
+        (97000, 85888, 8000, 0, 1, 0, {"budget_too_small"}),
+        (97000, 85889, 11111, 0, 1, 8447, {"resume_boundary"}),
+        (20000, 0, 20000, 0, 0, 8576, {"last_cache_boundary"}),
+        (1000, 0, 1000, 0, 0, 768, {"prompt_checkpoint"}),
+        (97000, 85888, 11112, 90112, 1, 4224, {"shared_prefix"}),
+        (97000, 85889, 11111, 94336, 1, 8447, {"resume_boundary", "shared_prefix"}),
+        (97000, 85888, 11112, 0, 1, 11112, set()),
+        (1000, 0, 1000, 0, 1, 1000, set()),
+    ],
+)
+def test_mamba_alignment_metrics_identify_limiting_boundary(
+    prompt,
+    start,
+    proposed,
+    junction,
+    checkpoint_blocks,
+    expected,
+    reasons,
+):
+    """Report the binding stop, including zero allocations, without changing it."""
+    stub = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=8576),
+        block_size=8576,
+        hash_block_size=128,
+        use_eagle_block_drop=True,
+        mamba_partial_cache_hit=True,
+        mamba_has_prefill_checkpoint_blocks=bool(checkpoint_blocks),
+        mamba_prefill_checkpoint_alignment=1,
+        mamba_shared_prefix_checkpoint=True,
+        max_num_scheduled_tokens=16960,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+    )
+    request = SimpleNamespace(
+        num_computed_tokens=start,
+        num_prompt_tokens=prompt,
+        num_tokens=prompt,
+        shared_prefix_boundary=junction,
+    )
+    observed: set[str] = set()
+    assert (
+        Scheduler._mamba_block_aligned_split(
+            stub,
+            request,
+            proposed,
+            underfill_reasons=observed,
+        )
+        == expected
+    )
+    assert observed == {f"mamba_alignment_{reason}" for reason in reasons}
+    assert Scheduler._mamba_block_aligned_split(stub, request, proposed) == expected

@@ -9,7 +9,7 @@ import pytest
 from transformers import GPT2Config
 
 from vllm.config import ModelConfig, VllmConfig
-from vllm.v1.metrics.batching import PrefillBatchingStats
+from vllm.v1.metrics.batching import UNDERFILL_REASONS, PrefillBatchingStats
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import SchedulerStats
@@ -30,7 +30,13 @@ def test_batching_records_work_without_histograms_and_only_underfill_reasons():
         total_tokens=17,
         requests=2,
         token_budget=128,
-        reasons=["mamba_alignment", "mamba_alignment", "request_tail"],
+        reasons=[
+            "mamba_alignment",
+            "mamba_alignment",
+            "request_tail",
+            "mamba_alignment_budget_too_small",
+            "mamba_alignment_budget_too_small",
+        ],
     )
     assert stats.batches == 2
     assert stats.batch_tokens == 145
@@ -39,7 +45,11 @@ def test_batching_records_work_without_histograms_and_only_underfill_reasons():
     assert stats.request_forward_observations == 3
     assert stats.unused_token_slots == 111
     assert stats.underfilled_batches == 1
-    assert stats.underfilled_reasons == {"mamba_alignment": 1, "request_tail": 1}
+    assert stats.underfilled_reasons == {
+        "mamba_alignment": 1,
+        "request_tail": 1,
+        "mamba_alignment_budget_too_small": 1,
+    }
 
 
 def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
@@ -53,7 +63,11 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
             total_tokens=96,
             requests=2,
             token_budget=128,
-            reasons=["request_tail"],
+            reasons=[
+                reason
+                for reason in UNDERFILL_REASONS
+                if reason.startswith("mamba_alignment")
+            ],
         )
         logger.record(SchedulerStats(prefill_batching_stats=stats), None)
         logger.record(SchedulerStats(), None)
@@ -70,6 +84,15 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
         assert samples["vllm:prefill_request_forward_observations_total"] == 2
         assert samples["vllm:prefill_completed_requests_total"] == 1
         assert samples["vllm:prefill_request_forwards_total"] == 3
+        reason_samples = {
+            sample.labels["reason"]: sample.value
+            for family in prometheus_client.REGISTRY.collect()
+            for sample in family.samples
+            if sample.name == "vllm:prefill_underfilled_batches_by_reason_total"
+        }
+        for reason in UNDERFILL_REASONS:
+            if reason.startswith("mamba_alignment"):
+                assert reason_samples[reason] == 1
         assert not any(key.endswith("_bucket") for key in samples)
     finally:
         unregister_vllm_metrics()

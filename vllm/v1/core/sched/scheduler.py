@@ -456,6 +456,8 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        *,
+        underfill_reasons: set[str] | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -563,8 +565,30 @@ class Scheduler(SchedulerInterface):
             junction_stop if start < junction < end else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
+        chunk_end = end
         end = min((s for s in stops if start < s < end), default=end)
-        return max(end - start, 0)
+        scheduled = max(end - start, 0)
+        if underfill_reasons is not None and scheduled < num_new_tokens:
+            if scheduled == 0:
+                underfill_reasons.add("mamba_alignment_budget_too_small")
+            elif end == chunk_end:
+                underfill_reasons.add("mamba_alignment_chunk_boundary")
+            else:
+                # Attribute the actual limiting boundary, not an earlier
+                # rounding that was superseded. Equal boundary constraints
+                # can overlap, just like reasons from different requests.
+                for boundary, reason in zip(
+                    stops,
+                    (
+                        "mamba_alignment_resume_boundary",
+                        "mamba_alignment_last_cache_boundary",
+                        "mamba_alignment_prompt_checkpoint",
+                        "mamba_alignment_shared_prefix",
+                    ),
+                ):
+                    if boundary == end:
+                        underfill_reasons.add(reason)
+        return scheduled
 
     def _get_local_prefix_cache_hit(
         self, request: Request
@@ -754,7 +778,7 @@ class Scheduler(SchedulerInterface):
             before_alignment = num_new_tokens
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                    request, num_new_tokens, underfill_reasons=batch_constraints
                 )
 
             if batch_constraints is not None and (num_new_tokens < before_alignment):
@@ -1254,6 +1278,7 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
+                            underfill_reasons=batch_constraints,
                         )
                         if batch_constraints is not None and (
                             num_new_tokens < before_alignment

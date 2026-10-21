@@ -26,6 +26,12 @@ BATCH_COUNTER_FIELDS = (
 )
 UNDERFILL_REASONS = (
     "mamba_alignment",
+    "mamba_alignment_chunk_boundary",
+    "mamba_alignment_budget_too_small",
+    "mamba_alignment_resume_boundary",
+    "mamba_alignment_last_cache_boundary",
+    "mamba_alignment_prompt_checkpoint",
+    "mamba_alignment_shared_prefix",
     "long_prefill_limit",
     "prefill_lookahead",
     "kv_capacity",

@@ -2387,10 +2387,10 @@ def test_spec_decode_padding_dropped_when_recurrent_alignment_clips(
     scheduler.need_mamba_block_aligned_split = True
     original_split = scheduler._mamba_block_aligned_split
 
-    def align_prompt_tail(request, num_new_tokens, *args):
+    def align_prompt_tail(request, num_new_tokens, *args, **kwargs):
         if request is r2:
             return aligned_tokens
-        return original_split(request, num_new_tokens, *args)
+        return original_split(request, num_new_tokens, *args, **kwargs)
 
     scheduler._mamba_block_aligned_split = align_prompt_tail
     scheduler.add_request(r2)
@@ -7635,7 +7635,7 @@ def test_prefill_batching_underfill_records_alignment_and_request_limit(monkeypa
     monkeypatch.setattr(
         scheduler,
         "_mamba_block_aligned_split",
-        lambda request, tokens, *args: min(tokens, 64),
+        lambda request, tokens, *args, **kwargs: min(tokens, 64),
     )
     scheduler.schedule()
     stats = scheduler.make_stats().prefill_batching_stats
@@ -7715,3 +7715,34 @@ def test_prefill_batching_metrics_are_disabled_by_default():
     assert scheduled.batch_underfill_reasons == []
     assert request.prefill_stats.num_forwards == 0
     assert scheduler.make_stats().prefill_batching_stats is None
+
+
+def test_prefill_batching_mamba_subreasons_for_waiting_and_running_requests():
+    """Both schedule paths carry the splitter's detail into exported stats."""
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        max_num_batched_tokens=96,
+        max_model_len=1024,
+        block_size=64,
+        enable_prefix_caching=True,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    (request,) = create_requests(1, num_tokens=200, block_size=64)
+    scheduler.add_request(request)
+    for _ in range(2):
+        scheduled = scheduler.schedule()
+        assert scheduled.num_scheduled_tokens[request.request_id] == 64
+        stats = scheduler.make_stats().prefill_batching_stats
+        assert stats.underfilled_reasons["mamba_alignment"] == 1
+        assert stats.underfilled_reasons["mamba_alignment_chunk_boundary"] == 1
+        scheduler.update_from_output(
+            scheduled,
+            ModelRunnerOutput(
+                req_ids=[request.request_id],
+                req_id_to_index={request.request_id: 0},
+                sampled_token_ids=[[]],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )

@@ -627,7 +627,13 @@ mod prefill_batching_tests {
                 batches: 3,
                 unused_token_slots: 64,
                 underfilled_batches: 1,
-                underfilled_reasons: BTreeMap::from([("request_tail".to_owned(), 1)]),
+                underfilled_reasons: PREFILL_UNDERFILL_REASONS
+                    .iter()
+                    .filter(|reason| {
+                        reason.starts_with("mamba_alignment") || **reason == "request_tail"
+                    })
+                    .map(|reason| ((*reason).to_owned(), 1))
+                    .collect(),
             }),
             ..Default::default()
         };
@@ -654,6 +660,11 @@ mod prefill_batching_tests {
             vllm:prefill_underfilled_batches_total{model_name="model",engine="0"} 1"#]]
         .assert_eq(&lines);
         assert!(rendered.contains("reason=\"request_tail\"} 1"));
+        for reason in PREFILL_UNDERFILL_REASONS {
+            if reason.starts_with("mamba_alignment") {
+                assert!(rendered.contains(&format!("reason=\"{reason}\"}} 1")));
+            }
+        }
         assert!(!rendered.contains("prefill_batch_tokens_bucket"));
     }
 }
