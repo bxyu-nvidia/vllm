@@ -69,6 +69,11 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
                 if reason.startswith("mamba_alignment")
             ],
         )
+        stats.kv_lookup_completed = 2
+        stats.kv_lookup_duration_ns = 6_000_000
+        stats.observe_delays(
+            {"pending": "kv_lookup_pending"}, scheduled_tokens={}, has_prefill=False
+        )
         logger.record(SchedulerStats(prefill_batching_stats=stats), None)
         logger.record(SchedulerStats(), None)
         samples = {
@@ -82,6 +87,21 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
         assert samples["vllm:prefill_batches_total"] == 1
         assert samples["vllm:prefill_request_tokens_total"] == 96
         assert samples["vllm:prefill_request_forward_observations_total"] == 2
+        assert samples["vllm:prefill_kv_lookup_completed_total"] == 2
+        assert samples["vllm:prefill_kv_lookup_duration_ns_total"] == 6_000_000
+        assert samples["vllm:prefill_delay_steps_total"] == 1
+        for field in ("delayed_requests", "blocked_requests"):
+            assert (
+                prometheus_client.REGISTRY.get_sample_value(
+                    f"vllm:prefill_{field}_by_reason_total",
+                    {
+                        "model_name": str(tmp_path),
+                        "engine": "0",
+                        "reason": "kv_lookup_pending",
+                    },
+                )
+                == 1
+            )
         assert samples["vllm:prefill_completed_requests_total"] == 1
         assert samples["vllm:prefill_request_forwards_total"] == 3
         reason_samples = {
@@ -130,3 +150,25 @@ def test_dp_load_stats_roundtrip_with_prefill_batching_field(lockstep: bool) -> 
 
     core._maybe_publish_request_counts()
     assert core.output_queue.empty()
+
+
+def test_delay_counts_include_idle_steps_and_distinguish_clipped_from_blocked():
+    stats = PrefillBatchingStats()
+    stats.observe_delays(
+        {"a": "mamba_alignment", "b": "kv_lookup_pending", "c": "kv_lookup_pending"},
+        scheduled_tokens={"a": 64},
+        has_prefill=True,
+    )
+    stats.observe_delays(
+        {"b": "kv_lookup_pending", "c": "kv_load_pending"},
+        scheduled_tokens={},
+        has_prefill=False,
+    )
+    stats.observe_delays({}, scheduled_tokens={"decode": 1}, has_prefill=False)
+    assert stats.delay_steps == 2
+    assert stats.delayed_requests == {
+        "mamba_alignment": 1,
+        "kv_lookup_pending": 3,
+        "kv_load_pending": 1,
+    }
+    assert stats.blocked_requests == {"kv_lookup_pending": 3, "kv_load_pending": 1}

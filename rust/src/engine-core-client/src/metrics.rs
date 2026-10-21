@@ -8,9 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use vllm_metrics::{
     CacheHitSourceLabels, EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric,
     LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
-    MooncakeOperationHistogramFamily, MooncakeOperationLabels, PREFILL_UNDERFILL_REASONS,
-    RequestMetrics, SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge,
-    WaitingReasonLabels,
+    MooncakeOperationHistogramFamily, MooncakeOperationLabels, PREFILL_DELAY_REASONS,
+    PREFILL_UNDERFILL_REASONS, RequestMetrics, SchedulerLogStatsAccumulator, SchedulerMetrics,
+    U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
 use crate::protocol::stats::{
@@ -49,6 +49,7 @@ pub(crate) struct SchedulerStatsRecorder {
 struct SchedulerStatsHandles {
     prefill_batching: BTreeMap<&'static str, U64Counter>,
     prefill_underfill_reasons: BTreeMap<&'static str, U64Counter>,
+    prefill_delays: BTreeMap<&'static str, BTreeMap<&'static str, U64Counter>>,
     // Base labels reused for dynamic child labels.
     labels: EngineLabels,
 
@@ -161,6 +162,28 @@ fn resolve_scheduler_stats_handles(
             .iter()
             .map(|(name, family)| (*name, family.get_or_create_owned(&labels)))
             .collect(),
+        prefill_delays: metrics
+            .prefill_delays
+            .iter()
+            .map(|(field, family)| {
+                (
+                    *field,
+                    PREFILL_DELAY_REASONS
+                        .into_iter()
+                        .map(|reason| {
+                            (
+                                reason,
+                                family.get_or_create_owned(&WaitingReasonLabels {
+                                    model_name: model_name.to_string(),
+                                    engine,
+                                    reason,
+                                }),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
         prefill_underfill_reasons: PREFILL_UNDERFILL_REASONS
             .into_iter()
             .map(|reason| {
@@ -257,8 +280,30 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
             ("batches", batching.batches),
             ("unused_token_slots", batching.unused_token_slots),
             ("underfilled_batches", batching.underfilled_batches),
+            ("delay_steps", batching.delay_steps),
+            ("kv_lookup_completed", batching.kv_lookup_completed),
+            ("kv_lookup_duration_ns", batching.kv_lookup_duration_ns),
+            (
+                "kv_lookup_pending_completed",
+                batching.kv_lookup_pending_completed,
+            ),
+            (
+                "kv_lookup_pending_duration_ns",
+                batching.kv_lookup_pending_duration_ns,
+            ),
+            ("kv_lookup_cancelled", batching.kv_lookup_cancelled),
         ] {
             handles.prefill_batching[name].inc_by(value);
+        }
+        for (field, counts) in [
+            ("delayed_requests", &batching.delayed_requests),
+            ("blocked_requests", &batching.blocked_requests),
+        ] {
+            for (reason, count) in counts {
+                if let Some(counter) = handles.prefill_delays[field].get(reason.as_str()) {
+                    counter.inc_by(*count);
+                }
+            }
         }
         for (reason, count) in &batching.underfilled_reasons {
             if let Some(counter) = handles.prefill_underfill_reasons.get(reason.as_str()) {
@@ -627,6 +672,11 @@ mod prefill_batching_tests {
                 batches: 3,
                 unused_token_slots: 64,
                 underfilled_batches: 1,
+                delay_steps: 4,
+                kv_lookup_completed: 2,
+                kv_lookup_duration_ns: 6000000,
+                delayed_requests: [("kv_lookup_pending".to_owned(), 3)].into(),
+                blocked_requests: [("kv_lookup_pending".to_owned(), 3)].into(),
                 underfilled_reasons: PREFILL_UNDERFILL_REASONS
                     .iter()
                     .filter(|reason| {
@@ -634,6 +684,7 @@ mod prefill_batching_tests {
                     })
                     .map(|reason| ((*reason).to_owned(), 1))
                     .collect(),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -657,7 +708,13 @@ mod prefill_batching_tests {
             vllm:prefill_batch_requests_total{model_name="model",engine="0"} 3
             vllm:prefill_batches_total{model_name="model",engine="0"} 3
             vllm:prefill_unused_token_slots_total{model_name="model",engine="0"} 64
-            vllm:prefill_underfilled_batches_total{model_name="model",engine="0"} 1"#]]
+            vllm:prefill_underfilled_batches_total{model_name="model",engine="0"} 1
+            vllm:prefill_delay_steps_total{model_name="model",engine="0"} 4
+            vllm:prefill_kv_lookup_completed_total{model_name="model",engine="0"} 2
+            vllm:prefill_kv_lookup_duration_ns_total{model_name="model",engine="0"} 6000000
+            vllm:prefill_kv_lookup_pending_completed_total{model_name="model",engine="0"} 0
+            vllm:prefill_kv_lookup_pending_duration_ns_total{model_name="model",engine="0"} 0
+            vllm:prefill_kv_lookup_cancelled_total{model_name="model",engine="0"} 0"#]]
         .assert_eq(&lines);
         assert!(rendered.contains("reason=\"request_tail\"} 1"));
         for reason in PREFILL_UNDERFILL_REASONS {
@@ -665,6 +722,7 @@ mod prefill_batching_tests {
                 assert!(rendered.contains(&format!("reason=\"{reason}\"}} 1")));
             }
         }
+        assert!(rendered.contains("vllm:prefill_delayed_requests_by_reason_total{model_name=\"model\",engine=\"0\",reason=\"kv_lookup_pending\"} 3"));
         assert!(!rendered.contains("prefill_batch_tokens_bucket"));
     }
 }

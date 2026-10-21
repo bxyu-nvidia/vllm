@@ -315,6 +315,14 @@ pub struct PrefillBatchingStats {
     pub unused_token_slots: u64,
     pub underfilled_batches: u64,
     pub underfilled_reasons: BTreeMap<String, u64>,
+    pub delay_steps: u64,
+    pub kv_lookup_completed: u64,
+    pub kv_lookup_duration_ns: u64,
+    pub kv_lookup_pending_completed: u64,
+    pub kv_lookup_pending_duration_ns: u64,
+    pub kv_lookup_cancelled: u64,
+    pub delayed_requests: BTreeMap<String, u64>,
+    pub blocked_requests: BTreeMap<String, u64>,
 }
 
 /// Stats associated with the scheduler.

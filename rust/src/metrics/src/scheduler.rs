@@ -12,7 +12,7 @@ use prometheus_client::registry::Registry;
 use crate::{F64Gauge, Histogram, HistogramFamily, U64Counter, U64Gauge};
 
 // Keep fields and reasons in sync with vllm/v1/metrics/batching.py.
-pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 9] = [
+pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 15] = [
     "completed_requests",
     "request_forwards",
     "request_tokens",
@@ -22,7 +22,16 @@ pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 9] = [
     "batches",
     "unused_token_slots",
     "underfilled_batches",
+    "delay_steps",
+    "kv_lookup_completed",
+    "kv_lookup_duration_ns",
+    "kv_lookup_pending_completed",
+    "kv_lookup_pending_duration_ns",
+    "kv_lookup_cancelled",
 ];
+pub const PREFILL_DELAY_REASONS: [&str; 3] =
+    ["mamba_alignment", "kv_load_pending", "kv_lookup_pending"];
+pub const PREFILL_DELAY_COUNTER_FIELDS: [&str; 2] = ["delayed_requests", "blocked_requests"];
 pub const PREFILL_UNDERFILL_REASONS: [&str; 24] = [
     "mamba_alignment",
     "mamba_alignment_chunk_boundary",
@@ -269,6 +278,7 @@ impl SchedulerLogStatsAccumulator {
 pub struct SchedulerMetrics {
     pub prefill_batching: BTreeMap<&'static str, Family<EngineLabels, U64Counter>>,
     pub prefill_underfilled_batches_by_reason: Family<WaitingReasonLabels, U64Counter>,
+    pub prefill_delays: BTreeMap<&'static str, Family<WaitingReasonLabels, U64Counter>>,
     // Scheduler state gauges.
     pub scheduler_running: Family<EngineLabels, U64Gauge>,
     pub scheduler_waiting: Family<EngineLabels, U64Gauge>,
@@ -332,9 +342,7 @@ impl SchedulerMetrics {
                 let family = Family::default();
                 registry.register(
                     format!("vllm:prefill_{field}"),
-                    format!(
-                        "Scheduler-visible prefill {field}; excludes draft and cache-only steps"
-                    ),
+                    format!("Scheduler-visible initial-prefill {field}"),
                     family.clone(),
                 );
                 (field, family)
@@ -346,6 +354,19 @@ impl SchedulerMetrics {
             "Constraints observed in underfilled prefill batches; reasons can overlap",
             prefill_underfilled_batches_by_reason.clone(),
         );
+
+        let prefill_delays = PREFILL_DELAY_COUNTER_FIELDS
+            .into_iter()
+            .map(|field| {
+                let family = Family::default();
+                registry.register(
+                    format!("vllm:prefill_{field}_by_reason"),
+                    format!("Prefill {field} with a sole observed blocker; request-step observations, not proven counterfactual readiness"),
+                    family.clone(),
+                );
+                (field, family)
+            })
+            .collect();
 
         // Scheduler state gauges.
         let scheduler_running = Family::default();
@@ -597,6 +618,7 @@ impl SchedulerMetrics {
 
         Self {
             prefill_batching,
+            prefill_delays,
             prefill_underfilled_batches_by_reason,
             scheduler_running,
             scheduler_waiting,

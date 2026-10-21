@@ -7656,7 +7656,14 @@ def test_prefill_batching_excludes_async_cache_load_steps():
     scheduler.add_request(request)
     scheduled = scheduler.schedule()
     assert scheduled.total_num_scheduled_tokens == 0
-    assert scheduler.make_stats().prefill_batching_stats.batches == 0
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.batches == 0
+    assert stats.delay_steps == 1
+    assert stats.blocked_requests == {"kv_load_pending": 1}
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    assert scheduler.make_stats().prefill_batching_stats.blocked_requests == {
+        "kv_load_pending": 1
+    }
     scheduler.update_from_output(
         scheduled,
         ModelRunnerOutput(
@@ -7735,6 +7742,8 @@ def test_prefill_batching_mamba_subreasons_for_waiting_and_running_requests():
         stats = scheduler.make_stats().prefill_batching_stats
         assert stats.underfilled_reasons["mamba_alignment"] == 1
         assert stats.underfilled_reasons["mamba_alignment_chunk_boundary"] == 1
+        assert stats.delayed_requests == {"mamba_alignment": 1}
+        assert stats.blocked_requests == {}
         scheduler.update_from_output(
             scheduled,
             ModelRunnerOutput(
@@ -7746,3 +7755,146 @@ def test_prefill_batching_mamba_subreasons_for_waiting_and_running_requests():
                 pooler_output=[],
             ),
         )
+
+
+def test_prefill_lookup_metrics_count_requests_and_time_across_stats_drains(
+    monkeypatch,
+):
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        max_num_batched_tokens=256,
+        max_model_len=1024,
+        use_kv_connector=mock_kv(
+            matched_tokens=0, is_async=False, num_defers_before_matching=2
+        ),
+    )
+    now = [1_000_000]
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.scheduler.time.monotonic_ns", lambda: now[0]
+    )
+    requests = create_requests(num_requests=2, num_tokens=64)
+    for request in requests:
+        scheduler.add_request(request)
+    for _ in range(2):
+        assert scheduler.schedule().total_num_scheduled_tokens == 0
+        stats = scheduler.make_stats().prefill_batching_stats
+        assert stats.batches == 0
+        assert stats.delay_steps == 1
+        assert stats.blocked_requests == {"kv_lookup_pending": 2}
+        assert stats.kv_lookup_completed == 0
+        now[0] += 2_000_000
+    assert scheduler.schedule().total_num_scheduled_tokens == 128
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.blocked_requests == {}
+    assert stats.kv_lookup_completed == stats.kv_lookup_pending_completed == 2
+    assert (
+        stats.kv_lookup_duration_ns == stats.kv_lookup_pending_duration_ns == 8_000_000
+    )
+    assert not scheduler._prefill_lookup_started_ns
+
+
+def test_prefill_lookup_abort_cleans_up_without_completed_latency():
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        use_kv_connector=mock_kv(
+            matched_tokens=0, is_async=False, num_defers_before_matching=10
+        ),
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=64)
+    scheduler.add_request(request)
+    scheduler.schedule()
+    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.kv_lookup_cancelled == 1
+    assert stats.kv_lookup_completed == stats.kv_lookup_duration_ns == 0
+    assert not scheduler._prefill_lookup_started_ns
+
+
+@pytest.mark.parametrize("other_blocker", [None, "capacity", "lookahead"])
+def test_prefill_mamba_delay_excludes_known_other_blockers(monkeypatch, other_blocker):
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        max_num_batched_tokens=96,
+        max_model_len=1024,
+        block_size=64,
+        enable_prefix_caching=True,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    (request,) = create_requests(num_requests=1, num_tokens=200, block_size=64)
+    scheduler.add_request(request)
+    if other_blocker == "capacity":
+        monkeypatch.setattr(
+            scheduler.kv_cache_manager, "allocate_slots", lambda *a, **k: None
+        )
+    elif other_blocker == "lookahead":
+        monkeypatch.setattr(scheduler, "_reserve_prefill_lookahead", lambda *a, **k: 0)
+    scheduler.schedule()
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.delay_steps == 1
+    assert stats.delayed_requests == (
+        {"mamba_alignment": 1} if other_blocker is None else {}
+    )
+
+
+def test_prefill_alignment_zero_tokens_counts_blocked_request():
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        max_num_batched_tokens=96,
+        max_model_len=1024,
+        block_size=64,
+        enable_prefix_caching=True,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    (first,) = create_requests(1, num_tokens=64, block_size=64, req_ids=["first"])
+    (second,) = create_requests(1, num_tokens=200, block_size=64, req_ids=["second"])
+    scheduler.add_request(first)
+    scheduler.add_request(second)
+    scheduled = scheduler.schedule()
+    assert scheduled.num_scheduled_tokens == {first.request_id: 64}
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.delay_steps == 1
+    assert stats.blocked_requests == {"mamba_alignment": 1}
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prefill_lookup_metrics_do_not_prevent_ready_request_scheduling(
+    monkeypatch, enabled
+):
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=enabled,
+        max_num_batched_tokens=256,
+        max_model_len=1024,
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False),
+    )
+    pending, ready = create_requests(num_requests=2, num_tokens=64)
+    for request in (pending, ready):
+        scheduler.add_request(request)
+    monkeypatch.setattr(
+        scheduler.connector,
+        "get_num_new_matched_tokens",
+        lambda request, local: (None, False) if request is pending else (0, False),
+    )
+    scheduled = scheduler.schedule()
+    assert scheduled.num_scheduled_tokens == {ready.request_id: 64}
+    stats = scheduler.make_stats().prefill_batching_stats
+    if enabled:
+        assert stats.blocked_requests == {"kv_lookup_pending": 1}
+        assert stats.kv_lookup_completed == 1
+        assert stats.kv_lookup_pending_completed == 0
+    else:
+        assert stats is None
+        assert not scheduler._prefill_lookup_started_ns
+
+
+def test_prefill_fully_cached_load_is_counted_as_waiting():
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        max_num_batched_tokens=256,
+        max_model_len=1024,
+        use_kv_connector=mock_kv(matched_tokens=256, is_async=True),
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=256)
+    scheduler.add_request(request)
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.blocked_requests == {"kv_load_pending": 1}
