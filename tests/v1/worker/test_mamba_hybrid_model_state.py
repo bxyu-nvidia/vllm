@@ -164,6 +164,7 @@ def test_prepare_attn_forwards_positions_and_stages_replayssm_prefill(
 
     positions = torch.arange(computed, computed + scheduled, dtype=torch.int64)
     input_batch = SimpleNamespace(
+        mamba_checkpoint_block_ids=None,
         num_reqs=1,
         num_tokens=scheduled,
         num_reqs_after_padding=1,
@@ -251,6 +252,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
     is_prefilling = [False, True, True]
     query_start_loc = np.array([0, 4, 8, 12], dtype=np.int32)
     input_batch = SimpleNamespace(
+        mamba_checkpoint_block_ids=None,
         num_reqs=3,
         num_tokens=12,
         num_reqs_after_padding=3,
@@ -328,6 +330,7 @@ def _input_batch(
     num_tokens = int(query_start_loc[-1])
     seq_lens = torch.full((num_reqs,), 10, dtype=torch.int32)
     return SimpleNamespace(
+        mamba_checkpoint_block_ids=None,
         num_reqs=num_reqs,
         num_reqs_after_padding=num_reqs_after_padding or num_reqs,
         num_tokens=num_tokens,
@@ -616,3 +619,29 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias(
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
     expected_accepted = [9, 1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted
+
+
+@pytest.mark.parametrize(
+    "mode,padded", [(CUDAGraphMode.PIECEWISE, False), (CUDAGraphMode.FULL, True)]
+)
+def test_separate_checkpoint_destinations_follow_batch_order_and_padding(
+    monkeypatch, mode, padded
+):
+    state = _mamba_hybrid_state(0)
+    batch = _input_batch([10, 10], None, [True, True], num_reqs_after_padding=3)
+    batch.req_ids = ["second", "first"]
+    batch.mamba_checkpoint_block_ids = {0: {"first": 71}, 2: {"second": 91}}
+    captured = Mock(return_value={})
+    monkeypatch.setattr(mamba_hybrid, "build_attn_metadata", captured)
+    state.prepare_attn(
+        input_batch=batch,
+        cudagraph_mode=mode,
+        block_tables=(),
+        slot_mappings={},
+        attn_groups=[],
+        kv_cache_config=Mock(),
+    )
+    assert captured.call_args.kwargs["mamba_checkpoint_block_ids"] == {
+        0: [-1, 71] + ([-1] if padded else []),
+        2: [91, -1] + ([-1] if padded else []),
+    }

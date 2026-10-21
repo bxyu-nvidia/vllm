@@ -392,3 +392,83 @@ def test_unaligned_resume_never_runs_past_its_block(
             f"intermediate chunk end {end} is neither block-aligned nor the "
             f"partial-tail stop ({tail_stop})"
         )
+
+
+@pytest.mark.parametrize("spec_blocks", [0, 3])
+def test_short_prefill_reserves_separate_checkpoint_and_preserves_it(
+    monkeypatch: pytest.MonkeyPatch,
+    spec_blocks: int,
+) -> None:
+    """One forward exports a reusable prefix without changing the live table."""
+    monkeypatch.setattr(sys.modules[__name__], "NUM_SPEC", spec_blocks)
+    manager = _make_hybrid_kv_cache_manager(num_prefill_checkpoint_blocks=1)
+    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    (request,) = create_requests(1, num_tokens=1000, block_size=ATTN_BLOCK_SIZE)
+    free_before = manager.block_pool.get_num_free_blocks()
+    assert (
+        _split(request, 1000, partial_hit=True, num_prefill_checkpoint_blocks=1) == 1000
+    )
+    assert manager.allocate_slots(request, 1000) is not None
+    ids = manager.get_mamba_checkpoint_block_ids([request.request_id])
+    checkpoint_id = ids[MAMBA_GROUP_ID][request.request_id]
+    blocks = mamba.req_to_blocks[request.request_id]
+    assert len(blocks) == 1 + spec_blocks
+    assert checkpoint_id not in [block.block_id for block in blocks]
+    assert (
+        free_before - manager.block_pool.get_num_free_blocks()
+        == cdiv(1000, ATTN_BLOCK_SIZE) + 2 + spec_blocks
+    )
+    checkpoint = manager.block_pool.blocks[checkpoint_id]
+    assert checkpoint.block_hash_num_tokens == 976
+    live_id = blocks[0].block_id
+
+    # Simulate completed prefill followed by a decode step. The checkpoint
+    # survives while the worker continues mutating the same live block.
+    request.num_computed_tokens = 1000
+    request.append_output_token_ids(42)
+    manager.new_step_starts()
+    assert manager.allocate_slots(request, 1) is not None
+    assert manager.get_mamba_checkpoint_block_ids([request.request_id]) == {}
+    assert mamba.req_to_blocks[request.request_id][0].block_id == live_id
+    assert checkpoint.block_hash_num_tokens == 976
+    assert checkpoint.ref_cnt == 1
+
+    manager.free(request)
+    assert checkpoint.ref_cnt == 0
+    assert checkpoint.block_hash_num_tokens == 976
+    assert manager.block_pool.get_num_free_blocks() == free_before
+
+    # A sibling can resume from the exported state after the producer is freed.
+    (sibling,) = create_requests(
+        1, num_tokens=1000, block_size=ATTN_BLOCK_SIZE, req_ids=["sibling"]
+    )
+    computed, hit, _ = manager.get_computed_blocks(sibling)
+    assert hit == 976
+    assert computed.blocks[MAMBA_GROUP_ID][-1].block_id == checkpoint_id
+    assert (
+        manager.allocate_slots(
+            sibling,
+            1000 - hit,
+            num_new_computed_tokens=hit,
+            new_computed_blocks=computed,
+        )
+        is not None
+    )
+    assert checkpoint.block_hash_num_tokens == 976
+    assert mamba.req_to_blocks[sibling.request_id][0].block_id != checkpoint_id
+    manager.free(sibling)
+
+
+def test_short_checkpoint_allocation_respects_pool_capacity() -> None:
+    manager = _make_hybrid_kv_cache_manager(num_prefill_checkpoint_blocks=1)
+    (request,) = create_requests(1, num_tokens=1000, block_size=ATTN_BLOCK_SIZE)
+    # Attention, live Mamba, and speculation fit; the extra checkpoint does not.
+    without_checkpoint = cdiv(1000, ATTN_BLOCK_SIZE) + 1 + NUM_SPEC
+    held = manager.block_pool.get_new_blocks(
+        manager.block_pool.get_num_free_blocks() - without_checkpoint
+    )
+    assert manager.allocate_slots(request, 1000) is None
+    mamba = manager.coordinator.single_type_managers[MAMBA_GROUP_ID]
+    assert not mamba._separate_checkpoint_blocks
+    assert manager.block_pool.get_num_free_blocks() == without_checkpoint
+    manager.block_pool.free_blocks(held)

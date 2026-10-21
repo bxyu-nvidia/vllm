@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Internal prefill checkpoints for Mamba2 align-mode prefix caching."""
 
+from types import SimpleNamespace
+
 import torch
 
 from tests.v1.attention.utils import (
@@ -166,3 +168,108 @@ def test_builder_emits_nothing_outside_align_mode():
     meta = _build(builder, seq_lens=[900], query_lens=[900])
 
     assert meta.checkpoint_chunk_idx is None
+
+
+def test_short_checkpoint_metadata_uses_explicit_group_destination():
+    """Short checkpoint rows use the dedicated block, not table column -1."""
+    from vllm.model_executor.layers.mamba.checkpoint import (
+        MambaPrefillCheckpointBuilder,
+    )
+
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            mamba_cache_mode="align",
+            hash_block_size=128,
+            cache_hit_alignment_tokens=128,
+        ),
+        speculative_config=None,
+    )
+    spec = MambaSpec(
+        block_size=8576,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        prefill_checkpoint_alignment=1,
+    )
+    builder = MambaPrefillCheckpointBuilder(config, spec)
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[1000, 100], query_lens=[1000, 100]),
+        8576,
+        DEVICE,
+        arange_block_indices=True,
+    )
+    common.mamba_checkpoint_block_ids = [71, -1]
+    checkpoint = builder.build(common, [0, 1])
+    assert checkpoint is not None
+    assert checkpoint.offsets == [896, 0]
+    assert checkpoint.state_indices.tolist() == [71, NULL_BLOCK_ID]
+    cu, _, _, chunk_idx = compute_chunk_metadata(
+        256,
+        2,
+        torch.tensor([0, 0]),
+        torch.tensor([0, 1000, 1100]),
+        checkpoint_offsets_p=checkpoint.offsets,
+    )
+    assert cu[chunk_idx[0] + 1] == 896
+    # Another group must use its own dedicated destination.
+    common.mamba_checkpoint_block_ids = [91, -1]
+    other = builder.build(common, [0, 1])
+    assert other.state_indices.tolist() == [91, NULL_BLOCK_ID]
+    # Profiling without scheduler allocations must not export to a bogus slot.
+    common.mamba_checkpoint_block_ids = None
+    assert builder.build(common, [0, 1]) is None
+
+
+def test_group_metadata_reuse_does_not_replace_separate_checkpoint_destinations():
+    from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionBackend
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+    from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+    from vllm.v1.worker.utils import AttentionGroup
+
+    builders = [_create_mamba2_builder(), _create_mamba2_builder()]
+    for builder in builders:
+        cache_config = builder.checkpoint_builder.vllm_config.cache_config
+        cache_config.hash_block_size = 128
+        cache_config.cache_hit_alignment_tokens = 128
+    spec = builders[0].kv_cache_spec
+    groups = [
+        [
+            AttentionGroup(
+                backend=Mamba2AttentionBackend,
+                layer_names=[f"layer{i}"],
+                kv_cache_spec=spec,
+                kv_cache_group_id=i,
+                metadata_builders=[builder],
+            )
+        ]
+        for i, builder in enumerate(builders)
+    ]
+    qsl = torch.tensor([0, 200], dtype=torch.int32)
+    meta = build_attn_metadata(
+        attn_groups=groups,
+        num_reqs=1,
+        num_tokens=200,
+        query_start_loc_gpu=qsl,
+        query_start_loc_cpu=qsl,
+        max_query_len=200,
+        seq_lens=torch.tensor([200]),
+        max_seq_len=200,
+        block_tables=[
+            torch.tensor([[10]], dtype=torch.int32),
+            torch.tensor([[20]], dtype=torch.int32),
+        ],
+        slot_mappings=torch.zeros((2, 200), dtype=torch.int64),
+        kv_cache_config=KVCacheConfig(
+            num_blocks=100,
+            kv_cache_tensors=[],
+            kv_cache_groups=[KVCacheGroupSpec([f"layer{i}"], spec) for i in range(2)],
+        ),
+        seq_lens_cpu_upper_bound=torch.tensor([200]),
+        is_prefilling=torch.tensor([True]),
+        mamba_checkpoint_block_ids={0: [71], 1: [91]},
+    )
+    assert meta["layer0"].checkpoint_meta.state_indices.tolist() == [71]
+    assert meta["layer1"].checkpoint_meta.state_indices.tolist() == [91]
+    assert meta["layer0"].checkpoint_meta.offsets == [128]
+    assert meta["layer1"].checkpoint_meta.offsets == [128]

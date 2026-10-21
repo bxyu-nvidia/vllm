@@ -2351,6 +2351,7 @@ class GPUModelRunner(
         for_cudagraph_capture: bool = False,
         num_scheduled_tokens: dict[str, int] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        mamba_checkpoint_block_ids: dict[int, dict[str, int]] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """Returns:
         tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -2575,6 +2576,7 @@ class GPUModelRunner(
             elif (
                 cache_key in cached_attn_metadata
                 and builder.supports_update_block_table
+                and not mamba_checkpoint_block_ids
             ):
                 attn_metadata_i = builder.update_block_table(
                     cached_attn_metadata[cache_key],
@@ -2607,6 +2609,15 @@ class GPUModelRunner(
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
+            if (
+                mamba_checkpoint_block_ids
+                and kv_cache_gid in mamba_checkpoint_block_ids
+            ):
+                destinations = mamba_checkpoint_block_ids[kv_cache_gid]
+                cm.mamba_checkpoint_block_ids = [
+                    destinations.get(req_id, -1)
+                    for req_id in self.input_batch.req_ids[:num_reqs]
+                ] + [-1] * (num_reqs_padded - num_reqs)
 
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -4247,6 +4258,7 @@ class GPUModelRunner(
                     use_spec_decode=use_spec_decode,
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     slot_mappings=slot_mappings_by_group,
+                    mamba_checkpoint_block_ids=scheduler_output.mamba_checkpoint_block_ids,
                 )
             )
 

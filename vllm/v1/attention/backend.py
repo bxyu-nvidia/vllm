@@ -466,6 +466,8 @@ class CommonAttentionMetadata:
     into its own persistent buffer and reads ``rswa_window`` from model config."""
 
     replayssm_decode_base_cpu: torch.Tensor | None = None
+    # Batch-ordered separate export destinations; -1 means use normal table lookup.
+    mamba_checkpoint_block_ids: list[int] | None = None
     """(batch_size,) CPU ring origin for Mamba2 ReplaySSM decode: num_computed
     at the current decode run's last full-state write. write_pos counts from
     here, so a preemption-resumed request re-anchors past the prompt boundary."""
@@ -545,6 +547,9 @@ class CommonAttentionMetadata:
             req_idx=maybe_slice_reqs(self.req_idx),
             rswa_prefix_lens=maybe_slice_reqs(self.rswa_prefix_lens),
             replayssm_decode_base_cpu=maybe_slice_reqs(self.replayssm_decode_base_cpu),
+            mamba_checkpoint_block_ids=maybe_slice_reqs(
+                self.mamba_checkpoint_block_ids
+            ),
         )
 
 

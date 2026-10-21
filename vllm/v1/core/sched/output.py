@@ -262,6 +262,11 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    # group ID -> request ID -> physical checkpoint block outside the live table.
+    mamba_checkpoint_block_ids: dict[int, dict[str, int]] = field(
+        default_factory=dict, kw_only=True
+    )
+
     batch_underfill_reasons: list[str] = field(default_factory=list)
 
     scheduled_encoder_input_stats: ScheduledEncoderInputStats | None = None

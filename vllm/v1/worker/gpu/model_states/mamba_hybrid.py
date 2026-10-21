@@ -388,6 +388,15 @@ class MambaHybridModelState(DefaultModelState):
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            mamba_checkpoint_block_ids={
+                group_id: [
+                    destinations.get(req_id, -1) for req_id in input_batch.req_ids
+                ]
+                + [-1] * (num_reqs - input_batch.num_reqs)
+                for group_id, destinations in (
+                    input_batch.mamba_checkpoint_block_ids or {}
+                ).items()
+            },
         )
         if self.recoverssm is not None:
             self.recoverssm.record_step(

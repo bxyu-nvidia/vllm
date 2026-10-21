@@ -505,6 +505,7 @@ class Scheduler(SchedulerInterface):
                 hash_block_size=self.hash_block_size,
                 mamba_block_size=block_size,
                 checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+                allow_separate_checkpoint=True,
             )
         )
         if use_internal_checkpoint:
@@ -1602,6 +1603,9 @@ class Scheduler(SchedulerInterface):
             )
 
         scheduler_output = SchedulerOutput(
+            mamba_checkpoint_block_ids=self.kv_cache_manager.get_mamba_checkpoint_block_ids(
+                list(num_scheduled_tokens)
+            ),
             batch_underfill_reasons=sorted(batch_constraints)
             if batch_constraints
             else [],
