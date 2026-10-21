@@ -1145,14 +1145,7 @@ def is_mamba_prefill_checkpoint_valid(
     checkpoint_col = cdiv(query_end, mamba_block_size) - 2
     return (
         query_start % hash_block_size == 0
-        and (
-            checkpoint_col > initial_state_col
-            or (
-                allow_separate_checkpoint
-                and query_start == 0
-                and query_end <= mamba_block_size
-            )
-        )
+        and (checkpoint_col > initial_state_col or allow_separate_checkpoint)
         and query_start + hash_block_size <= checkpoint_position
         and query_start < checkpoint_position < query_end
         and (checkpoint_position - query_start) % checkpoint_alignment == 0

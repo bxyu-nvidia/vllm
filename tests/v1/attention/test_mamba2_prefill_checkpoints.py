@@ -4,6 +4,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tests.v1.attention.utils import (
@@ -170,8 +171,22 @@ def test_builder_emits_nothing_outside_align_mode():
     assert meta.checkpoint_chunk_idx is None
 
 
-def test_short_checkpoint_metadata_uses_explicit_group_destination():
-    """Short checkpoint rows use the dedicated block, not table column -1."""
+@pytest.mark.parametrize(
+    "seq_len,query_start,drop_eagle,offset",
+    [
+        (1000, 0, False, 896),
+        (97000, 85888, True, 10880),
+        (99328, 88064, True, 11136),
+        (97000, 94720, True, 2048),
+    ],
+)
+def test_separate_checkpoint_metadata_uses_explicit_group_destination(
+    seq_len,
+    query_start,
+    drop_eagle,
+    offset,
+):
+    """Export beside the live table without overwriting a resumed input state."""
     from vllm.model_executor.layers.mamba.checkpoint import (
         MambaPrefillCheckpointBuilder,
     )
@@ -182,7 +197,7 @@ def test_short_checkpoint_metadata_uses_explicit_group_destination():
             hash_block_size=128,
             cache_hit_alignment_tokens=128,
         ),
-        speculative_config=None,
+        speculative_config=SimpleNamespace(use_eagle_block_drop=lambda: drop_eagle),
     )
     spec = MambaSpec(
         block_size=8576,
@@ -193,8 +208,9 @@ def test_short_checkpoint_metadata_uses_explicit_group_destination():
         prefill_checkpoint_alignment=1,
     )
     builder = MambaPrefillCheckpointBuilder(config, spec)
+    query_len = seq_len - query_start
     common = create_common_attn_metadata(
-        BatchSpec(seq_lens=[1000, 100], query_lens=[1000, 100]),
+        BatchSpec(seq_lens=[seq_len, 100], query_lens=[query_len, 100]),
         8576,
         DEVICE,
         arange_block_indices=True,
@@ -202,16 +218,16 @@ def test_short_checkpoint_metadata_uses_explicit_group_destination():
     common.mamba_checkpoint_block_ids = [71, -1]
     checkpoint = builder.build(common, [0, 1])
     assert checkpoint is not None
-    assert checkpoint.offsets == [896, 0]
+    assert checkpoint.offsets == [offset, 0]
     assert checkpoint.state_indices.tolist() == [71, NULL_BLOCK_ID]
     cu, _, _, chunk_idx = compute_chunk_metadata(
         256,
         2,
-        torch.tensor([0, 0]),
-        torch.tensor([0, 1000, 1100]),
+        torch.tensor([query_start, 0]),
+        torch.tensor([0, query_len, query_len + 100]),
         checkpoint_offsets_p=checkpoint.offsets,
     )
-    assert cu[chunk_idx[0] + 1] == 896
+    assert cu[chunk_idx[0] + 1] == offset
     # Another group must use its own dedicated destination.
     common.mamba_checkpoint_block_ids = [91, -1]
     other = builder.build(common, [0, 1])

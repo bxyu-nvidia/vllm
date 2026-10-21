@@ -62,7 +62,11 @@ def compute_mamba_prefill_checkpoints(
             ),
         )
         offsets.append(position - query_start if valid else 0)
-        cols.append(cdiv(seq_len, mamba_block_size) - 2 if valid else -1)
+        checkpoint_col = cdiv(seq_len, mamba_block_size) - 2
+        initial_state_col = (query_start - 1) // mamba_block_size
+        cols.append(
+            checkpoint_col if valid and checkpoint_col > initial_state_col else -1
+        )
     return offsets, cols
 
 

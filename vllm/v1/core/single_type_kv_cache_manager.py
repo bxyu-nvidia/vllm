@@ -1461,9 +1461,9 @@ class MambaManager(SingleTypeKVCacheManager):
             # checkpoint position and reserved block index for the current
             # allocation.
             self._checkpoints: dict[str, tuple[int, int]] = {}
-            # Fresh prefills within one physical block have no spare table column.
-            # Keep their checkpoint outside the position-indexed running-state table.
-            self._separate_checkpoint_blocks: dict[str, KVCacheBlock] = {}
+            # Keep checkpoints outside the live table when their usual column
+            # is absent or still holds the resumed state read by this forward.
+            self._separate_checkpoint_blocks: dict[str, list[KVCacheBlock]] = {}
             # Requests that registered their own last-prompt-boundary partial
             # tail (producers). A later CoW hands its private copy to the
             # connector; a request that finishes first hands off this table
@@ -1684,7 +1684,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 allow_separate_checkpoint=True,
             )
             and (
-                checkpoint_idx < 0
+                checkpoint_idx <= (query_start - 1) // self.block_size
                 or checkpoint_idx >= len(blocks)
                 or blocks[checkpoint_idx].is_null
                 or (
@@ -1776,10 +1776,15 @@ class MambaManager(SingleTypeKVCacheManager):
                 prefill_end,
             ):
                 checkpoint_position = 0
-            checkpoint_block = int(checkpoint_position > 0)
+            checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
+            separate_checkpoint = checkpoint_position > 0 and (
+                checkpoint_idx <= (total_computed_tokens - 1) // self.block_size
+            )
+            checkpoint_block = int(checkpoint_position > 0 and not separate_checkpoint)
             if not apply_admission_cap:
                 if checkpoint_position > 0:
-                    checkpoint_idx = cdiv(num_tokens, self.block_size) - 2
+                    if separate_checkpoint:
+                        checkpoint_idx = -1
                     self._checkpoints[request_id] = (
                         checkpoint_position,
                         checkpoint_idx,
@@ -1796,7 +1801,6 @@ class MambaManager(SingleTypeKVCacheManager):
             num_evictable_computed_blocks = self._get_num_evictable_blocks(
                 new_computed_blocks
             )
-            separate_checkpoint = checkpoint_block and num_tokens <= self.block_size
             return (
                 num_new_blocks
                 + num_evictable_computed_blocks
@@ -1852,9 +1856,11 @@ class MambaManager(SingleTypeKVCacheManager):
             checkpoint = self._checkpoints.get(request_id)
             checkpoint_block = int(checkpoint is not None and checkpoint[1] >= 0)
             if checkpoint is not None and checkpoint[1] < 0:
-                assert request_id not in self._separate_checkpoint_blocks
-                self._separate_checkpoint_blocks[request_id] = (
-                    self.block_pool.get_new_blocks(1)[0]
+                # Dense caching can export again on a later prefill chunk.
+                # Keep earlier destinations alive until their request is freed;
+                # a previous forward may still be writing them asynchronously.
+                self._separate_checkpoint_blocks.setdefault(request_id, []).extend(
+                    self.block_pool.get_new_blocks(1)
                 )
             partial_hit = self._partial_hit_reqs.get(request_id)
             has_partial_hit = partial_hit is not None
@@ -2038,9 +2044,8 @@ class MambaManager(SingleTypeKVCacheManager):
             ]
         blocks = super().pop_blocks_for_free(request_id)
         if self.mamba_cache_mode == "align":
-            checkpoint = self._separate_checkpoint_blocks.pop(request_id, None)
-            if checkpoint is not None:
-                blocks.insert(0, checkpoint)
+            checkpoints = self._separate_checkpoint_blocks.pop(request_id, [])
+            blocks[0:0] = checkpoints
         return blocks
 
     def get_separate_checkpoint_block_id(self, request_id: str) -> int | None:
@@ -2052,7 +2057,7 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         if checkpoint is None or checkpoint[1] >= 0:
             return None
-        return self._separate_checkpoint_blocks[request_id].block_id
+        return self._separate_checkpoint_blocks[request_id][-1].block_id
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """Get the number of tokens whose mamba state are not needed anymore. Mamba only
@@ -2069,6 +2074,16 @@ class MambaManager(SingleTypeKVCacheManager):
         *,
         replay_boundaries: Sequence[int],
     ) -> None:
+        if self.mamba_cache_mode == "align":
+            checkpoint = self._checkpoints.get(request.request_id)
+            if checkpoint is not None and checkpoint[1] < 0:
+                # The forward writes only the final live state and the separate
+                # checkpoint. Its input slot must not acquire the hash of a
+                # physical boundary crossed without materializing that state.
+                self.num_cached_block[request.request_id] = max(
+                    self.num_cached_block.get(request.request_id, 0),
+                    cdiv(num_tokens, self.block_size) - 1,
+                )
         num_cached_blocks_before = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(
             request,
@@ -2124,7 +2139,9 @@ class MambaManager(SingleTypeKVCacheManager):
             checkpoint_position, checkpoint_idx = checkpoint
             blocks = self.req_to_blocks[request.request_id]
             if checkpoint_idx < 0:
-                checkpoint_block = self._separate_checkpoint_blocks[request.request_id]
+                checkpoint_block = self._separate_checkpoint_blocks[request.request_id][
+                    -1
+                ]
             else:
                 assert checkpoint_idx < len(blocks)
                 checkpoint_block = blocks[checkpoint_idx]
