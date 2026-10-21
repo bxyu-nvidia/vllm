@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
+from vllm.v1.metrics.batching import PrefillBatchingStats
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -254,6 +255,11 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    # DP load reporting constructs the request counts positionally.
+    prefill_batching_stats: PrefillBatchingStats | None = field(
+        default=None, kw_only=True
+    )
+
 
 @dataclass
 class RequestStateStats:
@@ -315,6 +321,7 @@ class PrefillStats:
         num_local_cached_tokens: Tokens to be prefilled from local prefix cache.
         num_external_cached_tokens: Tokens to be prefilled from external KV transfer.
         num_cache_creation_tokens: Tokens computed and written to the prefix cache.
+        num_forwards: Nonempty main-model schedules before the first output.
     """
 
     num_prompt_tokens: int = 0
@@ -323,6 +330,7 @@ class PrefillStats:
     num_local_cached_tokens: int = 0
     num_external_cached_tokens: int = 0
     num_cache_creation_tokens: int = 0
+    num_forwards: int = 0
 
     def set(
         self,

@@ -1054,3 +1054,13 @@ class TestDpDeviceIdSharding:
             get_physical_gpu_ids_for_local_dp_rank(
                 evar, local_dp_rank=2, world_size=2, user_assigned_gpu_ids=[4, 5, 6, 7]
             )
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_prefill_batching_metrics_cli_opt_in(enabled: bool) -> None:
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    flags = ["--enable-prefill-batching-metrics"] if enabled else []
+    config = EngineArgs.from_cli_args(
+        parser.parse_args(flags)
+    ).create_observability_config()
+    assert config.enable_prefill_batching_metrics is enabled

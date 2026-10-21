@@ -22,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
 from vllm.v1.engine import FinishReason
+from vllm.v1.metrics.batching import BATCH_COUNTER_FIELDS, UNDERFILL_REASONS
 from vllm.v1.metrics.buckets import histogram_buckets
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
@@ -504,6 +505,36 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             idx: [model_name, str(idx)] for idx in engine_indexes
         }
         per_engine_labelvalues = self.per_engine_labelvalues
+
+        # Sums/counts preserve interval averages across DP engines and scrapes.
+        self.prefill_batch_counters = {
+            name: create_metric_per_engine(
+                self._counter_cls(
+                    name=f"vllm:prefill_{name}_total",
+                    documentation=(
+                        f"Scheduler-visible prefill {name}; "
+                        "excludes draft and cache-only steps."
+                    ),
+                    labelnames=labelnames,
+                ),
+                per_engine_labelvalues,
+            )
+            for name in BATCH_COUNTER_FIELDS
+        }
+        reasons = self._counter_cls(
+            name="vllm:prefill_underfilled_batches_by_reason_total",
+            documentation=(
+                "Constraints observed in underfilled prefill batches; "
+                "reasons can overlap."
+            ),
+            labelnames=labelnames + ["reason"],
+        )
+        self.prefill_underfill_reasons = {
+            idx: {
+                reason: reasons.labels(*values, reason) for reason in UNDERFILL_REASONS
+            }
+            for idx, values in per_engine_labelvalues.items()
+        }
 
         self.spec_decoding_prom = self._spec_decoding_cls(
             vllm_config.speculative_config,
@@ -1163,6 +1194,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.num_kv_fetch_reqs_by_stage.get(stage, 0)
                 )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            if (batching := scheduler_stats.prefill_batching_stats) is not None:
+                for name, counters in self.prefill_batch_counters.items():
+                    counters[engine_idx].inc(getattr(batching, name))
+                for reason, count in batching.underfilled_reasons.items():
+                    self.prefill_underfill_reasons[engine_idx][reason].inc(count)
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

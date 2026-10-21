@@ -301,12 +301,30 @@ pub mod kv_connector {
 
 pub use kv_connector::*;
 
+/// Delta sums/counts for initial-prefill batching; no histogram payloads.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrefillBatchingStats {
+    pub completed_requests: u64,
+    pub request_forwards: u64,
+    pub request_tokens: u64,
+    pub request_forward_observations: u64,
+    pub batch_tokens: u64,
+    pub batch_requests: u64,
+    pub batches: u64,
+    pub unused_token_slots: u64,
+    pub underfilled_batches: u64,
+    pub underfilled_reasons: BTreeMap<String, u64>,
+}
+
 /// Stats associated with the scheduler.
 ///
 /// Original Python definition:
 /// <https://github.com/vllm-project/vllm/blob/906a8c15d0beded2cca8b357877266c631340f74/vllm/v1/metrics/stats.py#L170-L196>
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerStats {
+    #[serde(default)]
+    pub prefill_batching_stats: Option<PrefillBatchingStats>,
     /// Number of requests in model execution batches.
     pub num_running_reqs: u64,
     /// Number of waiting requests not deferred.

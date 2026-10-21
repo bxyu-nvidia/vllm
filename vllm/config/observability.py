@@ -88,6 +88,10 @@ class ObservabilityConfig:
     module in the model and attach information such as input/output shapes to
     nvtx range markers. Noted that this doesn't work with CUDA graphs enabled."""
 
+    enable_prefill_batching_metrics: bool = False
+    """Collect prefill batching sums/counts and underfill constraints. Disabled
+    by default; decode-only KV consumers remain excluded when enabled."""
+
     enable_mfu_metrics: bool = False
     """Enable Model FLOPs Utilization (MFU) metrics."""
 
