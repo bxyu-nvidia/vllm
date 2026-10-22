@@ -9,7 +9,11 @@ import pytest
 from transformers import GPT2Config
 
 from vllm.config import ModelConfig, VllmConfig
-from vllm.v1.metrics.batching import UNDERFILL_REASONS, PrefillBatchingStats
+from vllm.v1.metrics.batching import (
+    OUTCOME_COUNTER_FIELDS,
+    UNDERFILL_REASONS,
+    PrefillBatchingStats,
+)
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import SchedulerStats
@@ -69,6 +73,11 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
                 if reason.startswith("mamba_alignment")
             ],
         )
+        stats.observe_outcomes(
+            {"scheduled": 1, "mamba_alignment": 1, "not_examined": 2},
+            {"mamba_alignment": 2},
+            underfilled=True,
+        )
         stats.readiness_steps = 3
         stats.ready_requests = 4
         stats.ready_unscheduled_requests = 1
@@ -110,6 +119,14 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
                 )
                 == 1
             )
+        assert samples["vllm:prefill_outcome_steps_total"] == 1
+        assert samples["vllm:prefill_underfilled_outcome_steps_total"] == 1
+        for field, (label, values) in OUTCOME_COUNTER_FIELDS.items():
+            for value in values:
+                assert prometheus_client.REGISTRY.get_sample_value(
+                    f"vllm:prefill_{field}_total",
+                    {"model_name": str(tmp_path), "engine": "0", label: value},
+                ) == getattr(stats, field).get(value, 0)
         assert samples["vllm:prefill_completed_requests_total"] == 1
         assert samples["vllm:prefill_request_forwards_total"] == 3
         reason_samples = {
@@ -180,3 +197,32 @@ def test_delay_counts_include_idle_steps_and_distinguish_clipped_from_blocked():
         "kv_load_pending": 1,
     }
     assert stats.blocked_requests == {"kv_lookup_pending": 3, "kv_load_pending": 1}
+
+
+def test_outcome_averages_have_separate_idle_full_and_underfilled_denominators() -> (
+    None
+):
+    stats = PrefillBatchingStats()
+    stats.observe_outcomes({}, {}, underfilled=False)
+    stats.observe_outcomes({"kv_lookup_pending": 2}, {}, underfilled=False)
+    stats.observe_outcomes({"scheduled": 4}, {}, underfilled=False)
+    stats.observe_outcomes(
+        {"scheduled": 1, "mamba_alignment": 1, "not_examined": 2},
+        {"mamba_alignment": 2},
+        underfilled=True,
+    )
+    stats.observe_outcomes({"scheduled": 2}, {}, underfilled=True)
+    assert stats.outcome_steps == 4
+    assert stats.underfilled_outcome_steps == 2
+    assert stats.request_outcomes == {
+        "scheduled": 7,
+        "kv_lookup_pending": 2,
+        "mamba_alignment": 1,
+        "not_examined": 2,
+    }
+    assert stats.underfilled_request_outcomes == {
+        "scheduled": 3,
+        "mamba_alignment": 1,
+        "not_examined": 2,
+    }
+    assert stats.underfilled_unexamined_by_stop_reason == {"mamba_alignment": 2}

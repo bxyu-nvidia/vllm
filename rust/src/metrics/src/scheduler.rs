@@ -12,7 +12,7 @@ use prometheus_client::registry::Registry;
 use crate::{F64Gauge, Histogram, HistogramFamily, U64Counter, U64Gauge};
 
 // Keep fields and reasons in sync with vllm/v1/metrics/batching.py.
-pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 19] = [
+pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 21] = [
     "completed_requests",
     "request_forwards",
     "request_tokens",
@@ -32,6 +32,8 @@ pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 19] = [
     "ready_requests",
     "ready_unscheduled_requests",
     "unexamined_requests",
+    "outcome_steps",
+    "underfilled_outcome_steps",
 ];
 pub const PREFILL_DELAY_REASONS: [&str; 3] =
     ["mamba_alignment", "kv_load_pending", "kv_lookup_pending"];
@@ -62,6 +64,60 @@ pub const PREFILL_UNDERFILL_REASONS: [&str; 24] = [
     "request_tail",
     "no_other_constraint_observed",
 ];
+
+pub const PREFILL_REQUEST_OUTCOMES: [&str; 17] = [
+    "scheduled",
+    "kv_lookup_pending",
+    "kv_load_pending",
+    "in_flight_output",
+    "mamba_alignment",
+    "prefill_lookahead",
+    "dp_prefill_throttle",
+    "kv_capacity",
+    "encoder_pending",
+    "lora_limit",
+    "grammar_pending",
+    "streaming_input_pending",
+    "chunked_prefill_disabled",
+    "spec_decode_padding",
+    "model_length_limit",
+    "not_examined",
+    "other",
+];
+pub const PREFILL_QUEUE_STOP_REASONS: [&str; 13] = [
+    "token_budget",
+    "input_budget_reserved",
+    "request_limit",
+    "kv_capacity",
+    "mamba_alignment",
+    "prefill_lookahead",
+    "dp_prefill_throttle",
+    "chunked_prefill_disabled",
+    "spec_decode_padding",
+    "encoder_pending",
+    "scheduler_paused",
+    "preemption",
+    "other",
+];
+pub const PREFILL_OUTCOME_FIELDS: [&str; 2] = ["request_outcomes", "underfilled_request_outcomes"];
+pub const PREFILL_STOP_FIELDS: [&str; 2] = [
+    "unexamined_by_stop_reason",
+    "underfilled_unexamined_by_stop_reason",
+];
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PrefillOutcomeLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub outcome: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct PrefillStopLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub stop_reason: &'static str,
+}
 
 const KV_CACHE_RESIDENCY_BUCKETS: [f64; 21] = [
     0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0,
@@ -282,6 +338,8 @@ impl SchedulerLogStatsAccumulator {
 pub struct SchedulerMetrics {
     pub prefill_batching: BTreeMap<&'static str, Family<EngineLabels, U64Counter>>,
     pub prefill_underfilled_batches_by_reason: Family<WaitingReasonLabels, U64Counter>,
+    pub prefill_outcomes: BTreeMap<&'static str, Family<PrefillOutcomeLabels, U64Counter>>,
+    pub prefill_stops: BTreeMap<&'static str, Family<PrefillStopLabels, U64Counter>>,
     pub prefill_delays: BTreeMap<&'static str, Family<WaitingReasonLabels, U64Counter>>,
     // Scheduler state gauges.
     pub scheduler_running: Family<EngineLabels, U64Gauge>,
@@ -366,6 +424,31 @@ impl SchedulerMetrics {
                 registry.register(
                     format!("vllm:prefill_{field}_by_reason"),
                     format!("Prefill {field} with a sole observed blocker; request-step observations, not proven counterfactual readiness"),
+                    family.clone(),
+                );
+                (field, family)
+            })
+            .collect();
+
+        let prefill_outcomes = PREFILL_OUTCOME_FIELDS
+            .into_iter()
+            .map(|field| {
+                let family = Family::default();
+                registry.register(
+                    format!("vllm:prefill_{field}"),
+                    format!("Initial-prefill {field}; observed scheduling decisions, not counterfactual readiness"),
+                    family.clone(),
+                );
+                (field, family)
+            })
+            .collect();
+        let prefill_stops = PREFILL_STOP_FIELDS
+            .into_iter()
+            .map(|field| {
+                let family = Family::default();
+                registry.register(
+                    format!("vllm:prefill_{field}"),
+                    format!("Initial-prefill {field}; observed scheduling decisions, not counterfactual readiness"),
                     family.clone(),
                 );
                 (field, family)
@@ -623,6 +706,8 @@ impl SchedulerMetrics {
         Self {
             prefill_batching,
             prefill_delays,
+            prefill_outcomes,
+            prefill_stops,
             prefill_underfilled_batches_by_reason,
             scheduler_running,
             scheduler_waiting,

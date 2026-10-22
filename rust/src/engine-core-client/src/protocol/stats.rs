@@ -327,6 +327,12 @@ pub struct PrefillBatchingStats {
     pub unexamined_requests: u64,
     pub delayed_requests: BTreeMap<String, u64>,
     pub blocked_requests: BTreeMap<String, u64>,
+    pub outcome_steps: u64,
+    pub underfilled_outcome_steps: u64,
+    pub request_outcomes: BTreeMap<String, u64>,
+    pub underfilled_request_outcomes: BTreeMap<String, u64>,
+    pub unexamined_by_stop_reason: BTreeMap<String, u64>,
+    pub underfilled_unexamined_by_stop_reason: BTreeMap<String, u64>,
 }
 
 /// Stats associated with the scheduler.

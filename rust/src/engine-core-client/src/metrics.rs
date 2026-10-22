@@ -9,8 +9,9 @@ use vllm_metrics::{
     CacheHitSourceLabels, EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric,
     LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
     MooncakeOperationHistogramFamily, MooncakeOperationLabels, PREFILL_DELAY_REASONS,
-    PREFILL_UNDERFILL_REASONS, RequestMetrics, SchedulerLogStatsAccumulator, SchedulerMetrics,
-    U64Counter, U64Gauge, WaitingReasonLabels,
+    PREFILL_QUEUE_STOP_REASONS, PREFILL_REQUEST_OUTCOMES, PREFILL_UNDERFILL_REASONS,
+    PrefillOutcomeLabels, PrefillStopLabels, RequestMetrics, SchedulerLogStatsAccumulator,
+    SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
 use crate::protocol::stats::{
@@ -49,6 +50,8 @@ pub(crate) struct SchedulerStatsRecorder {
 struct SchedulerStatsHandles {
     prefill_batching: BTreeMap<&'static str, U64Counter>,
     prefill_underfill_reasons: BTreeMap<&'static str, U64Counter>,
+    prefill_outcomes: BTreeMap<&'static str, BTreeMap<&'static str, U64Counter>>,
+    prefill_stops: BTreeMap<&'static str, BTreeMap<&'static str, U64Counter>>,
     prefill_delays: BTreeMap<&'static str, BTreeMap<&'static str, U64Counter>>,
     // Base labels reused for dynamic child labels.
     labels: EngineLabels,
@@ -161,6 +164,50 @@ fn resolve_scheduler_stats_handles(
             .prefill_batching
             .iter()
             .map(|(name, family)| (*name, family.get_or_create_owned(&labels)))
+            .collect(),
+        prefill_outcomes: metrics
+            .prefill_outcomes
+            .iter()
+            .map(|(field, family)| {
+                (
+                    *field,
+                    PREFILL_REQUEST_OUTCOMES
+                        .into_iter()
+                        .map(|value| {
+                            (
+                                value,
+                                family.get_or_create_owned(&PrefillOutcomeLabels {
+                                    model_name: model_name.to_string(),
+                                    engine,
+                                    outcome: value,
+                                }),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+        prefill_stops: metrics
+            .prefill_stops
+            .iter()
+            .map(|(field, family)| {
+                (
+                    *field,
+                    PREFILL_QUEUE_STOP_REASONS
+                        .into_iter()
+                        .map(|value| {
+                            (
+                                value,
+                                family.get_or_create_owned(&PrefillStopLabels {
+                                    model_name: model_name.to_string(),
+                                    engine,
+                                    stop_reason: value,
+                                }),
+                            )
+                        })
+                        .collect(),
+                )
+            })
             .collect(),
         prefill_delays: metrics
             .prefill_delays
@@ -299,6 +346,11 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
                 batching.ready_unscheduled_requests,
             ),
             ("unexamined_requests", batching.unexamined_requests),
+            ("outcome_steps", batching.outcome_steps),
+            (
+                "underfilled_outcome_steps",
+                batching.underfilled_outcome_steps,
+            ),
         ] {
             handles.prefill_batching[name].inc_by(value);
         }
@@ -308,6 +360,35 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
         ] {
             for (reason, count) in counts {
                 if let Some(counter) = handles.prefill_delays[field].get(reason.as_str()) {
+                    counter.inc_by(*count);
+                }
+            }
+        }
+        for (field, counts) in [
+            ("request_outcomes", &batching.request_outcomes),
+            (
+                "underfilled_request_outcomes",
+                &batching.underfilled_request_outcomes,
+            ),
+        ] {
+            for (value, count) in counts {
+                if let Some(counter) = handles.prefill_outcomes[field].get(value.as_str()) {
+                    counter.inc_by(*count);
+                }
+            }
+        }
+        for (field, counts) in [
+            (
+                "unexamined_by_stop_reason",
+                &batching.unexamined_by_stop_reason,
+            ),
+            (
+                "underfilled_unexamined_by_stop_reason",
+                &batching.underfilled_unexamined_by_stop_reason,
+            ),
+        ] {
+            for (value, count) in counts {
+                if let Some(counter) = handles.prefill_stops[field].get(value.as_str()) {
                     counter.inc_by(*count);
                 }
             }
@@ -662,6 +743,7 @@ mod tests {
 mod prefill_batching_tests {
     use super::*;
     use crate::protocol::stats::PrefillBatchingStats;
+    use itertools::Itertools;
     use vllm_metrics::Metrics;
 
     #[test]
@@ -680,6 +762,12 @@ mod prefill_batching_tests {
                 unused_token_slots: 64,
                 underfilled_batches: 1,
                 delay_steps: 4,
+                outcome_steps: 4,
+                underfilled_outcome_steps: 1,
+                request_outcomes: [("scheduled".to_owned(), 7)].into(),
+                underfilled_request_outcomes: [("scheduled".to_owned(), 2)].into(),
+                unexamined_by_stop_reason: [("mamba_alignment".to_owned(), 3)].into(),
+                underfilled_unexamined_by_stop_reason: [("mamba_alignment".to_owned(), 1)].into(),
                 readiness_steps: 4,
                 ready_requests: 7,
                 ready_unscheduled_requests: 1,
@@ -705,9 +793,28 @@ mod prefill_batching_tests {
         record_scheduler_stats_with_handles(&handles, &decoded);
         record_scheduler_stats_with_handles(&handles, &SchedulerStats::default());
         let rendered = metrics.render().unwrap();
+        let outcome_lines = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("vllm:prefill_")
+                    && (line.contains("outcome=") || line.contains("stop_reason="))
+                    && !line.ends_with(" 0")
+            })
+            .sorted()
+            .join("\n");
+        expect_test::expect![[r#"
+            vllm:prefill_request_outcomes_total{model_name="model",engine="0",outcome="scheduled"} 7
+            vllm:prefill_underfilled_request_outcomes_total{model_name="model",engine="0",outcome="scheduled"} 2
+            vllm:prefill_underfilled_unexamined_by_stop_reason_total{model_name="model",engine="0",stop_reason="mamba_alignment"} 1
+            vllm:prefill_unexamined_by_stop_reason_total{model_name="model",engine="0",stop_reason="mamba_alignment"} 3"#]].assert_eq(&outcome_lines);
         let lines = rendered
             .lines()
-            .filter(|line| line.starts_with("vllm:prefill_") && !line.contains("by_reason"))
+            .filter(|line| {
+                line.starts_with("vllm:prefill_")
+                    && !line.contains("by_reason")
+                    && !line.contains("outcome=")
+                    && !line.contains("stop_reason=")
+            })
             .collect::<Vec<_>>()
             .join("\n");
         expect_test::expect![[r#"
@@ -729,7 +836,9 @@ mod prefill_batching_tests {
             vllm:prefill_readiness_steps_total{model_name="model",engine="0"} 4
             vllm:prefill_ready_requests_total{model_name="model",engine="0"} 7
             vllm:prefill_ready_unscheduled_requests_total{model_name="model",engine="0"} 1
-            vllm:prefill_unexamined_requests_total{model_name="model",engine="0"} 2"#]]
+            vllm:prefill_unexamined_requests_total{model_name="model",engine="0"} 2
+            vllm:prefill_outcome_steps_total{model_name="model",engine="0"} 4
+            vllm:prefill_underfilled_outcome_steps_total{model_name="model",engine="0"} 1"#]]
         .assert_eq(&lines);
         assert!(rendered.contains("reason=\"request_tail\"} 1"));
         for reason in PREFILL_UNDERFILL_REASONS {

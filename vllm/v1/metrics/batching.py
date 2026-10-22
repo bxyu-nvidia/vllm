@@ -17,6 +17,10 @@ but before KV allocation. Ready counts include scheduled requests; ready-unsched
 counts include allocation failures or subsequent preemption. Requests not examined
 in this step are reported separately, never assumed ready. Readiness observations
 are engine-step counts, including steps without a forward, not queue snapshots.
+Outcome accounting partitions all active initial prefills once per step, including
+unexamined requests. It records the observed stopping condition, not every possible
+blocker. A scheduled request wins over earlier constraints; partial work is scheduled.
+The underfilled subset uses the same partition and only nonempty prefill forwards.
 """
 
 from collections import Counter
@@ -43,6 +47,8 @@ BATCH_COUNTER_FIELDS = (
     "ready_requests",
     "ready_unscheduled_requests",
     "unexamined_requests",
+    "outcome_steps",
+    "underfilled_outcome_steps",
 )
 DELAY_REASONS = ("mamba_alignment", "kv_load_pending", "kv_lookup_pending")
 DELAY_COUNTER_FIELDS = (
@@ -77,6 +83,49 @@ UNDERFILL_REASONS = (
 )
 
 
+REQUEST_OUTCOMES = (
+    "scheduled",
+    "kv_lookup_pending",
+    "kv_load_pending",
+    "in_flight_output",
+    "mamba_alignment",
+    "prefill_lookahead",
+    "dp_prefill_throttle",
+    "kv_capacity",
+    "encoder_pending",
+    "lora_limit",
+    "grammar_pending",
+    "streaming_input_pending",
+    "chunked_prefill_disabled",
+    "spec_decode_padding",
+    "model_length_limit",
+    "not_examined",
+    "other",
+)
+QUEUE_STOP_REASONS = (
+    "token_budget",
+    "input_budget_reserved",
+    "request_limit",
+    "kv_capacity",
+    "mamba_alignment",
+    "prefill_lookahead",
+    "dp_prefill_throttle",
+    "chunked_prefill_disabled",
+    "spec_decode_padding",
+    "encoder_pending",
+    "scheduler_paused",
+    "preemption",
+    "other",
+)
+# Field -> Prometheus label and its bounded values. No request IDs are exported.
+OUTCOME_COUNTER_FIELDS = {
+    "request_outcomes": ("outcome", REQUEST_OUTCOMES),
+    "unexamined_by_stop_reason": ("stop_reason", QUEUE_STOP_REASONS),
+    "underfilled_request_outcomes": ("outcome", REQUEST_OUTCOMES),
+    "underfilled_unexamined_by_stop_reason": ("stop_reason", QUEUE_STOP_REASONS),
+}
+
+
 @dataclass
 class PrefillBatchingStats:
     """Delta observations drained with scheduler stats; no request-ID labels."""
@@ -103,6 +152,40 @@ class PrefillBatchingStats:
     unexamined_requests: int = 0
     delayed_requests: dict[str, int] = field(default_factory=dict)
     blocked_requests: dict[str, int] = field(default_factory=dict)
+
+    outcome_steps: int = 0
+    underfilled_outcome_steps: int = 0
+    request_outcomes: dict[str, int] = field(default_factory=dict)
+    unexamined_by_stop_reason: dict[str, int] = field(default_factory=dict)
+    underfilled_request_outcomes: dict[str, int] = field(default_factory=dict)
+    underfilled_unexamined_by_stop_reason: dict[str, int] = field(default_factory=dict)
+
+    def observe_outcomes(
+        self,
+        outcomes: dict[str, int],
+        unexamined: dict[str, int],
+        *,
+        underfilled: bool,
+    ) -> None:
+        """Partition active initial prefills once per step by observed outcome.
+
+        Unexamined requests inherit the queue's stop reason, not a claim that
+        they themselves are blocked by it. Underfilled observations include only
+        nonempty prefill-containing forwards below max_num_batched_tokens.
+        """
+        if not outcomes:
+            return
+        self.outcome_steps += 1
+        if underfilled:
+            self.underfilled_outcome_steps += 1
+        for prefix in ("", "underfilled_") if underfilled else ("",):
+            for field_name, counts in (
+                ("request_outcomes", outcomes),
+                ("unexamined_by_stop_reason", unexamined),
+            ):
+                target = getattr(self, prefix + field_name)
+                for reason, count in counts.items():
+                    target[reason] = target.get(reason, 0) + count
 
     def observe_delays(
         self,

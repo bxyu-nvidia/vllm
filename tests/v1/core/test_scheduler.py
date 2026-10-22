@@ -7663,12 +7663,15 @@ def test_prefill_batching_excludes_async_cache_load_steps():
     assert stats.batches == 0
     assert stats.delay_steps == 1
     assert stats.blocked_requests == {"kv_load_pending": 1}
+    assert stats.request_outcomes == {"kv_load_pending": 1}
+    assert stats.outcome_steps == 1
+    assert stats.underfilled_outcome_steps == 0
     assert stats.readiness_steps == 1
     assert stats.ready_requests == stats.unexamined_requests == 0
     assert scheduler.schedule().total_num_scheduled_tokens == 0
-    assert scheduler.make_stats().prefill_batching_stats.blocked_requests == {
-        "kv_load_pending": 1
-    }
+    pending_stats = scheduler.make_stats().prefill_batching_stats
+    assert pending_stats.blocked_requests == {"kv_load_pending": 1}
+    assert pending_stats.request_outcomes == {"kv_load_pending": 1}
     scheduler.update_from_output(
         scheduled,
         ModelRunnerOutput(
@@ -7939,6 +7942,15 @@ def test_prefill_readiness_distinguishes_pending_ready_and_unexamined(
         assert stats.ready_unscheduled_requests == 0
         assert stats.unexamined_requests == 1
         assert stats.blocked_requests == {"kv_lookup_pending": 1}
+        assert stats.request_outcomes == {
+            "scheduled": 2,
+            "kv_lookup_pending": 1,
+            "not_examined": 1,
+        }
+        assert stats.unexamined_by_stop_reason == {"token_budget": 1}
+        assert stats.outcome_steps == 1
+        assert stats.underfilled_outcome_steps == 0
+        assert stats.underfilled_request_outcomes == {}
     else:
         assert stats is None
 
@@ -7960,3 +7972,151 @@ def test_prefill_ready_but_allocation_blocked_does_not_assume_rest_ready(monkeyp
     assert stats.ready_requests == stats.ready_unscheduled_requests == 1
     assert stats.unexamined_requests == 2
     assert scheduler.make_stats().prefill_batching_stats.ready_requests == 0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "stop_reason,blocked",
+    [
+        ("token_budget", False),
+        ("request_limit", False),
+        ("mamba_alignment", True),
+        ("prefill_lookahead", True),
+        ("kv_capacity", True),
+    ],
+)
+def test_prefill_outcomes_separate_blocked_head_from_unexamined_tail(
+    monkeypatch, enabled: bool, stop_reason: str, blocked: bool
+) -> None:
+    """Instrumentation must not probe the tail or change the resulting schedule."""
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=enabled,
+        max_num_batched_tokens=64 if stop_reason == "token_budget" else 96,
+        max_num_seqs=1 if stop_reason == "request_limit" else 16,
+        max_model_len=1024,
+    )
+    requests = create_requests(num_requests=3, num_tokens=64)
+    for request in requests:
+        scheduler.add_request(request)
+    if stop_reason in ("mamba_alignment", "prefill_lookahead"):
+        scheduler.need_mamba_block_aligned_split = stop_reason == "mamba_alignment"
+        method = (
+            "_mamba_block_aligned_split"
+            if stop_reason == "mamba_alignment"
+            else "_reserve_prefill_lookahead"
+        )
+        gate = Mock(
+            side_effect=lambda req, *args, **kwargs: 0
+            if req is requests[1]
+            else args[-1]
+        )
+        monkeypatch.setattr(scheduler, method, gate)
+        # Alignment receives optional cached-token arguments after num_tokens.
+        if stop_reason == "mamba_alignment":
+            gate.side_effect = lambda req, tokens, *args, **kwargs: (
+                0 if req is requests[1] else tokens
+            )
+    allocate = Mock(wraps=scheduler.kv_cache_manager.allocate_slots)
+    if stop_reason == "kv_capacity":
+        original = scheduler.kv_cache_manager.allocate_slots
+        allocate.side_effect = lambda req, *args, **kwargs: (
+            None if req is requests[1] else original(req, *args, **kwargs)
+        )
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_slots", allocate)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {requests[0].request_id: 64}
+    assert allocate.call_count == (2 if stop_reason == "kv_capacity" else 1)
+    if stop_reason in ("mamba_alignment", "prefill_lookahead"):
+        assert gate.call_count == 2
+    stats = scheduler.make_stats().prefill_batching_stats
+    if not enabled:
+        assert stats is None
+        return
+    expected = {"scheduled": 1, "not_examined": 1 if blocked else 2}
+    if blocked:
+        expected[stop_reason] = 1
+    assert stats.request_outcomes == expected
+    assert sum(stats.request_outcomes.values()) == len(requests)
+    assert stats.unexamined_by_stop_reason == {stop_reason: 1 if blocked else 2}
+    underfilled = stop_reason != "token_budget"
+    assert stats.outcome_steps == 1
+    assert stats.underfilled_outcome_steps == int(underfilled)
+    assert stats.underfilled_request_outcomes == (expected if underfilled else {})
+    assert stats.underfilled_unexamined_by_stop_reason == (
+        stats.unexamined_by_stop_reason if underfilled else {}
+    )
+    drained = scheduler.make_stats().prefill_batching_stats
+    assert drained.outcome_steps == 0
+    assert drained.request_outcomes == {}
+
+
+def test_prefill_outcomes_in_flight_work_is_not_a_second_forward() -> None:
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        max_num_batched_tokens=128,
+        max_model_len=1024,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=64)
+    scheduler.add_request(request)
+    scheduler.schedule()
+    assert scheduler.make_stats().prefill_batching_stats.request_outcomes == {
+        "scheduled": 1,
+    }
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.request_outcomes == {"in_flight_output": 1}
+    assert stats.outcome_steps == 1
+    assert stats.underfilled_outcome_steps == 0
+
+
+@pytest.mark.parametrize("paused", [PauseState.PAUSED_ALL, PauseState.PAUSED_NEW])
+def test_prefill_outcomes_paused_queue_is_unexamined(paused: PauseState) -> None:
+    scheduler = create_scheduler(enable_prefill_batching_metrics=True)
+    for request in create_requests(num_requests=2, num_tokens=64):
+        scheduler.add_request(request)
+    scheduler._pause_state = paused
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.request_outcomes == {"not_examined": 2}
+    assert stats.unexamined_by_stop_reason == {"scheduler_paused": 2}
+    assert stats.underfilled_outcome_steps == 0
+
+
+@pytest.mark.parametrize(
+    "status,outcome",
+    [
+        (RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, "grammar_pending"),
+        (RequestStatus.WAITING_FOR_STREAMING_REQ, "streaming_input_pending"),
+    ],
+)
+def test_prefill_outcomes_include_non_kv_waiting_states(status, outcome: str) -> None:
+    scheduler = create_scheduler(enable_prefill_batching_metrics=True)
+    blocked, ready = create_requests(num_requests=2, num_tokens=64)
+    for request in (blocked, ready):
+        scheduler.add_request(request)
+    blocked.status = status
+    assert scheduler.schedule().num_scheduled_tokens == {ready.request_id: 64}
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.request_outcomes == {outcome: 1, "scheduled": 1}
+    assert stats.underfilled_request_outcomes == stats.request_outcomes
+
+
+def test_prefill_outcomes_preempted_request_counted_once(monkeypatch) -> None:
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=True,
+        max_num_batched_tokens=64,
+        max_model_len=1024,
+    )
+    running, waiting = create_requests(num_requests=2, num_tokens=128)
+    scheduler.add_request(running)
+    scheduler.schedule()
+    scheduler.make_stats()
+    scheduler.add_request(waiting)
+    monkeypatch.setattr(
+        scheduler.kv_cache_manager, "allocate_slots", lambda *a, **k: None
+    )
+    assert scheduler.schedule().total_num_scheduled_tokens == 0
+    stats = scheduler.make_stats().prefill_batching_stats
+    assert stats.request_outcomes == {"kv_capacity": 1, "not_examined": 1}
+    assert stats.unexamined_by_stop_reason == {"preemption": 1}
+    assert stats.underfilled_outcome_steps == 0

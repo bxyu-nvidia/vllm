@@ -26,6 +26,7 @@ from vllm.v1.metrics.batching import (
     BATCH_COUNTER_FIELDS,
     DELAY_COUNTER_FIELDS,
     DELAY_REASONS,
+    OUTCOME_COUNTER_FIELDS,
     UNDERFILL_REASONS,
 )
 from vllm.v1.metrics.buckets import histogram_buckets
@@ -553,6 +554,21 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     reason: counter.labels(*values, reason) for reason in DELAY_REASONS
                 }
                 for idx, values in per_engine_labelvalues.items()
+            }
+
+        self.prefill_outcome_counters = {}
+        for field, (label, values) in OUTCOME_COUNTER_FIELDS.items():
+            counter = self._counter_cls(
+                name=f"vllm:prefill_{field}_total",
+                documentation=(
+                    f"Initial-prefill {field}; one observed outcome per request "
+                    "per step, not counterfactual readiness."
+                ),
+                labelnames=labelnames + [label],
+            )
+            self.prefill_outcome_counters[field] = {
+                idx: {value: counter.labels(*engine_labels, value) for value in values}
+                for idx, engine_labels in per_engine_labelvalues.items()
             }
 
         self.spec_decoding_prom = self._spec_decoding_cls(
@@ -1218,6 +1234,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     counters[engine_idx].inc(getattr(batching, name))
                 for reason, count in batching.underfilled_reasons.items():
                     self.prefill_underfill_reasons[engine_idx][reason].inc(count)
+                for field, engines in self.prefill_outcome_counters.items():
+                    for value, count in getattr(batching, field).items():
+                        engines[engine_idx][value].inc(count)
                 for field, engines in self.prefill_delay_counters.items():
                     for reason, count in getattr(batching, field).items():
                         engines[engine_idx][reason].inc(count)
