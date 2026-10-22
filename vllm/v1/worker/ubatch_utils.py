@@ -327,6 +327,11 @@ def _make_metadata_with_slice(
         block_table_tensor=block_table_tensor,
         slot_mapping=slot_mapping,
         seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+        mamba_checkpoint_block_ids=(
+            attn_metadata.mamba_checkpoint_block_ids[request_slice]
+            if attn_metadata.mamba_checkpoint_block_ids is not None
+            else None
+        ),
     )
 
 

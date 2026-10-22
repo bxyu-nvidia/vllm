@@ -22,7 +22,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
 from vllm.v1.engine import FinishReason
-from vllm.v1.metrics.batching import BATCH_COUNTER_FIELDS, UNDERFILL_REASONS
+from vllm.v1.metrics.batching import (
+    BATCH_COUNTER_FIELDS,
+    DELAY_COUNTER_FIELDS,
+    DELAY_REASONS,
+    OUTCOME_COUNTER_FIELDS,
+    UNDERFILL_REASONS,
+)
 from vllm.v1.metrics.buckets import histogram_buckets
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
@@ -511,10 +517,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             name: create_metric_per_engine(
                 self._counter_cls(
                     name=f"vllm:prefill_{name}_total",
-                    documentation=(
-                        f"Scheduler-visible prefill {name}; "
-                        "excludes draft and cache-only steps."
-                    ),
+                    documentation=f"Scheduler-visible initial-prefill {name}.",
                     labelnames=labelnames,
                 ),
                 per_engine_labelvalues,
@@ -535,6 +538,38 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             }
             for idx, values in per_engine_labelvalues.items()
         }
+
+        self.prefill_delay_counters = {}
+        for field in DELAY_COUNTER_FIELDS:
+            counter = self._counter_cls(
+                name=f"vllm:prefill_{field}_by_reason_total",
+                documentation=(
+                    f"Prefill {field} with a sole observed blocker; "
+                    "request-step observations, not proven counterfactual readiness."
+                ),
+                labelnames=labelnames + ["reason"],
+            )
+            self.prefill_delay_counters[field] = {
+                idx: {
+                    reason: counter.labels(*values, reason) for reason in DELAY_REASONS
+                }
+                for idx, values in per_engine_labelvalues.items()
+            }
+
+        self.prefill_outcome_counters = {}
+        for field, (label, values) in OUTCOME_COUNTER_FIELDS.items():
+            counter = self._counter_cls(
+                name=f"vllm:prefill_{field}_total",
+                documentation=(
+                    f"Initial-prefill {field}; one observed outcome per request "
+                    "per step, not counterfactual readiness."
+                ),
+                labelnames=labelnames + [label],
+            )
+            self.prefill_outcome_counters[field] = {
+                idx: {value: counter.labels(*engine_labels, value) for value in values}
+                for idx, engine_labels in per_engine_labelvalues.items()
+            }
 
         self.spec_decoding_prom = self._spec_decoding_cls(
             vllm_config.speculative_config,
@@ -1199,6 +1234,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     counters[engine_idx].inc(getattr(batching, name))
                 for reason, count in batching.underfilled_reasons.items():
                     self.prefill_underfill_reasons[engine_idx][reason].inc(count)
+                for field, engines in self.prefill_outcome_counters.items():
+                    for value, count in getattr(batching, field).items():
+                        engines[engine_idx][value].inc(count)
+                for field, engines in self.prefill_delay_counters.items():
+                    for reason, count in getattr(batching, field).items():
+                        engines[engine_idx][reason].inc(count)
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

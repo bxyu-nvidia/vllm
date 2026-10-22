@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import time
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
@@ -104,6 +104,7 @@ class Scheduler(SchedulerInterface):
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
         self.prefill_batching_stats = PrefillBatchingStats()
+        self._prefill_lookup_started_ns: dict[str, int] = {}
         self.prefill_batching_enabled = (
             log_stats
             and vllm_config.observability_config.enable_prefill_batching_metrics
@@ -456,6 +457,8 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        *,
+        underfill_reasons: set[str] | None = None,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
 
@@ -505,6 +508,7 @@ class Scheduler(SchedulerInterface):
                 hash_block_size=self.hash_block_size,
                 mamba_block_size=block_size,
                 checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+                allow_separate_checkpoint=True,
             )
         )
         if use_internal_checkpoint:
@@ -562,8 +566,30 @@ class Scheduler(SchedulerInterface):
             junction_stop if start < junction < end else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.
+        chunk_end = end
         end = min((s for s in stops if start < s < end), default=end)
-        return max(end - start, 0)
+        scheduled = max(end - start, 0)
+        if underfill_reasons is not None and scheduled < num_new_tokens:
+            if scheduled == 0:
+                underfill_reasons.add("mamba_alignment_budget_too_small")
+            elif end == chunk_end:
+                underfill_reasons.add("mamba_alignment_chunk_boundary")
+            else:
+                # Attribute the actual limiting boundary, not an earlier
+                # rounding that was superseded. Equal boundary constraints
+                # can overlap, just like reasons from different requests.
+                for boundary, reason in zip(
+                    stops,
+                    (
+                        "mamba_alignment_resume_boundary",
+                        "mamba_alignment_last_cache_boundary",
+                        "mamba_alignment_prompt_checkpoint",
+                        "mamba_alignment_shared_prefix",
+                    ),
+                ):
+                    if boundary == end:
+                        underfill_reasons.add(reason)
+        return scheduled
 
     def _get_local_prefix_cache_hit(
         self, request: Request
@@ -598,6 +624,36 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _lookup_external_prefix(
+        self, request: Request, num_local_tokens: int
+    ) -> tuple[int | None, bool]:
+        """Time lookup through scheduler-observed completion, including polling."""
+        assert self.connector is not None
+        if (
+            not self.prefill_batching_enabled
+            or request.prefill_stats is None
+            or request.num_output_tokens > 0
+            or request.skip_reading_prefix_cache
+        ):
+            return self.connector.get_num_new_matched_tokens(request, num_local_tokens)
+        started = time.monotonic_ns()
+        result = self.connector.get_num_new_matched_tokens(request, num_local_tokens)
+        request_id = request.request_id
+        if result[0] is None:
+            self._prefill_lookup_started_ns.setdefault(request_id, started)
+        else:
+            pending_started = self._prefill_lookup_started_ns.pop(request_id, None)
+            elapsed = time.monotonic_ns() - (
+                pending_started if pending_started is not None else started
+            )
+            stats = self.prefill_batching_stats
+            stats.kv_lookup_completed += 1
+            stats.kv_lookup_duration_ns += elapsed
+            if pending_started is not None:
+                stats.kv_lookup_pending_completed += 1
+                stats.kv_lookup_pending_duration_ns += elapsed
+        return result
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -621,6 +677,22 @@ class Scheduler(SchedulerInterface):
         batch_constraints: set[str] | None = (
             set() if self.prefill_batching_enabled else None
         )
+        delay_candidates: dict[str, str] = {}
+        observed_prefill = False
+        examined_prefills: set[str] = set()
+        ready_prefills: set[str] = set()
+        request_outcomes: dict[str, str] = {}
+        running_stop_reason = "other"
+        waiting_stop_reason = "other"
+
+        def record_outcome(request: Request, outcome: str) -> None:
+            if (
+                self.prefill_batching_enabled
+                and request.prefill_stats is not None
+                and request.num_output_tokens == 0
+            ):
+                request_outcomes[request.request_id] = outcome
+
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
@@ -667,14 +739,48 @@ class Scheduler(SchedulerInterface):
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
 
+        def record_delay(request: Request, reason: str) -> None:
+            # Do not claim a sole observed blocker for requests with known
+            # independent admission blockers. Never probe by allocating blocks
+            # or issuing a second cache lookup: metrics must not change scheduling.
+            if (
+                not self.prefill_batching_enabled
+                or request.prefill_stats is None
+                or request.num_output_tokens > 0
+                or defer_prefills
+                or request.has_encoder_inputs
+                or request.num_output_placeholders > 0
+                or self.current_step < request.next_decode_eligible_step
+                or (request.num_stale_output_tokens and not request.drop_stale_output)
+                or (
+                    request.status != RequestStatus.RUNNING
+                    and self.lora_config
+                    and request.lora_request
+                    and len(scheduled_loras) == self.lora_config.max_loras
+                    and request.lora_request.lora_int_id not in scheduled_loras
+                )
+            ):
+                return
+            delay_candidates[request.request_id] = reason
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if self.prefill_batching_enabled and request.prefill_stats is not None:
+                observed_prefill |= request.num_output_tokens == 0
             if input_budget <= draft_slots:
+                running_stop_reason = "input_budget_reserved"
                 if batch_constraints is not None:
                     batch_constraints.add("input_budget_reserved")
                 break
+
+            if (
+                self.prefill_batching_enabled
+                and request.prefill_stats is not None
+                and request.num_output_tokens == 0
+            ):
+                examined_prefills.add(request.request_id)
 
             if (
                 request.num_output_placeholders > 0
@@ -689,10 +795,12 @@ class Scheduler(SchedulerInterface):
                 # Async scheduling: Avoid scheduling an extra step when we are sure that
                 # the previous step has reached request.max_tokens. We don't schedule
                 # partial draft tokens since this prevents uniform decode optimizations.
+                record_outcome(request, "in_flight_output")
                 req_index += 1
                 continue
 
             if self.current_step < request.next_decode_eligible_step:
+                record_outcome(request, "in_flight_output")
                 if batch_constraints is not None:
                     batch_constraints.add("in_flight_output")
                 # V2+PP+async: enforce `pp_size` steps between same-req decodes
@@ -701,6 +809,7 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if defer_prefills and request.is_prefill_chunk:
+                record_outcome(request, "dp_prefill_throttle")
                 if batch_constraints is not None:
                     batch_constraints.add("dp_prefill_throttle")
                 # DP prefill balancing: defer this in-progress prefill chunk to a
@@ -716,6 +825,7 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens - request.num_output_placeholders,
                 )
             ):
+                record_outcome(request, "encoder_pending")
                 if batch_constraints is not None:
                     batch_constraints.add("encoder_constraint")
                 req_index += 1
@@ -726,8 +836,10 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if batch_constraints is not None and (num_new_tokens == 0):
-                batch_constraints.add("in_flight_output")
+            if num_new_tokens == 0:
+                record_outcome(request, "in_flight_output")
+                if batch_constraints is not None:
+                    batch_constraints.add("in_flight_output")
             if batch_constraints is not None and (
                 0 < num_new_tokens < min(token_budget, input_budget - draft_slots)
             ):
@@ -742,6 +854,7 @@ class Scheduler(SchedulerInterface):
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
+            before_model_limit = num_new_tokens
             num_new_tokens = min(
                 num_new_tokens,
                 self.max_model_len
@@ -749,15 +862,21 @@ class Scheduler(SchedulerInterface):
                 - self.num_sampled_tokens_per_step,
             )
 
+            if before_model_limit > 0 and num_new_tokens == 0:
+                record_outcome(request, "model_length_limit")
+
             # Apply Mamba alignment before encoder caps.
             before_alignment = num_new_tokens
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
-                    request, num_new_tokens
+                    request, num_new_tokens, underfill_reasons=batch_constraints
                 )
 
+            if before_alignment > 0 and num_new_tokens == 0:
+                record_outcome(request, "mamba_alignment")
             if batch_constraints is not None and (num_new_tokens < before_alignment):
                 batch_constraints.add("mamba_alignment")
+                record_delay(request, "mamba_alignment")
 
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
@@ -780,8 +899,11 @@ class Scheduler(SchedulerInterface):
                     shift_computed_tokens=self.num_prefill_lookahead,
                 )
 
+            if before_encoder > 0 and num_new_tokens == 0:
+                record_outcome(request, "encoder_pending")
             if batch_constraints is not None and (num_new_tokens < before_encoder):
                 batch_constraints.add("encoder_constraint")
+                delay_candidates.pop(request.request_id, None)
 
             # Multi-module MTP: avoid ending a prefill chunk within
             # num_prefill_lookahead of the prefill end.
@@ -790,8 +912,11 @@ class Scheduler(SchedulerInterface):
                 request, request.num_computed_tokens, num_new_tokens
             )
 
+            if before_lookahead > 0 and num_new_tokens == 0:
+                record_outcome(request, "prefill_lookahead")
             if batch_constraints is not None and (num_new_tokens < before_lookahead):
                 batch_constraints.add("prefill_lookahead")
+                delay_candidates.pop(request.request_id, None)
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
@@ -812,6 +937,12 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                request.request_id in examined_prefills
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                ready_prefills.add(request.request_id)
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -826,6 +957,7 @@ class Scheduler(SchedulerInterface):
                         break
                     if batch_constraints is not None:
                         batch_constraints.add("kv_capacity")
+                        delay_candidates.pop(request.request_id, None)
 
                     if (
                         self.connector is not None
@@ -881,11 +1013,14 @@ class Scheduler(SchedulerInterface):
                         drop_stale_output=self.requires_kv_delivery,
                     )
                     preempted_reqs.append(preempted_req)
+                    record_outcome(preempted_req, "kv_capacity")
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.
                         break
 
             if new_blocks is None:
+                record_outcome(request, "kv_capacity")
+                running_stop_reason = "kv_capacity"
                 # Cannot schedule this request.
                 break
 
@@ -928,6 +1063,9 @@ class Scheduler(SchedulerInterface):
                     duplicate_encoder_inputs,
                 )
 
+        if token_budget == 0 and running_stop_reason == "other":
+            running_stop_reason = "token_budget"
+
         # Record the LoRAs in scheduled_running_reqs
         scheduled_loras: set[int] = set()
         if self.lora_config:
@@ -958,6 +1096,8 @@ class Scheduler(SchedulerInterface):
                 if not request_queue and self._pause_state == PauseState.UNPAUSED:
                     request_queue = self.waiting
                 if not request_queue or input_budget <= draft_slots:
+                    if request_queue and input_budget <= draft_slots:
+                        waiting_stop_reason = "input_budget_reserved"
                     if batch_constraints is not None and (
                         request_queue and input_budget <= draft_slots
                     ):
@@ -967,25 +1107,49 @@ class Scheduler(SchedulerInterface):
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_active_reqs:
+                    waiting_stop_reason = "request_limit"
                     if batch_constraints is not None:
                         batch_constraints.add("request_limit")
                     break
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                if self.prefill_batching_enabled and request.prefill_stats is not None:
+                    observed_prefill |= request.num_output_tokens == 0
+
+                if (
+                    self.prefill_batching_enabled
+                    and request.prefill_stats is not None
+                    and request.num_output_tokens == 0
+                ):
+                    examined_prefills.add(request_id)
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
+                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                        outcome = "kv_load_pending"
+                    elif request.status == (
+                        RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+                    ):
+                        outcome = "grammar_pending"
+                    elif request.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+                        outcome = "streaming_input_pending"
+                    else:
+                        outcome = "other"
+                    record_outcome(request, outcome)
                     if batch_constraints is not None:
                         batch_constraints.add(
                             "kv_load_pending"
                             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
                             else "blocked_request"
                         )
+                    if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                        record_delay(request, "kv_load_pending")
                     skip_request(request_queue)
                     continue
 
                 if request.num_stale_output_tokens and not request.drop_stale_output:
+                    record_outcome(request, "in_flight_output")
                     if batch_constraints is not None:
                         batch_constraints.add("in_flight_output")
                     # Deliverable stale output still in flight: resuming now
@@ -1006,6 +1170,7 @@ class Scheduler(SchedulerInterface):
                     if batch_constraints is not None:
                         batch_constraints.add("lora_limit")
                     # Scheduling would exceed max_loras, skip.
+                    record_outcome(request, "lora_limit")
                     skip_request(request_queue)
                     continue
 
@@ -1033,17 +1198,17 @@ class Scheduler(SchedulerInterface):
                         block_aligned_local = (
                             num_new_local_computed_tokens - partial_tail
                         )
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, block_aligned_local
-                            )
+                        ext_tokens, load_kv_async = self._lookup_external_prefix(
+                            request, block_aligned_local
                         )
                         if request.skip_reading_prefix_cache:
                             ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
+                            record_outcome(request, "kv_lookup_pending")
                             if batch_constraints is not None:
                                 batch_constraints.add("kv_lookup_pending")
+                                record_delay(request, "kv_lookup_pending")
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
@@ -1128,6 +1293,7 @@ class Scheduler(SchedulerInterface):
 
                     # Skip request with pending mm encoding prefetches
                     if self._ec_transfer_pending(request, num_computed_tokens):
+                        record_outcome(request, "encoder_pending")
                         if batch_constraints is not None:
                             batch_constraints.add("encoder_constraint")
                         skip_request(request_queue)
@@ -1154,6 +1320,7 @@ class Scheduler(SchedulerInterface):
                     num_computed_tokens = request.num_computed_tokens
 
                     if self._ec_transfer_pending(request, num_computed_tokens):
+                        record_outcome(request, "encoder_pending")
                         if batch_constraints is not None:
                             batch_constraints.add("encoder_constraint")
                         skip_request(request_queue)
@@ -1171,12 +1338,15 @@ class Scheduler(SchedulerInterface):
                 num_replay_tokens = 0
 
                 if load_kv_async:
+                    record_outcome(request, "kv_load_pending")
                     if batch_constraints is not None:
                         batch_constraints.add("kv_load_pending")
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
+                    record_outcome(request, "dp_prefill_throttle")
+                    waiting_stop_reason = "dp_prefill_throttle"
                     if batch_constraints is not None:
                         batch_constraints.add("dp_prefill_throttle")
                     # DP prefill balancing: defer this step's local prefill
@@ -1216,6 +1386,8 @@ class Scheduler(SchedulerInterface):
                         ):
                             if padded_num_tokens > request_token_budget:
                                 # Prefer to not schedule than schedule un-padded.
+                                record_outcome(request, "spec_decode_padding")
+                                waiting_stop_reason = "spec_decode_padding"
                                 break
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
@@ -1236,6 +1408,8 @@ class Scheduler(SchedulerInterface):
                         and num_new_tokens > request_token_budget
                         and not self.is_mm_encoder_only
                     ):
+                        record_outcome(request, "chunked_prefill_disabled")
+                        waiting_stop_reason = "chunked_prefill_disabled"
                         if batch_constraints is not None:
                             batch_constraints.add("chunked_prefill_disabled")
                         # If chunked_prefill is disabled,
@@ -1253,13 +1427,19 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
+                            underfill_reasons=batch_constraints,
                         )
                         if batch_constraints is not None and (
                             num_new_tokens < before_alignment
                         ):
                             batch_constraints.add("mamba_alignment")
+                            record_delay(request, "mamba_alignment")
                         if num_new_tokens == 0:
-                            break
+                            record_outcome(request, "mamba_alignment")
+                            # A later request may fit the remaining budget. Retry
+                            # this one next step, preserving its queue priority.
+                            skip_request(request_queue)
+                            continue
                         if (
                             pad_spec_decode
                             and num_new_tokens != 1 + self.num_spec_tokens
@@ -1290,10 +1470,14 @@ class Scheduler(SchedulerInterface):
                             shift_computed_tokens=self.num_prefill_lookahead,
                         )
 
+                    if before_encoder > 0 and num_new_tokens == 0:
+                        record_outcome(request, "encoder_pending")
+                        waiting_stop_reason = "encoder_pending"
                     if batch_constraints is not None and (
                         num_new_tokens < before_encoder
                     ):
                         batch_constraints.add("encoder_constraint")
+                        delay_candidates.pop(request_id, None)
 
                     # Multi-module MTP: avoid ending a prefill chunk within
                     # num_prefill_lookahead of the prefill end.
@@ -1302,13 +1486,24 @@ class Scheduler(SchedulerInterface):
                         request, num_computed_tokens, num_new_tokens
                     )
 
+                    if before_lookahead > 0 and num_new_tokens == 0:
+                        record_outcome(request, "prefill_lookahead")
+                        waiting_stop_reason = "prefill_lookahead"
                     if batch_constraints is not None and (
                         num_new_tokens < before_lookahead
                     ):
                         batch_constraints.add("prefill_lookahead")
+                        delay_candidates.pop(request_id, None)
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
                         break
+
+                if (
+                    not load_kv_async
+                    and request_id in examined_prefills
+                    and num_computed_tokens < request.num_prompt_tokens
+                ):
+                    ready_prefills.add(request_id)
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
@@ -1365,8 +1560,11 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
+                    record_outcome(request, "kv_capacity")
+                    waiting_stop_reason = "kv_capacity"
                     if batch_constraints is not None:
                         batch_constraints.add("kv_capacity")
+                        delay_candidates.pop(request_id, None)
                     # The request cannot be scheduled.
 
                     # NOTE: we need to untouch the request from the encode cache
@@ -1429,6 +1627,7 @@ class Scheduler(SchedulerInterface):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    record_delay(request, "kv_load_pending")
                     self._inflight_prefills.add(request)
                     self._set_kv_fetch_stage(request, KV_FETCH_IN_PROGRESS)
                     skip_request(request_queue)
@@ -1517,6 +1716,77 @@ class Scheduler(SchedulerInterface):
         ):
             batch_constraints.add("scheduling_token_limit")
 
+        if self.prefill_batching_enabled:
+            # Count only; do not poll connectors or run admission checks again.
+            if self._pause_state == PauseState.PAUSED_ALL:
+                running_stop_reason = waiting_stop_reason = "scheduler_paused"
+            else:
+                if token_budget == 0 and waiting_stop_reason == "other":
+                    waiting_stop_reason = "token_budget"
+                if preempted_reqs:
+                    waiting_stop_reason = "preemption"
+            outcomes: Counter[str] = Counter()
+            unexamined_reasons: Counter[str] = Counter()
+            unexamined = 0
+            for queue, stop_reason in (
+                (self.running, running_stop_reason),
+                (self.kv_holding_waiting, waiting_stop_reason),
+                (
+                    self.waiting,
+                    "scheduler_paused"
+                    if self._pause_state == PauseState.PAUSED_NEW
+                    else waiting_stop_reason,
+                ),
+            ):
+                for request in queue:
+                    if request.prefill_stats is None or request.num_output_tokens > 0:
+                        continue
+                    req_id = request.request_id
+                    if req_id not in examined_prefills:
+                        unexamined += 1
+                    if num_scheduled_tokens.get(req_id, 0) > 0:
+                        outcome = "scheduled"
+                    elif req_id in request_outcomes:
+                        outcome = request_outcomes[req_id]
+                    elif req_id not in examined_prefills:
+                        outcome = "not_examined"
+                    else:
+                        outcome = "other"
+                    outcomes[outcome] += 1
+                    if outcome == "not_examined":
+                        unexamined_reasons[stop_reason] += 1
+            has_prefill_forward = any(
+                self.requests[req_id].prefill_stats is not None
+                and self.requests[req_id].num_computed_tokens
+                < self.requests[req_id].num_prompt_tokens
+                and tokens > 0
+                for req_id, tokens in num_scheduled_tokens.items()
+            )
+            self.prefill_batching_stats.observe_outcomes(
+                outcomes,
+                unexamined_reasons,
+                underfilled=(
+                    has_prefill_forward
+                    and total_num_scheduled_tokens
+                    < self.scheduler_config.max_num_batched_tokens
+                ),
+            )
+            if observed_prefill or unexamined:
+                stats = self.prefill_batching_stats
+                stats.readiness_steps += 1
+                stats.ready_requests += len(ready_prefills)
+                stats.ready_unscheduled_requests += len(
+                    ready_prefills.difference(num_scheduled_tokens)
+                )
+                stats.unexamined_requests += unexamined
+            for preempted_req in preempted_reqs:
+                delay_candidates.pop(preempted_req.request_id, None)
+            self.prefill_batching_stats.observe_delays(
+                delay_candidates,
+                scheduled_tokens=num_scheduled_tokens,
+                has_prefill=observed_prefill,
+            )
+
         # Construct the scheduler output.
         if self.use_v2_model_runner:
             scheduled_new_reqs.extend(scheduled_resumed_reqs)
@@ -1602,6 +1872,9 @@ class Scheduler(SchedulerInterface):
             )
 
         scheduler_output = SchedulerOutput(
+            mamba_checkpoint_block_ids=self.kv_cache_manager.get_mamba_checkpoint_block_ids(
+                list(num_scheduled_tokens)
+            ),
             batch_underfill_reasons=sorted(batch_constraints)
             if batch_constraints
             else [],
@@ -2871,6 +3144,8 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        if self._prefill_lookup_started_ns.pop(request.request_id, None) is not None:
+            self.prefill_batching_stats.kv_lookup_cancelled += 1
 
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)

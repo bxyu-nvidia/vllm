@@ -26,6 +26,8 @@ def compute_mamba_prefill_checkpoints(
     checkpoint_alignment: int | None,
     drop_eagle_block: bool,
     cache_hit_alignment_tokens: int,
+    *,
+    separate_checkpoint_block_ids: list[int] | None = None,
 ) -> tuple[list[int], list[int]]:
     """Per-row internal prefill checkpoint offsets and cache block columns.
 
@@ -36,12 +38,13 @@ def compute_mamba_prefill_checkpoints(
 
     Returns:
         ``(offsets, cols)``: the checkpoint's offset into each row's query and
-        its block-table column. ``0`` and ``-1`` mean the row has none.
+        its block-table column. Offset ``0`` means no checkpoint; column
+        ``-1`` with a positive offset uses a separate physical destination.
 
     """
     offsets: list[int] = []
     cols: list[int] = []
-    for seq_len, query_len in zip(seq_lens, query_lens):
+    for row, (seq_len, query_len) in enumerate(zip(seq_lens, query_lens)):
         query_start = seq_len - query_len
         position = get_mamba_prefill_checkpoint_position(
             seq_len, cache_hit_alignment_tokens, drop_eagle_block=drop_eagle_block
@@ -53,9 +56,17 @@ def compute_mamba_prefill_checkpoints(
             hash_block_size=hash_block_size,
             mamba_block_size=mamba_block_size,
             checkpoint_alignment=checkpoint_alignment,
+            allow_separate_checkpoint=(
+                separate_checkpoint_block_ids is not None
+                and separate_checkpoint_block_ids[row] >= 0
+            ),
         )
         offsets.append(position - query_start if valid else 0)
-        cols.append(cdiv(seq_len, mamba_block_size) - 2 if valid else -1)
+        checkpoint_col = cdiv(seq_len, mamba_block_size) - 2
+        initial_state_col = (query_start - 1) // mamba_block_size
+        cols.append(
+            checkpoint_col if valid and checkpoint_col > initial_state_col else -1
+        )
     return offsets, cols
 
 
@@ -122,6 +133,11 @@ class MambaPrefillCheckpointBuilder:
         drop_eagle_block = (
             speculative_config is not None and speculative_config.use_eagle_block_drop()
         )
+        separate_ids = (
+            [m.mamba_checkpoint_block_ids[row] for row in request_rows]
+            if m.mamba_checkpoint_block_ids is not None
+            else None
+        )
         checkpoint_offsets, checkpoint_cols = compute_mamba_prefill_checkpoints(
             [seq_lens[row] for row in request_rows],
             query_lens,
@@ -130,6 +146,7 @@ class MambaPrefillCheckpointBuilder:
             checkpoint_alignment=self.kv_cache_spec.prefill_checkpoint_alignment,
             drop_eagle_block=drop_eagle_block,
             cache_hit_alignment_tokens=cache_hit_alignment_tokens,
+            separate_checkpoint_block_ids=separate_ids,
         )
         if not any(checkpoint_offsets):
             return None
@@ -144,11 +161,21 @@ class MambaPrefillCheckpointBuilder:
         checkpoint_cols_tensor = async_tensor_h2d(
             checkpoint_cols, dtype=torch.int64, device=m.query_start_loc.device
         )
+        state_indices = _gather_checkpoint_state_indices(
+            m.block_table_tensor, request_rows_tensor, checkpoint_cols_tensor
+        )
+        if separate_ids is not None:
+            separate_tensor = async_tensor_h2d(
+                separate_ids, dtype=state_indices.dtype, device=m.query_start_loc.device
+            )
+            state_indices = torch.where(
+                (checkpoint_cols_tensor < 0) & (checkpoint_offsets_tensor > 0),
+                separate_tensor,
+                state_indices,
+            )
         return MambaPrefillCheckpointMetadata(
             checkpoint_offsets_tensor,
-            _gather_checkpoint_state_indices(
-                m.block_table_tensor, request_rows_tensor, checkpoint_cols_tensor
-            ),
+            state_indices,
             offsets=checkpoint_offsets,
             request_rows=request_rows_tensor,
             block_cols=checkpoint_cols_tensor,

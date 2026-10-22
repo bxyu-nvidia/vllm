@@ -732,6 +732,24 @@ class KVCacheManager:
             event.kv_cache_spec_sliding_window = sliding_window
         return events
 
+    def get_mamba_checkpoint_block_ids(
+        self,
+        request_ids: Sequence[str],
+    ) -> dict[int, dict[str, int]]:
+        """Gather separate Mamba export blocks for the scheduled requests."""
+        result: dict[int, dict[str, int]] = {}
+        for group_id, manager in enumerate(self.coordinator.single_type_managers):
+            if not isinstance(manager, MambaManager):
+                continue
+            blocks = {}
+            for request_id in request_ids:
+                block_id = manager.get_separate_checkpoint_block_id(request_id)
+                if block_id is not None:
+                    blocks[request_id] = block_id
+            if blocks:
+                result[group_id] = blocks
+        return result
+
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""
         return self.create_kv_cache_blocks(self.coordinator.get_blocks(request_id))

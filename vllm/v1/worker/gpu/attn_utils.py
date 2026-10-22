@@ -486,6 +486,7 @@ def build_attn_metadata(
     ubatch_idx: int = 0,
     fast_prefill: FastPrefillBatchMetadata | None = None,
     req_idx: np.ndarray | None = None,
+    mamba_checkpoint_block_ids: dict[int, list[int]] | None = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -549,6 +550,7 @@ def build_attn_metadata(
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
             req_idx=req_idx,
+            mamba_checkpoint_block_ids=(mamba_checkpoint_block_ids or {}).get(i),
             _token_to_req_indices_cache=token_to_req_indices,
             **common_attn_metadata_extra_kwargs,
         )
@@ -560,7 +562,7 @@ def build_attn_metadata(
                 attn_group.kv_cache_spec, MambaSpec
             ):
                 reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
-            if reuse_key in cached_metadata:
+            if reuse_key in cached_metadata and not mamba_checkpoint_block_ids:
                 metadata = attn_metadata_builder.update_block_table(
                     cached_metadata[reuse_key], block_table, slot_mapping
                 )

@@ -9,7 +9,11 @@ import pytest
 from transformers import GPT2Config
 
 from vllm.config import ModelConfig, VllmConfig
-from vllm.v1.metrics.batching import PrefillBatchingStats
+from vllm.v1.metrics.batching import (
+    OUTCOME_COUNTER_FIELDS,
+    UNDERFILL_REASONS,
+    PrefillBatchingStats,
+)
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import SchedulerStats
@@ -30,7 +34,13 @@ def test_batching_records_work_without_histograms_and_only_underfill_reasons():
         total_tokens=17,
         requests=2,
         token_budget=128,
-        reasons=["mamba_alignment", "mamba_alignment", "request_tail"],
+        reasons=[
+            "mamba_alignment",
+            "mamba_alignment",
+            "request_tail",
+            "mamba_alignment_budget_too_small",
+            "mamba_alignment_budget_too_small",
+        ],
     )
     assert stats.batches == 2
     assert stats.batch_tokens == 145
@@ -39,7 +49,11 @@ def test_batching_records_work_without_histograms_and_only_underfill_reasons():
     assert stats.request_forward_observations == 3
     assert stats.unused_token_slots == 111
     assert stats.underfilled_batches == 1
-    assert stats.underfilled_reasons == {"mamba_alignment": 1, "request_tail": 1}
+    assert stats.underfilled_reasons == {
+        "mamba_alignment": 1,
+        "request_tail": 1,
+        "mamba_alignment_budget_too_small": 1,
+    }
 
 
 def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
@@ -53,7 +67,25 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
             total_tokens=96,
             requests=2,
             token_budget=128,
-            reasons=["request_tail"],
+            reasons=[
+                reason
+                for reason in UNDERFILL_REASONS
+                if reason.startswith("mamba_alignment")
+            ],
+        )
+        stats.observe_outcomes(
+            {"scheduled": 1, "mamba_alignment": 1, "not_examined": 2},
+            {"mamba_alignment": 2},
+            underfilled=True,
+        )
+        stats.readiness_steps = 3
+        stats.ready_requests = 4
+        stats.ready_unscheduled_requests = 1
+        stats.unexamined_requests = 2
+        stats.kv_lookup_completed = 2
+        stats.kv_lookup_duration_ns = 6_000_000
+        stats.observe_delays(
+            {"pending": "kv_lookup_pending"}, scheduled_tokens={}, has_prefill=False
         )
         logger.record(SchedulerStats(prefill_batching_stats=stats), None)
         logger.record(SchedulerStats(), None)
@@ -68,8 +100,44 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
         assert samples["vllm:prefill_batches_total"] == 1
         assert samples["vllm:prefill_request_tokens_total"] == 96
         assert samples["vllm:prefill_request_forward_observations_total"] == 2
+        assert samples["vllm:prefill_readiness_steps_total"] == 3
+        assert samples["vllm:prefill_ready_requests_total"] == 4
+        assert samples["vllm:prefill_ready_unscheduled_requests_total"] == 1
+        assert samples["vllm:prefill_unexamined_requests_total"] == 2
+        assert samples["vllm:prefill_kv_lookup_completed_total"] == 2
+        assert samples["vllm:prefill_kv_lookup_duration_ns_total"] == 6_000_000
+        assert samples["vllm:prefill_delay_steps_total"] == 1
+        for field in ("delayed_requests", "blocked_requests"):
+            assert (
+                prometheus_client.REGISTRY.get_sample_value(
+                    f"vllm:prefill_{field}_by_reason_total",
+                    {
+                        "model_name": str(tmp_path),
+                        "engine": "0",
+                        "reason": "kv_lookup_pending",
+                    },
+                )
+                == 1
+            )
+        assert samples["vllm:prefill_outcome_steps_total"] == 1
+        assert samples["vllm:prefill_underfilled_outcome_steps_total"] == 1
+        for field, (label, values) in OUTCOME_COUNTER_FIELDS.items():
+            for value in values:
+                assert prometheus_client.REGISTRY.get_sample_value(
+                    f"vllm:prefill_{field}_total",
+                    {"model_name": str(tmp_path), "engine": "0", label: value},
+                ) == getattr(stats, field).get(value, 0)
         assert samples["vllm:prefill_completed_requests_total"] == 1
         assert samples["vllm:prefill_request_forwards_total"] == 3
+        reason_samples = {
+            sample.labels["reason"]: sample.value
+            for family in prometheus_client.REGISTRY.collect()
+            for sample in family.samples
+            if sample.name == "vllm:prefill_underfilled_batches_by_reason_total"
+        }
+        for reason in UNDERFILL_REASONS:
+            if reason.startswith("mamba_alignment"):
+                assert reason_samples[reason] == 1
         assert not any(key.endswith("_bucket") for key in samples)
     finally:
         unregister_vllm_metrics()
@@ -107,3 +175,54 @@ def test_dp_load_stats_roundtrip_with_prefill_batching_field(lockstep: bool) -> 
 
     core._maybe_publish_request_counts()
     assert core.output_queue.empty()
+
+
+def test_delay_counts_include_idle_steps_and_distinguish_clipped_from_blocked():
+    stats = PrefillBatchingStats()
+    stats.observe_delays(
+        {"a": "mamba_alignment", "b": "kv_lookup_pending", "c": "kv_lookup_pending"},
+        scheduled_tokens={"a": 64},
+        has_prefill=True,
+    )
+    stats.observe_delays(
+        {"b": "kv_lookup_pending", "c": "kv_load_pending"},
+        scheduled_tokens={},
+        has_prefill=False,
+    )
+    stats.observe_delays({}, scheduled_tokens={"decode": 1}, has_prefill=False)
+    assert stats.delay_steps == 2
+    assert stats.delayed_requests == {
+        "mamba_alignment": 1,
+        "kv_lookup_pending": 3,
+        "kv_load_pending": 1,
+    }
+    assert stats.blocked_requests == {"kv_lookup_pending": 3, "kv_load_pending": 1}
+
+
+def test_outcome_averages_have_separate_idle_full_and_underfilled_denominators() -> (
+    None
+):
+    stats = PrefillBatchingStats()
+    stats.observe_outcomes({}, {}, underfilled=False)
+    stats.observe_outcomes({"kv_lookup_pending": 2}, {}, underfilled=False)
+    stats.observe_outcomes({"scheduled": 4}, {}, underfilled=False)
+    stats.observe_outcomes(
+        {"scheduled": 1, "mamba_alignment": 1, "not_examined": 2},
+        {"mamba_alignment": 2},
+        underfilled=True,
+    )
+    stats.observe_outcomes({"scheduled": 2}, {}, underfilled=True)
+    assert stats.outcome_steps == 4
+    assert stats.underfilled_outcome_steps == 2
+    assert stats.request_outcomes == {
+        "scheduled": 7,
+        "kv_lookup_pending": 2,
+        "mamba_alignment": 1,
+        "not_examined": 2,
+    }
+    assert stats.underfilled_request_outcomes == {
+        "scheduled": 3,
+        "mamba_alignment": 1,
+        "not_examined": 2,
+    }
+    assert stats.underfilled_unexamined_by_stop_reason == {"mamba_alignment": 2}
