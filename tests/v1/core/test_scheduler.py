@@ -7867,6 +7867,60 @@ def test_prefill_alignment_zero_tokens_counts_blocked_request():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("scheduling_policy", ["fcfs", "priority"])
+def test_mamba_alignment_defers_requests_and_fills_with_later_short_prompt(
+    enabled: bool,
+    scheduling_policy: str,
+) -> None:
+    """Use the real splitter; skipped requests retain order and make progress."""
+    scheduler = create_scheduler(
+        enable_prefill_batching_metrics=enabled,
+        scheduling_policy=scheduling_policy,
+        max_num_batched_tokens=96,
+        max_model_len=1024,
+        block_size=64,
+        enable_prefix_caching=True,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    (first,) = create_requests(1, num_tokens=64, block_size=64, req_ids=["first"])
+    deferred = create_requests(
+        2,
+        num_tokens=200,
+        block_size=64,
+        req_ids=["long0", "long1"],
+    )
+    (short,) = create_requests(1, num_tokens=16, block_size=64, req_ids=["short"])
+    for i, request in enumerate([first, *deferred, short]):
+        request.arrival_time = float(i)
+        request.priority = i
+        scheduler.add_request(request)
+
+    scheduled = scheduler.schedule()
+    assert scheduled.num_scheduled_tokens == {"first": 64, "short": 16}
+    assert list(scheduler.waiting) == deferred
+    assert scheduler.deferred_waiting == set(deferred)
+    assert all(request.num_computed_tokens == 0 for request in deferred)
+    stats = scheduler.make_stats().prefill_batching_stats
+    if enabled:
+        assert stats.request_outcomes == {"scheduled": 2, "mamba_alignment": 2}
+        assert stats.blocked_requests == {"mamba_alignment": 2}
+        assert stats.unexamined_by_stop_reason == {}
+        assert stats.underfilled_request_outcomes == stats.request_outcomes
+        assert stats.underfilled_reasons["mamba_alignment_budget_too_small"] == 1
+    else:
+        assert stats is None
+
+    # With fresh budget the older deferred request runs before its sibling.
+    # The completed prompts have no more tokens to schedule before their outputs.
+    scheduled = scheduler.schedule()
+    assert scheduled.num_scheduled_tokens == {"long0": 64}
+    assert deferred[0].num_computed_tokens % 64 == 0
+    assert list(scheduler.waiting) == [deferred[1]]
+    assert deferred[0] not in scheduler.deferred_waiting
+    assert deferred[1] in scheduler.deferred_waiting
+
+
+@pytest.mark.parametrize("enabled", [False, True])
 def test_prefill_lookup_metrics_do_not_prevent_ready_request_scheduling(
     monkeypatch, enabled
 ):
@@ -7980,7 +8034,6 @@ def test_prefill_ready_but_allocation_blocked_does_not_assume_rest_ready(monkeyp
     [
         ("token_budget", False),
         ("request_limit", False),
-        ("mamba_alignment", True),
         ("prefill_lookahead", True),
         ("kv_capacity", True),
     ],
@@ -7998,24 +8051,11 @@ def test_prefill_outcomes_separate_blocked_head_from_unexamined_tail(
     requests = create_requests(num_requests=3, num_tokens=64)
     for request in requests:
         scheduler.add_request(request)
-    if stop_reason in ("mamba_alignment", "prefill_lookahead"):
-        scheduler.need_mamba_block_aligned_split = stop_reason == "mamba_alignment"
-        method = (
-            "_mamba_block_aligned_split"
-            if stop_reason == "mamba_alignment"
-            else "_reserve_prefill_lookahead"
-        )
+    if stop_reason == "prefill_lookahead":
         gate = Mock(
-            side_effect=lambda req, *args, **kwargs: 0
-            if req is requests[1]
-            else args[-1]
+            side_effect=lambda req, start, tokens: 0 if req is requests[1] else tokens
         )
-        monkeypatch.setattr(scheduler, method, gate)
-        # Alignment receives optional cached-token arguments after num_tokens.
-        if stop_reason == "mamba_alignment":
-            gate.side_effect = lambda req, tokens, *args, **kwargs: (
-                0 if req is requests[1] else tokens
-            )
+        monkeypatch.setattr(scheduler, "_reserve_prefill_lookahead", gate)
     allocate = Mock(wraps=scheduler.kv_cache_manager.allocate_slots)
     if stop_reason == "kv_capacity":
         original = scheduler.kv_cache_manager.allocate_slots
@@ -8026,7 +8066,7 @@ def test_prefill_outcomes_separate_blocked_head_from_unexamined_tail(
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {requests[0].request_id: 64}
     assert allocate.call_count == (2 if stop_reason == "kv_capacity" else 1)
-    if stop_reason in ("mamba_alignment", "prefill_lookahead"):
+    if stop_reason == "prefill_lookahead":
         assert gate.call_count == 2
     stats = scheduler.make_stats().prefill_batching_stats
     if not enabled:

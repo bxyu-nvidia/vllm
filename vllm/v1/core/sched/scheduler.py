@@ -1436,8 +1436,10 @@ class Scheduler(SchedulerInterface):
                             record_delay(request, "mamba_alignment")
                         if num_new_tokens == 0:
                             record_outcome(request, "mamba_alignment")
-                            waiting_stop_reason = "mamba_alignment"
-                            break
+                            # A later request may fit the remaining budget. Retry
+                            # this one next step, preserving its queue priority.
+                            skip_request(request_queue)
+                            continue
                         if (
                             pad_spec_decode
                             and num_new_tokens != 1 + self.num_spec_tokens
