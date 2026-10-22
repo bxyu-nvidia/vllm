@@ -3378,6 +3378,20 @@ class Scheduler(SchedulerInterface):
         batching_stats = None
         if self.prefill_batching_enabled:
             batching_stats = self.prefill_batching_stats
+            if self.connector is not None:
+                lookup_stats = self.connector.take_prefill_lookup_stats()
+                if lookup_stats is not None:
+                    batching_stats.kv_lookup_timed_completed += lookup_stats.completed
+                    batching_stats.kv_lookup_timed_failed += lookup_stats.failed
+                    batching_stats.kv_lookup_queue_duration_ns += (
+                        lookup_stats.queue_duration_ns
+                    )
+                    batching_stats.kv_lookup_execution_duration_ns += (
+                        lookup_stats.execution_duration_ns
+                    )
+                    batching_stats.kv_lookup_observation_duration_ns += (
+                        lookup_stats.observation_duration_ns
+                    )
             self.prefill_batching_stats = PrefillBatchingStats()
         return SchedulerStats(
             prefill_batching_stats=batching_stats,

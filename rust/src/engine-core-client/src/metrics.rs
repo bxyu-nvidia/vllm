@@ -339,6 +339,23 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
                 batching.kv_lookup_pending_duration_ns,
             ),
             ("kv_lookup_cancelled", batching.kv_lookup_cancelled),
+            (
+                "kv_lookup_timed_completed",
+                batching.kv_lookup_timed_completed,
+            ),
+            ("kv_lookup_timed_failed", batching.kv_lookup_timed_failed),
+            (
+                "kv_lookup_queue_duration_ns",
+                batching.kv_lookup_queue_duration_ns,
+            ),
+            (
+                "kv_lookup_execution_duration_ns",
+                batching.kv_lookup_execution_duration_ns,
+            ),
+            (
+                "kv_lookup_observation_duration_ns",
+                batching.kv_lookup_observation_duration_ns,
+            ),
             ("readiness_steps", batching.readiness_steps),
             ("ready_requests", batching.ready_requests),
             (
@@ -774,6 +791,11 @@ mod prefill_batching_tests {
                 unexamined_requests: 2,
                 kv_lookup_completed: 2,
                 kv_lookup_duration_ns: 6000000,
+                kv_lookup_timed_completed: 2,
+                kv_lookup_timed_failed: 1,
+                kv_lookup_queue_duration_ns: 1000000,
+                kv_lookup_execution_duration_ns: 2000000,
+                kv_lookup_observation_duration_ns: 3000000,
                 delayed_requests: [("kv_lookup_pending".to_owned(), 3)].into(),
                 blocked_requests: [("kv_lookup_pending".to_owned(), 3)].into(),
                 underfilled_reasons: PREFILL_UNDERFILL_REASONS
@@ -833,6 +855,11 @@ mod prefill_batching_tests {
             vllm:prefill_kv_lookup_pending_completed_total{model_name="model",engine="0"} 0
             vllm:prefill_kv_lookup_pending_duration_ns_total{model_name="model",engine="0"} 0
             vllm:prefill_kv_lookup_cancelled_total{model_name="model",engine="0"} 0
+            vllm:prefill_kv_lookup_timed_completed_total{model_name="model",engine="0"} 2
+            vllm:prefill_kv_lookup_timed_failed_total{model_name="model",engine="0"} 1
+            vllm:prefill_kv_lookup_queue_duration_ns_total{model_name="model",engine="0"} 1000000
+            vllm:prefill_kv_lookup_execution_duration_ns_total{model_name="model",engine="0"} 2000000
+            vllm:prefill_kv_lookup_observation_duration_ns_total{model_name="model",engine="0"} 3000000
             vllm:prefill_readiness_steps_total{model_name="model",engine="0"} 4
             vllm:prefill_ready_requests_total{model_name="model",engine="0"} 7
             vllm:prefill_ready_unscheduled_requests_total{model_name="model",engine="0"} 1

@@ -87,6 +87,7 @@ from vllm.v1.kv_cache_interface import (
     group_kernel_blocks,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
+from vllm.v1.metrics.batching import PrefillLookupStats
 
 from .metrics import MooncakeStoreConnectorStats
 
@@ -2377,6 +2378,13 @@ class LookupKeyServer:
 # ============================================================
 
 
+@dataclasses.dataclass
+class _LookupTiming:
+    submitted_ns: int
+    started_ns: int = 0
+    finished_ns: int = 0
+
+
 class LookupKeyClient:
     """ZMQ client for the LookupKey admin channel.
 
@@ -2400,6 +2408,8 @@ class LookupKeyClient:
             max_workers=1, thread_name_prefix="MooncakeLookupClient"
         )
         self.futures: dict[str, Future[MooncakeLookupResult]] = {}
+        self._lookup_timings: dict[str, _LookupTiming] = {}
+        self._prefill_lookup_stats = PrefillLookupStats()
 
     def _lookup(
         self, num_tokens: int, block_hashes: list[BlockHash]
@@ -2415,31 +2425,79 @@ class LookupKeyClient:
         resp = self.socket.recv()
         return decode_lookup_response(resp)
 
+    def _timed_lookup(
+        self,
+        timing: _LookupTiming,
+        num_tokens: int,
+        block_hashes: list[BlockHash],
+    ) -> MooncakeLookupResult:
+        timing.started_ns = time.monotonic_ns()
+        try:
+            return self._lookup(num_tokens, block_hashes)
+        finally:
+            # Set before Future completion, so the scheduler cannot observe a
+            # done Future whose completion timestamp has not been published.
+            timing.finished_ns = time.monotonic_ns()
+
+    def _observe_lookup(self, req_id: str, *, failed: bool) -> None:
+        timing = self._lookup_timings.pop(req_id, None)
+        if timing is None:
+            return
+        observed_ns = time.monotonic_ns()
+        stats = self._prefill_lookup_stats
+        stats.completed += 1
+        stats.failed += int(failed)
+        stats.queue_duration_ns += timing.started_ns - timing.submitted_ns
+        stats.execution_duration_ns += timing.finished_ns - timing.started_ns
+        stats.observation_duration_ns += observed_ns - timing.finished_ns
+
+    def take_prefill_lookup_stats(self) -> PrefillLookupStats:
+        """Drain completed attempts on the scheduler thread; preserve pending ones."""
+        stats = self._prefill_lookup_stats
+        self._prefill_lookup_stats = PrefillLookupStats()
+        return stats
+
     def lookup(
         self,
         req_id: str,
         num_tokens: int,
         block_hashes: list[BlockHash],
         non_block: bool = False,
+        *,
+        record_timing: bool = False,
     ) -> MooncakeLookupResult | None:
         """If non_block is True, will return None until the result is ready,
         so the caller retries on a later step."""
         future = self.futures.get(req_id)
         if future is None:
-            future = self.executor.submit(self._lookup, num_tokens, list(block_hashes))
+            if record_timing:
+                timing = _LookupTiming(submitted_ns=time.monotonic_ns())
+                future = self.executor.submit(
+                    self._timed_lookup, timing, num_tokens, list(block_hashes)
+                )
+                self._lookup_timings[req_id] = timing
+            else:
+                future = self.executor.submit(
+                    self._lookup, num_tokens, list(block_hashes)
+                )
             self.futures[req_id] = future
         if non_block and not future.done():
             return None
         try:
-            return future.result()
+            result = future.result()
         except Exception as e:
+            self._observe_lookup(req_id, failed=True)
             logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
             return MooncakeLookupResult(0)
+        else:
+            self._observe_lookup(req_id, failed=False)
+            return result
         finally:
             del self.futures[req_id]
 
     def discard(self, req_id: str) -> None:
         """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort)."""
+        self._lookup_timings.pop(req_id, None)
         future = self.futures.pop(req_id, None)
         if future is not None:
             future.cancel()
