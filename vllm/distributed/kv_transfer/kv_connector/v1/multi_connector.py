@@ -31,7 +31,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.metrics.batching import PrefillLookupStats
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -431,16 +430,6 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
     def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
         connector = self._connectors[self._requests_to_connector[request.request_id]]
         return connector.get_loaded_kv_cache_group_ids(request)
-
-    def take_prefill_lookup_stats(self) -> PrefillLookupStats | None:
-        combined = None
-        for connector in self._connectors:
-            stats = connector.take_prefill_lookup_stats()
-            if stats is not None:
-                if combined is None:
-                    combined = PrefillLookupStats()
-                combined.aggregate(stats)
-        return combined
 
     def get_num_new_matched_tokens(
         self,

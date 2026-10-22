@@ -61,7 +61,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
-from vllm.v1.metrics.batching import PrefillLookupStats
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import (
     DraftTokenIds,
@@ -8161,37 +8160,3 @@ def test_prefill_outcomes_preempted_request_counted_once(monkeypatch) -> None:
     assert stats.request_outcomes == {"kv_capacity": 1, "not_examined": 1}
     assert stats.unexamined_by_stop_reason == {"preemption": 1}
     assert stats.underfilled_outcome_steps == 0
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-def test_prefill_lookup_phase_metrics_drain_multi_connector(enabled):
-    scheduler = create_scheduler(enable_prefill_batching_metrics=enabled)
-    connectors = [Mock(), Mock(), Mock()]
-    connectors[0].take_prefill_lookup_stats.side_effect = [
-        PrefillLookupStats(1, 0, 10, 20, 30),
-        PrefillLookupStats(),
-    ]
-    connectors[1].take_prefill_lookup_stats.side_effect = [
-        PrefillLookupStats(2, 1, 40, 50, 60),
-        PrefillLookupStats(),
-    ]
-    connectors[2].take_prefill_lookup_stats.return_value = None
-    multi = object.__new__(MultiConnector)
-    multi._connectors = connectors
-    scheduler.connector = multi
-    stats = scheduler.make_stats().prefill_batching_stats
-    if not enabled:
-        assert stats is None
-        for connector in connectors:
-            connector.take_prefill_lookup_stats.assert_not_called()
-        return
-    assert stats.kv_lookup_timed_completed == 3
-    assert stats.kv_lookup_timed_failed == 1
-    assert stats.kv_lookup_queue_duration_ns == 50
-    assert stats.kv_lookup_execution_duration_ns == 70
-    assert stats.kv_lookup_observation_duration_ns == 90
-    drained = scheduler.make_stats().prefill_batching_stats
-    assert drained.kv_lookup_timed_completed == 0
-    assert drained.kv_lookup_queue_duration_ns == 0
-    for connector in connectors:
-        assert connector.take_prefill_lookup_stats.call_count == 2

@@ -67,7 +67,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
     from vllm.v1.kv_cache_interface import KVCacheConfig
-    from vllm.v1.metrics.batching import PrefillLookupStats
     from vllm.v1.request import Request
 
 # s_tensor_list, d_tensor_list, s_indices, d_indices, direction
@@ -497,14 +496,6 @@ class KVConnectorBase_V1(ABC):
         every transfer group.
         """
         return self._kv_cache_config.prefix_cacheable_group_ids
-
-    def take_prefill_lookup_stats(self) -> "PrefillLookupStats | None":
-        """Drain scheduler-side lookup phase timings, if supported.
-
-        Only instrumented initial-prefill attempts belong here. These counters
-        are separate from worker-side KV transfer telemetry.
-        """
-        return None
 
     @abstractmethod
     def get_num_new_matched_tokens(

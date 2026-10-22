@@ -12,7 +12,7 @@ use prometheus_client::registry::Registry;
 use crate::{F64Gauge, Histogram, HistogramFamily, U64Counter, U64Gauge};
 
 // Keep fields and reasons in sync with vllm/v1/metrics/batching.py.
-pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 26] = [
+pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 21] = [
     "completed_requests",
     "request_forwards",
     "request_tokens",
@@ -28,11 +28,6 @@ pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 26] = [
     "kv_lookup_pending_completed",
     "kv_lookup_pending_duration_ns",
     "kv_lookup_cancelled",
-    "kv_lookup_timed_completed",
-    "kv_lookup_timed_failed",
-    "kv_lookup_queue_duration_ns",
-    "kv_lookup_execution_duration_ns",
-    "kv_lookup_observation_duration_ns",
     "readiness_steps",
     "ready_requests",
     "ready_unscheduled_requests",

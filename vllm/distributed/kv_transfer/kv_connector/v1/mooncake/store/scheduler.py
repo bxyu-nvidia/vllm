@@ -145,10 +145,6 @@ class MooncakeStoreScheduler:
         kvc_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
-        self._prefill_lookup_metrics = (
-            vllm_config.observability_config.enable_prefill_batching_metrics
-            and vllm_config.kv_transfer_config.kv_role != "kv_consumer"
-        )
         # Skips lookup CPU cost on instances that never load KV from the store.
         self.enable_lookup = kvc_extra_config.get("enable_lookup", True)
         self.save_decode_cache = kvc_extra_config.get("save_decode_cache", False)
@@ -228,11 +224,6 @@ class MooncakeStoreScheduler:
             request.num_tokens,
             request.block_hashes,
             non_block=self.lookup_async,
-            record_timing=(
-                self._prefill_lookup_metrics
-                and request.prefill_stats is not None
-                and request.num_output_tokens == 0
-            ),
         )
         if lookup_result is None:
             # Lookup not ready yet; scheduler will retry on a later step.

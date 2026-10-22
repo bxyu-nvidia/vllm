@@ -43,11 +43,6 @@ BATCH_COUNTER_FIELDS = (
     "kv_lookup_pending_completed",
     "kv_lookup_pending_duration_ns",
     "kv_lookup_cancelled",
-    "kv_lookup_timed_completed",
-    "kv_lookup_timed_failed",
-    "kv_lookup_queue_duration_ns",
-    "kv_lookup_execution_duration_ns",
-    "kv_lookup_observation_duration_ns",
     "readiness_steps",
     "ready_requests",
     "ready_unscheduled_requests",
@@ -132,29 +127,6 @@ OUTCOME_COUNTER_FIELDS = {
 
 
 @dataclass
-class PrefillLookupStats:
-    """Completed instrumented lookup attempts, including observed failures.
-
-    All three durations share this cohort. Execution includes the client RPC
-    round trip, worker processing and response decoding; it is not GPU time or
-    just the store existence check. Discarded attempts are excluded.
-    """
-
-    completed: int = 0
-    failed: int = 0
-    queue_duration_ns: int = 0
-    execution_duration_ns: int = 0
-    observation_duration_ns: int = 0
-
-    def aggregate(self, other: "PrefillLookupStats") -> None:
-        self.completed += other.completed
-        self.failed += other.failed
-        self.queue_duration_ns += other.queue_duration_ns
-        self.execution_duration_ns += other.execution_duration_ns
-        self.observation_duration_ns += other.observation_duration_ns
-
-
-@dataclass
 class PrefillBatchingStats:
     """Delta observations drained with scheduler stats; no request-ID labels."""
 
@@ -174,11 +146,6 @@ class PrefillBatchingStats:
     kv_lookup_pending_completed: int = 0
     kv_lookup_pending_duration_ns: int = 0
     kv_lookup_cancelled: int = 0
-    kv_lookup_timed_completed: int = 0
-    kv_lookup_timed_failed: int = 0
-    kv_lookup_queue_duration_ns: int = 0
-    kv_lookup_execution_duration_ns: int = 0
-    kv_lookup_observation_duration_ns: int = 0
     readiness_steps: int = 0
     ready_requests: int = 0
     ready_unscheduled_requests: int = 0
