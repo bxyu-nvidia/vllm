@@ -99,6 +99,12 @@ def main() -> None:
     print(f"{module_str}.{function_str}: forward_tokens={metadata['forward_tokens']}")
     for iteration in range(args.warmup + args.iterations):
         positional, keyword = load_snapshot(args.dump / "inputs.pt", device)
+        if iteration == 0:
+            print(
+                [(i, type(p)) for i, p in enumerate(positional)]
+                + [(k, type(v)) for k, v in keyword.items()]
+            )
+
         torch.accelerator.synchronize()
         start, end = (
             torch.cuda.Event(enable_timing=True),
