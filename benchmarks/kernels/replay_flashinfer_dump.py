@@ -63,7 +63,10 @@ def main() -> None:
     )
     parser.add_argument("--rtol", type=float, default=1e-2)
     parser.add_argument("--atol", type=float, default=1e-2)
+    parser.add_argument("--module", type=str, required=False, default=None)
+    parser.add_argument("--function", type=str, required=False, default=None)
     args = parser.parse_args()
+
     if args.warmup < 0 or args.iterations < 1:
         parser.error("warmup must be nonnegative and iterations must be positive")
     metadata = json.loads((args.dump / "metadata.json").read_text())
@@ -74,18 +77,26 @@ def main() -> None:
         )
     if metadata["torch_version"] != str(torch.__version__):
         parser.error("Use the same PyTorch/container version as capture")
+
     os.environ.pop("VLLM_FLASHINFER_DUMP_DIR", None)
     os.environ["FLASHINFER_LOGLEVEL"] = "0"
     device = torch.device(args.device)
     torch.accelerator.set_device_index(device)
-    function = importlib.import_module(metadata["module"])
-    for part in metadata["function"].split("."):
+
+    if args.module and args.function:
+        module_str = args.module
+        function_str = args.function
+    elif not args.module and not args.function:
+        module_str = metadata["module"]
+        function_str = metadata["function"]
+    else:
+        raise NotImplementedError(f"{args.module=} {args.function=}")
+
+    function = importlib.import_module(module_str)
+    for part in function_str.split("."):
         function = getattr(function, part)
 
-    print(
-        f"{metadata['module']}.{metadata['function']}: "
-        f"forward_tokens={metadata['forward_tokens']}"
-    )
+    print(f"{module_str}.{function_str}: forward_tokens={metadata['forward_tokens']}")
     for iteration in range(args.warmup + args.iterations):
         positional, keyword = load_snapshot(args.dump / "inputs.pt", device)
         torch.accelerator.synchronize()
