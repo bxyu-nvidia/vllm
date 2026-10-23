@@ -110,11 +110,6 @@ def main() -> None:
             from flashinfer.fused_moe import WeightLayout
 
             keyword["weight_layout"] = getattr(WeightLayout, args.weight_layout)
-        if iteration == 0:
-            print(
-                [(i, type(p)) for i, p in enumerate(positional)]
-                + [(k, type(v)) for k, v in keyword.items()]
-            )
 
         torch.accelerator.synchronize()
         start, end = (
