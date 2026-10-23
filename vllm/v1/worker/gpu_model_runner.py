@@ -56,6 +56,7 @@ from vllm.forward_context import (
     set_forward_context,
 )
 from vllm.logger import init_logger
+from vllm.logging_utils.flashinfer_dump import flashinfer_dump_forward
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -4307,6 +4308,7 @@ class GPUModelRunner(
                 skip_compiled=has_encoder_input,
                 is_padding=is_padding,
             ),
+            flashinfer_dump_forward(num_tokens_unpadded),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,

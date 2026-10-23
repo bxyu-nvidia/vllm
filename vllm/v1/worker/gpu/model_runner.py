@@ -42,6 +42,7 @@ from vllm.distributed.aux_output_connector.worker import (
 from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.logging_utils.flashinfer_dump import flashinfer_dump_forward
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -2030,18 +2031,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_active_loras=batch_desc.num_active_loras,
             )
 
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=dp_sync_state
-                and dp_sync_state.num_tokens_across_dp,
-                batch_descriptor=batch_descriptor,
-                ubatch_slices=ubatch_slices,
-                slot_mapping=slot_mappings_by_layer,
-                skip_compiled=skip_compiled,
-                is_padding=input_batch.is_padding,
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                    num_tokens_across_dp=dp_sync_state
+                    and dp_sync_state.num_tokens_across_dp,
+                    batch_descriptor=batch_descriptor,
+                    ubatch_slices=ubatch_slices,
+                    slot_mapping=slot_mappings_by_layer,
+                    skip_compiled=skip_compiled,
+                    is_padding=input_batch.is_padding,
+                ),
+                flashinfer_dump_forward(input_batch.num_tokens, dummy=dummy_run),
             ):
                 self.kv_connector.pre_forward(scheduler_output, input_batch)
                 if ubatch_state is not None:

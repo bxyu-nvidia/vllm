@@ -548,6 +548,7 @@ steps:
   - tests/test_connections.py
   - tests/test_embedded_commit.py
   - tests/test_envs.py
+  - tests/logging_utils/
   - tests/test_force_first_config.py
   - tests/test_fxgraphcache_pickle_patch.py
   - tests/test_logprobs.py
@@ -594,6 +595,7 @@ steps:
   - pytest -v -s test_connections.py
   - pytest -v -s test_embedded_commit.py
   - pytest -v -s test_envs.py
+  - pytest -v -s logging_utils/test_flashinfer_dump.py
   - pytest -v -s test_force_first_config.py
   - pytest -v -s test_fxgraphcache_pickle_patch.py
   - pytest -v -s test_logprobs.py

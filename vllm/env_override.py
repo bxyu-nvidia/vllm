@@ -147,6 +147,14 @@ def _maybe_promote_torch_symbols_for_rocm():
 _maybe_set_cuda_compatibility_path()
 _maybe_promote_torch_symbols_for_rocm()
 
+# Install before FlashInfer imports so direct aliases and lazy APIs are covered.
+if os.environ.get("VLLM_FLASHINFER_DUMP_DIR"):
+    from vllm.logging_utils.flashinfer_capture_hook import (
+        install as _install_fi_capture,
+    )
+
+    _install_fi_capture()
+
 import torch
 
 from vllm.logger import init_logger
