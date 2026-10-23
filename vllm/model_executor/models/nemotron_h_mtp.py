@@ -35,7 +35,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsPP, SupportsQuant
+from .interfaces import MixtureOfExperts, SupportsPP, SupportsQuant
 from .nemotron_h import (
     NemotronHAttentionDecoderLayer,
     NemotronHMoEDecoderLayer,
@@ -330,7 +330,7 @@ class NemotronHMultiTokenPredictor(nn.Module):
         return hidden_states
 
 
-class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
+class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant, MixtureOfExperts):
     """NemotronH MTP model."""
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -386,6 +386,41 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+
+        # Register only the MoE layers, in MTP execution order.
+        self.moe_layers = []
+        self.expert_weights = []
+        self.num_expert_groups = config.n_group
+        example_moe = None
+        for layer in self.model.layers.values():
+            if isinstance(layer, NemotronHMoEDecoderLayer):
+                example_moe = layer.mixer
+                self.moe_layers.append(example_moe.experts)
+        self.num_moe_layers = len(self.moe_layers)
+        if example_moe is not None:
+            self.num_logical_experts = example_moe.n_logical_experts
+            self.num_physical_experts = example_moe.n_physical_experts
+            self.num_local_physical_experts = example_moe.n_local_physical_experts
+            self.num_routed_experts = example_moe.n_routed_experts
+            self.num_shared_experts = example_moe.n_shared_experts
+            self.num_redundant_experts = example_moe.n_redundant_experts
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
+        for layer in self.model.layers.values():
+            if isinstance(layer, NemotronHMoEDecoderLayer):
+                moe = layer.mixer
+                moe.n_local_physical_experts = num_local_physical_experts
+                moe.n_physical_experts = num_physical_experts
+                moe.n_redundant_experts = self.num_redundant_experts
+                moe.experts.update_expert_map()
 
     @staticmethod
     def _find_quant_config(*args, **kwargs) -> QuantizationConfig | None:
