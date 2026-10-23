@@ -65,6 +65,13 @@ def main() -> None:
     parser.add_argument("--atol", type=float, default=1e-2)
     parser.add_argument("--module", type=str, required=False, default=None)
     parser.add_argument("--function", type=str, required=False, default=None)
+    parser.add_argument(
+        "--weight-layout",
+        type=str,
+        required=False,
+        default=None,
+        choices=["BlockMajorK", "MajorK"],
+    )
     args = parser.parse_args()
 
     if args.warmup < 0 or args.iterations < 1:
@@ -99,6 +106,10 @@ def main() -> None:
     print(f"{module_str}.{function_str}: forward_tokens={metadata['forward_tokens']}")
     for iteration in range(args.warmup + args.iterations):
         positional, keyword = load_snapshot(args.dump / "inputs.pt", device)
+        if args.weight_layout:
+            from flashinfer.fused_moe import WeightLayout
+
+            keyword["weight_layout"] = getattr(WeightLayout, args.weight_layout)
         if iteration == 0:
             print(
                 [(i, type(p)) for i, p in enumerate(positional)]
