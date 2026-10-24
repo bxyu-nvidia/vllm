@@ -215,6 +215,7 @@ def test_mm_support_configured_after_model_load(monkeypatch):
 
     def init_base(speculator, vllm_config, device):
         speculator.vllm_config = vllm_config
+        speculator.dp_size = 1
         speculator.device = device
         speculator.max_num_tokens = 4
         speculator.max_num_reqs = 2
@@ -657,6 +658,7 @@ def test_mtp_prefill_only_requires_constant_zero_async_schedule(
 
 
 @pytest.mark.parametrize("num_steps", [1, 5])
+@pytest.mark.parametrize("scheduled_k", [0, 1, 2])
 @pytest.mark.parametrize(
     "cg_mode,dummy_run,is_profile",
     [
@@ -667,19 +669,28 @@ def test_mtp_prefill_only_requires_constant_zero_async_schedule(
         (CUDAGraphMode.NONE, True, True),
     ],
 )
-def test_mtp_zero_schedule_preserves_kv_without_draft_forwards(
-    monkeypatch, num_steps, cg_mode, dummy_run, is_profile
+def test_mtp_constant_schedule_matches_real_and_dummy_draft_counts(
+    monkeypatch, num_steps, scheduled_k, cg_mode, dummy_run, is_profile
 ):
-    """Real/dummy runs update KV once per chunk and never sample or decode drafts."""
+    """Idle ranks must issue the same number of draft forwards as active ranks."""
     from vllm.v1.worker.gpu.dp_utils import DPSyncState
     from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
     speculator = object.__new__(MTPSpeculator)
-    speculator.prefill_only = True
+    scheduled_k = min(scheduled_k, num_steps)
+    speculator.prefill_only = scheduled_k == 0
     speculator.num_speculative_steps = num_steps
     speculator.max_num_reqs = 2
     speculator.max_model_len = 128
     speculator.dp_size, speculator.dp_rank = 4, 0
+    speculator.speculative_config = SimpleNamespace(
+        num_speculative_tokens_per_batch_size=[(1, 1024, scheduled_k)]
+    )
+    speculator.scheduler_config = SimpleNamespace(async_scheduling=True)
+    speculator._configure_constant_dp_speculation()
+    speculator.supports_decode_metadata_update = False
+    speculator.temperature = speculator.seeds = speculator.draft_logits = None
+    speculator.sample_src_positions = torch.zeros(2, dtype=torch.int64)
     speculator.pcp_manager = None
     speculator.last_token_indices = torch.tensor([3, 7])
     speculator.current_draft_step = torch.tensor(0)
@@ -689,14 +700,14 @@ def test_mtp_zero_schedule_preserves_kv_without_draft_forwards(
     speculator.draft_tokens = torch.full((2, num_steps), 42)
     speculator._copy_request_inputs = Mock()
     speculator._prepare_eplb_forward = Mock()
-    speculator.sample_draft = Mock(side_effect=AssertionError("unused sampling"))
+    speculator.sample_draft = Mock(return_value=torch.zeros(2, dtype=torch.int64))
     speculator.decode_cudagraph_manager = Mock()
-    speculator._multi_step_decode = Mock(side_effect=AssertionError("unused drafts"))
+    speculator._multi_step_decode = Mock()
     speculator._fused_multi_step_decode = Mock(
         side_effect=AssertionError("unused fused drafts")
     )
     monkeypatch.setattr(spec_module, "prepare_prefill_inputs", Mock())
-    prepare_decode = Mock(side_effect=AssertionError("unused decode inputs"))
+    prepare_decode = Mock()
     monkeypatch.setattr(spec_module, "prepare_decode_inputs", prepare_decode)
 
     hidden = torch.ones(8, 3)
@@ -724,6 +735,7 @@ def test_mtp_zero_schedule_preserves_kv_without_draft_forwards(
         num_reqs=2,
         num_scheduled_tokens=torch.tensor([4, 4]),
         seq_lens_cpu_upper_bound=torch.tensor([4, 4]),
+        seq_lens=torch.tensor([4, 4]),
         idx_mapping=torch.arange(2),
         decode_graph_eligible=False,
     )
@@ -745,16 +757,27 @@ def test_mtp_zero_schedule_preserves_kv_without_draft_forwards(
             dp_sync_state=sync,
             dummy_run=dummy_run,
             is_profile=is_profile,
+            num_speculative_tokens=None if dummy_run else scheduled_k,
         )
         assert drafts.shape == (2, num_steps)
-        assert torch.all(drafts == -1)
+        if scheduled_k == 0:
+            assert torch.all(drafts == -1)
         assert len(kv_updates) == chunk + 1
         assert kv_updates[-1] == (8, attn_metadata, slot_mappings)
-        assert dispatch.call_count == chunk + 1
-        assert dispatch.call_args.kwargs["dp_sync_state"] is sync
-    speculator.sample_draft.assert_not_called()
-    prepare_decode.assert_not_called()
-    speculator._multi_step_decode.assert_not_called()
+        assert dispatch.call_count == (chunk + 1) * (2 if scheduled_k > 1 else 1)
+        assert dispatch.call_args_list[0].kwargs["dp_sync_state"] is sync
+        assert speculator.draft_max_seq_len == 8 + chunk * 4 + scheduled_k
+    assert speculator.sample_draft.call_count == (2 if scheduled_k else 0)
+    if scheduled_k > 1:
+        assert prepare_decode.call_count == 2
+        assert speculator._multi_step_decode.call_count == 2
+        assert all(
+            call.args[-1] == scheduled_k
+            for call in speculator._multi_step_decode.call_args_list
+        )
+    else:
+        prepare_decode.assert_not_called()
+        speculator._multi_step_decode.assert_not_called()
     speculator._fused_multi_step_decode.assert_not_called()
     speculator.decode_cudagraph_manager.run_fullgraph.assert_not_called()
 
