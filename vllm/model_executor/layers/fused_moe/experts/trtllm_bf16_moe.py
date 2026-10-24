@@ -141,7 +141,6 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
         return (
             moe_parallel_config.use_all2all_kernels
             and not moe_parallel_config.use_ag_rs_all2all_kernels
-            and not moe_parallel_config.use_deepep_ht_kernels
             and not moe_parallel_config.enable_eplb
         )
 
@@ -205,6 +204,10 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
         from flashinfer.fused_moe import WeightLayout
 
         topk_ids = topk_ids.to(dtype=torch.int32)
+        if apply_router_weight_on_input:
+            # Prepare already weighted the inputs; routed_moe always weights
+            # its output, so use unit weights to avoid applying them twice.
+            topk_weights = torch.ones_like(topk_weights)
 
         result = flashinfer.fused_moe.trtllm_bf16_routed_moe(
             topk_ids=(topk_ids, topk_weights),
@@ -224,6 +227,7 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
             weight_layout=WeightLayout.BlockMajorK,
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
+            tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
         )
         # FlashInfer's BF16 routed wrapper does not expose an output= argument.
         output.copy_(result[0] if isinstance(result, list) else result)
