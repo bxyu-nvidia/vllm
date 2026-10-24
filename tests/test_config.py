@@ -135,7 +135,8 @@ def test_flashinfer_replayssm_validates_input_dtype(mode, input_dtype):
         VllmConfig.validate_mamba_cached_kernel(config)
 
 
-def test_flashinfer_replayssm_rejects_microbatching():
+@pytest.mark.parametrize("runner_v2", [False, True])
+def test_flashinfer_replayssm_microbatching_requires_v2(runner_v2):
     config = SimpleNamespace(
         cache_config=SimpleNamespace(
             use_replayssm=True,
@@ -151,10 +152,13 @@ def test_flashinfer_replayssm_rejects_microbatching():
         mamba_config=SimpleNamespace(backend=MambaBackendEnum.FLASHINFER),
         parallel_config=SimpleNamespace(pipeline_parallel_size=1, use_ubatching=True),
         kv_transfer_config=None,
-        use_v2_model_runner=True,
+        use_v2_model_runner=runner_v2,
     )
-    with pytest.raises(ValueError, match="ReplaySSM does not support microbatching"):
-        VllmConfig.validate_mamba_cached_kernel(config)
+    if runner_v2:
+        assert VllmConfig.validate_mamba_cached_kernel(config) is config
+    else:
+        with pytest.raises(ValueError, match="microbatching requires Model Runner V2"):
+            VllmConfig.validate_mamba_cached_kernel(config)
 
 
 @pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
@@ -364,6 +368,10 @@ def test_kda_recoverssm_derivation_is_revalidated():
     VllmConfig.validate_mamba_cached_kernel(config)
     assert config.cache_config.use_replayssm
     assert config.cache_config.use_kda_recoverssm
+    config.parallel_config.use_ubatching = True
+    with pytest.raises(ValueError, match="RecoverSSM does not support microbatching"):
+        VllmConfig.validate_mamba_cached_kernel(config)
+    config.parallel_config.use_ubatching = False
 
     config.cache_config.mamba_cache_mode = "align"
     VllmConfig.validate_mamba_cached_kernel(config)
@@ -4300,3 +4308,62 @@ def test_hybrid_layer_counts_sparse_attention_as_attention(
             )
             == len(layer_types) - expected_attention
         )
+
+
+@pytest.mark.parametrize(
+    "section,field,value,expected",
+    [
+        (None, None, None, None),
+        ("model_config", "enforce_eager", False, "--enforce-eager"),
+        ("parallel_config", "num_ubatches", 3, "two microbatches"),
+        ("parallel_config", "tensor_parallel_size", 2, "TP=1"),
+        ("model_config", "dtype", torch.float16, "BF16"),
+        ("model_config", "quantization", "fp8", "without quantization"),
+        ("kernel_config", "moe_backend", "triton", "flashinfer_trtllm"),
+        ("speculative_config", "method", "eagle3", "speculative decoding"),
+        ("parallel_config", "pipeline_parallel_size", 2, "pipeline parallelism"),
+        ("parallel_config", "decode_context_parallel_size", 2, "context parallelism"),
+        ("model_config", "is_encoder_decoder", True, "multimodal inputs"),
+        ("compilation_config", "cudagraph_mode", CUDAGraphMode.PIECEWISE, "PIECEWISE"),
+        ("parallel_config", "all2all_backend", "deepep_high_throughput", "hybrid"),
+        ("multimodal_config", "language_model_only", False, "--language-model-only"),
+    ],
+)
+def test_eager_ag_rs_dbo_mtp_configuration_boundary(
+    monkeypatch, section, field, value, expected
+):
+    """Only the implemented text-only eager hybrid/MTP path is admitted."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    mm_config = SimpleNamespace(language_model_only=True, skip_mm_profiling=True)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            enforce_eager=True,
+            dtype=torch.bfloat16,
+            quantization=None,
+            is_hybrid=True,
+            is_attention_free=False,
+            is_encoder_decoder=False,
+            multimodal_config=mm_config,
+        ),
+        parallel_config=SimpleNamespace(
+            all2all_backend="allgather_reducescatter",
+            num_ubatches=2,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        speculative_config=SimpleNamespace(method="mtp"),
+        kernel_config=SimpleNamespace(moe_backend="flashinfer_trtllm"),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+        lora_config=None,
+        is_mm_encoder_only=False,
+    )
+    if section is not None:
+        obj = mm_config if section == "multimodal_config" else getattr(config, section)
+        setattr(obj, field, value)
+    blockers = VllmConfig._get_dbo_unsupported_features(config)
+    if expected is None:
+        assert blockers == []
+    else:
+        assert any(expected in blocker for blocker in blockers), blockers

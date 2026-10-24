@@ -2110,17 +2110,15 @@ class VllmConfig:
 
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
-            assert a2a_backend in [
+            supported_backends = [
                 "deepep_low_latency",
                 "deepep_high_throughput",
                 "nixl_ep",
-            ], (
-                "Microbatching currently only supports the deepep_low_latency, "
-                "deepep_high_throughput, and nixl_ep all2all backends. "
-                f"{a2a_backend} is not supported. To fix use "
-                "--all2all-backend=deepep_low_latency, "
-                "--all2all-backend=deepep_high_throughput, or "
-                "--all2all-backend=nixl_ep and install the matching kernels."
+            ]
+            if self.use_v2_model_runner:
+                supported_backends.append("allgather_reducescatter")
+            assert a2a_backend in supported_backends, (
+                f"Microbatching supports {supported_backends}; got {a2a_backend!r}."
             )
 
         if not self.instance_id:
@@ -3092,9 +3090,8 @@ class VllmConfig:
     def _get_dbo_unsupported_features(self) -> list[str]:
         """Collect what the V2 model runner cannot combine with DBO.
 
-        The V2 runner microbatches a plain decoder forward pass. Anything that
-        slices or replays the batch differently (drafting, adapters, pipeline
-        stages, context parallelism, encoders) is not handled yet.
+        Hybrid/MTP support initially uses eager AG/RS with whole requests.
+        Drafting runs on the merged batch after both target microbatches join.
         """
         # TODO: DBO with model runner V2 is under development.
         # It should be enabled with explicit VLLM_USE_V2_MODEL_RUNNER environ.
@@ -3106,10 +3103,33 @@ class VllmConfig:
         model_config = self.model_config
         parallel_config = self.parallel_config
 
+        eager_ag_rs = (
+            model_config is not None
+            and model_config.enforce_eager
+            and parallel_config.all2all_backend == "allgather_reducescatter"
+            and parallel_config.num_ubatches == 2
+            and parallel_config.tensor_parallel_size == 1
+        )
+        if parallel_config.all2all_backend == "allgather_reducescatter" and (
+            not eager_ag_rs
+            or self.kernel_config.moe_backend != "flashinfer_trtllm"
+            or model_config is None
+            or model_config.dtype != torch.bfloat16
+            or model_config.quantization is not None
+        ):
+            unsupported.append(
+                "AG/RS dual batch overlap requires --enforce-eager, TP=1, two "
+                "microbatches, BF16 without quantization, and "
+                "--moe-backend flashinfer_trtllm"
+            )
         if self.lora_config is not None:
             unsupported.append("dual batch overlap with LoRA")
-        if self.speculative_config is not None:
-            unsupported.append("dual batch overlap with speculative decoding")
+        if self.speculative_config is not None and not (
+            eager_ag_rs and self.speculative_config.method == "mtp"
+        ):
+            unsupported.append(
+                "dual batch overlap with speculative decoding outside eager AG/RS MTP"
+            )
         if parallel_config.pipeline_parallel_size > 1:
             unsupported.append("dual batch overlap with pipeline parallelism")
         if (
@@ -3117,12 +3137,21 @@ class VllmConfig:
             or parallel_config.prefill_context_parallel_size > 1
         ):
             unsupported.append("dual batch overlap with context parallelism")
-        if model_config is not None and (
-            model_config.is_multimodal_model or model_config.is_encoder_decoder
-        ):
-            unsupported.append("dual batch overlap with multimodal models")
-        if model_config is not None and model_config.is_hybrid:
-            unsupported.append("dual batch overlap with hybrid models")
+        if model_config is not None:
+            mm_config = model_config.multimodal_config
+            if model_config.is_encoder_decoder or (
+                mm_config is not None and not mm_config.language_model_only
+            ):
+                unsupported.append(
+                    "dual batch overlap with multimodal inputs; use "
+                    "--language-model-only for text-only decoder workloads"
+                )
+            if (
+                model_config.is_hybrid or model_config.is_attention_free
+            ) and not eager_ag_rs:
+                unsupported.append(
+                    "dual batch overlap with hybrid models outside eager AG/RS"
+                )
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE:
             # DBO captures FULL graphs only.
             unsupported.append("dual batch overlap with PIECEWISE CUDA graphs")
@@ -3356,6 +3385,8 @@ class VllmConfig:
                 "FlashInfer ReplaySSM requires --replayssm-buffer-len <= 16"
             )
         if self.cache_config.use_kda_recoverssm:
+            if self.parallel_config.use_ubatching:
+                raise ValueError("RecoverSSM does not support microbatching")
             if self.mamba_config.enable_stochastic_rounding:
                 raise ValueError(
                     "RecoverSSM supports bfloat16/float32 "
@@ -3385,8 +3416,10 @@ class VllmConfig:
                     "FlashInfer ReplaySSM align requires bfloat16 model inputs "
                     "for its replay rings; SSM state cache dtype is independent"
                 )
-            if self.parallel_config.use_ubatching:
-                raise ValueError("FlashInfer ReplaySSM does not support microbatching")
+            if self.parallel_config.use_ubatching and not self.use_v2_model_runner:
+                raise ValueError(
+                    "FlashInfer ReplaySSM microbatching requires Model Runner V2"
+                )
             if self.parallel_config.pipeline_parallel_size > 1:
                 raise ValueError(
                     "FlashInfer ReplaySSM currently requires pipeline_parallel_size=1"

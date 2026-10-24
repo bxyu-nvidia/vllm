@@ -560,3 +560,95 @@ def test_dummy_graph_padding_preserves_dp_sync(
         dp_sync_state=sync,
     )
     assert reused is sync
+
+
+@pytest.mark.parametrize("microbatched", [False, True])
+@pytest.mark.parametrize("drafting", [False, True])
+def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
+    monkeypatch, microbatched, drafting
+):
+    """MTP must not see a microbatch's offsets or overwrite live builder buffers."""
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+    from vllm.v1.worker.gpu.dp_utils import DPSyncState
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
+
+    events = []
+    runner = Mock()
+    runner.lora_config = runner.pcp_manager = None
+    runner.is_encoder_decoder = runner.uses_inputs_embeds = False
+    runner.use_aux_hidden_state_outputs = False
+    runner.is_first_pp_rank = runner.is_last_pp_rank = True
+    runner.speculator = Mock() if drafting else None
+    runner.decode_query_len = 6
+    runner.dp_size, runner.dp_rank, runner.dcp_size = 4, 0, 1
+    runner.parallel_config.num_ubatches = 2
+    runner.model_state.requires_whole_request_ubatches = True
+    runner.input_buffers = InputBuffers(4, 18, torch.device("cpu"))
+    runner.gather_batch_req_state.return_value = (None, 6)
+    runner.model_state.prepare_inputs.return_value = {}
+    blocks = (torch.tensor([[11], [22]]),)
+    slots = torch.arange(18).reshape(1, -1)
+    runner.prepare_dummy_attn.return_value = (blocks, slots)
+    full_metadata = {"attention": object()}
+    full_slots = {"attention": slots[0]}
+
+    def prepare_metadata(batch, mode, block_tables, slot_mappings, *args, **kwargs):
+        events.append("full_metadata")
+        assert batch.num_reqs == 2
+        assert batch.query_start_loc_np.tolist() == [0, 9, 18]
+        assert block_tables is blocks and slot_mappings is slots
+        return full_metadata
+
+    runner.model_state.prepare_attn.side_effect = prepare_metadata
+
+    def target_forward(*args, **kwargs):
+        events.append("target_joined")
+        return torch.arange(18).reshape(18, 1)
+
+    if microbatched:
+        runner.ubatch_runner.prepare.return_value = SimpleNamespace(slices=[])
+        runner.ubatch_runner.run.side_effect = target_forward
+    else:
+        runner.ubatch_runner = None
+        runner.model.side_effect = target_forward
+    desc = BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.NONE,
+        num_tokens=18,
+        num_reqs=2,
+        num_ubatches=2 if microbatched else 1,
+    )
+    sync = DPSyncState(torch.full((4,), 18), None, True, 2)
+    monkeypatch.setattr(
+        model_runner_module, "dispatch_cg_and_sync_dp", Mock(return_value=(desc, sync))
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "build_slot_mappings_by_layer",
+        lambda slot_mappings, config: full_slots,
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "set_forward_context",
+        lambda *a, **kw: contextlib.nullcontext(),
+    )
+    output = SchedulerOutput.make_empty()
+    output.num_scheduled_tokens = {"a": 6, "b": 6}
+    output.total_num_scheduled_tokens = 12
+    GPUModelRunner.execute_model(runner, output, dummy_run=True)
+
+    state = runner.execute_model_state
+    if microbatched and not drafting:
+        assert events == ["target_joined"]
+        assert state.attn_metadata is None
+    else:
+        assert events == (
+            ["target_joined", "full_metadata"]
+            if microbatched
+            else ["full_metadata", "target_joined"]
+        )
+        assert state.attn_metadata is full_metadata
+        assert state.slot_mappings_by_layer is full_slots
+    assert state.dp_sync_state is sync
+    torch.testing.assert_close(state.hidden_states, torch.arange(18).reshape(18, 1))

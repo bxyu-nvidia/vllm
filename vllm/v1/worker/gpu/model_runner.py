@@ -2072,6 +2072,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.kv_connector.finish_forward()
 
+        if ubatch_state is not None and self.speculator is not None:
+            # MTP draft prefill consumes the original, unsplit target batch.
+            # Rebuild only after run() has joined both microbatch threads: the
+            # full-batch builder reuses buffers owned by microbatch zero.
+            assert block_tables is not None and slot_mappings is not None
+            attn_metadata = self.model_state.prepare_attn(
+                input_batch,
+                CUDAGraphMode.NONE,
+                block_tables,
+                slot_mappings,
+                self.attn_groups,
+                self.kv_cache_config,
+            )
+            slot_mappings_by_layer = build_slot_mappings_by_layer(
+                slot_mappings, self.kv_cache_config
+            )
+
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
