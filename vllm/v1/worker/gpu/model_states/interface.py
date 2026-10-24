@@ -40,6 +40,9 @@ class ModelSpecificAttnMetadata:
 
 
 class ModelState(ABC):
+    requires_whole_request_ubatches: ClassVar[bool] = False
+    """Whether concurrent microbatches must own disjoint requests."""
+
     supports_prompt_embeds: ClassVar[bool] = False
     """Whether this state implements user-provided prompt embeddings."""
 
@@ -241,6 +244,16 @@ class ModelState(ABC):
         ubatch_idx: int = 0,
     ) -> dict[str, Any]:
         raise NotImplementedError
+
+    def prepare_ubatch_metadata(
+        self,
+        input_batch: InputBatch,
+        request_slices: list[slice],
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+    ) -> list[ModelSpecificAttnMetadata | None]:
+        """Prepare shared step state before building individual microbatches."""
+        return [None] * len(request_slices)
 
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         """Wrap or replace the default sampler.

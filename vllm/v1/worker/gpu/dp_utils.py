@@ -41,6 +41,19 @@ class DPSyncState:
     num_reqs: int
 
 
+def sync_ubatch_token_counts(
+    local_counts: list[int], dp_size: int, dp_rank: int
+) -> torch.Tensor:
+    """Exchange actual microbatch sizes after DP has agreed to split requests."""
+    counts = torch.zeros(len(local_counts), dp_size, dtype=torch.int32, device="cpu")
+    counts[:, dp_rank] = torch.tensor(local_counts, dtype=torch.int32, device="cpu")
+    if should_skip_dp_coordination():
+        counts[:] = counts[:, dp_rank, None].clone()
+    elif dp_size > 1:
+        dist.all_reduce(counts, group=get_dp_group().cpu_group)
+    return counts
+
+
 def sync_cudagraph_and_dp_padding(
     cudagraph_manager: CudaGraphManager | None,
     desired_batch_desc: BatchExecutionDescriptor,

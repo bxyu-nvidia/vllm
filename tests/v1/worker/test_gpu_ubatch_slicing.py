@@ -45,6 +45,7 @@ from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchState,
     _slice_input_batch,
     create_ubatch_slices,
+    create_whole_request_ubatch_slices,
     slice_model_inputs,
 )
 from vllm.v1.worker.ubatch_utils import (
@@ -282,7 +283,7 @@ def test_dummy_batch_can_be_microbatched():
 def _sync_dp(
     num_tokens_per_rank: list[int],
     uniform_token_count_per_rank: list[int] | None = None,
-    allow_ubatching: bool = True,
+    allow_ubatching: bool | list[bool] = True,
     cudagraph_manager: Any = None,
 ) -> tuple[BatchExecutionDescriptor, dp_utils.DPSyncState | None]:
     """Run the DP handshake with the all-reduce stubbed out.
@@ -299,7 +300,7 @@ def _sync_dp(
     reduced[1] = CUDAGraphMode.NONE.value
     reduced[2] = torch.tensor(uniform_token_counts, dtype=torch.int32)
     reduced[3] = -1  # max_query_len, -1 means None
-    reduced[4] = int(allow_ubatching)
+    reduced[4] = torch.tensor(allow_ubatching, dtype=torch.int32)
     reduced[5] = 8  # num_reqs
 
     with (
@@ -323,7 +324,11 @@ def _sync_dp(
                 dbo_decode_token_threshold=DECODE_THRESHOLD,
                 dbo_prefill_token_threshold=PREFILL_THRESHOLD,
             ),
-            allow_ubatching=allow_ubatching,
+            allow_ubatching=(
+                allow_ubatching[0]
+                if isinstance(allow_ubatching, list)
+                else allow_ubatching
+            ),
             uniform_decode=uniform_token_counts[0] == DECODE_QUERY_LEN,
         )
 
@@ -963,3 +968,60 @@ def test_microbatched_graph_needs_every_rank_to_reach_the_split():
     assert desc.cg_mode == CUDAGraphMode.NONE
     assert desc.num_ubatches == 2
     assert dp_sync_state is not None and dp_sync_state.eager
+
+
+@pytest.mark.parametrize("query_lens", [[1, 30, 1], [30, 1], [1, 30], [7, 4, 8, 2]])
+def test_whole_request_slices_preserve_recurrent_state_ownership(query_lens):
+    batch = _make_input_batch(
+        query_lens,
+        [q + 128 for q in query_lens],
+        _make_buffers(),
+        num_tokens_padded=sum(query_lens) + 5,
+    )
+    slices = create_whole_request_ubatch_slices(batch)
+    assert slices[0].request_slice.stop == slices[1].request_slice.start
+    assert slices[0].token_slice.stop == slices[1].token_slice.start
+    assert sum(s.num_tokens for s in slices) == batch.num_tokens_after_padding
+    actual_requests = []
+    actual_lengths = []
+    for s, (query_buf, seq_buf) in zip(slices, _make_ubatch_buffers()):
+        ubatch = _slice_input_batch(batch, s, query_buf, seq_buf)
+        actual_requests.extend(ubatch.req_ids)
+        actual_lengths.extend(ubatch.num_scheduled_tokens.tolist())
+        torch.testing.assert_close(ubatch.seq_lens, batch.seq_lens[s.request_slice])
+    assert actual_requests == batch.req_ids
+    assert actual_lengths == query_lens
+    split = slices[0].token_slice.stop
+    assert abs(2 * split - batch.num_tokens) == min(
+        abs(2 * int(boundary) - batch.num_tokens)
+        for boundary in batch.query_start_loc_np[1 : batch.num_reqs]
+    )
+
+
+def test_single_request_cannot_be_split_for_recurrent_dbo():
+    batch = _make_input_batch([32], [128], _make_buffers())
+    with pytest.raises(ValueError, match="at least two requests"):
+        create_whole_request_ubatch_slices(batch)
+
+
+def test_unsplittable_rank_disables_dbo_for_the_entire_dp_group():
+    desc, _ = _sync_dp([2048, 2048], allow_ubatching=[True, False])
+    assert desc.num_ubatches == 1
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_request_boundary_microbatches_exchange_actual_rank_sizes(monkeypatch, rank):
+    expected = torch.tensor([[3, 17], [29, 15]], dtype=torch.int32)
+
+    def all_reduce(counts, group):
+        torch.testing.assert_close(counts[:, rank], expected[:, rank])
+        assert torch.count_nonzero(counts[:, 1 - rank]) == 0
+        counts.copy_(expected)
+
+    monkeypatch.setattr(dp_utils, "should_skip_dp_coordination", lambda: False)
+    monkeypatch.setattr(
+        dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
+    monkeypatch.setattr(dp_utils.dist, "all_reduce", all_reduce)
+    counts = dp_utils.sync_ubatch_token_counts(expected[:, rank].tolist(), 2, rank)
+    torch.testing.assert_close(counts, expected)

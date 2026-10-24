@@ -645,3 +645,77 @@ def test_separate_checkpoint_destinations_follow_batch_order_and_padding(
         0: [-1, 71] + ([-1] if padded else []),
         2: [91, -1] + ([-1] if padded else []),
     }
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_microbatches_keep_full_batch_replayssm_and_disjoint_aligned_indices(
+    monkeypatch, device
+):
+    """The second microbatch must never restart at block-table row zero."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("Requires CUDA")
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    state = _mamba_hybrid_state(num_speculative_tokens=3)
+    state._align_mode = state._use_flashinfer_replayssm = True
+    state._is_prefilling_gpu = torch.zeros(3, dtype=torch.bool, device=device)
+    state._is_prefill_tail_gpu = torch.zeros_like(state._is_prefilling_gpu)
+    state.num_accepted_tokens_gpu = state.num_accepted_tokens_gpu.to(device)
+    batch = _input_batch([8, 1, 4], [0, 0, 3], [True, False, False])
+    batch.idx_mapping = torch.tensor([2, 0, 1], device=device)
+    batch.query_start_loc = batch.query_start_loc.to(device)
+    batch.seq_lens = batch.seq_lens.to(device)
+    indices = torch.tensor([[[20, 21], [40, 41], [60, 61]]], device=device)
+    state._mamba_ctx = Mock()
+    state._mamba_ctx.compute_aligned_state_indices.return_value = indices
+    state._get_mamba_group_info = Mock(return_value=([0], None))
+    builders = [SimpleNamespace(mamba_aligned_state_indices=None) for _ in range(2)]
+    groups = [[SimpleNamespace(get_metadata_builder=lambda i: builders[i])]]
+    slices = [slice(0, 1), slice(1, 3)]
+    metadata = state.prepare_ubatch_metadata(batch, slices, groups, Mock())
+    assert state._replayssm_query_start_loc is batch.query_start_loc
+    assert state._is_prefilling_gpu.tolist() == [True, False, False]
+    assert metadata[0].num_accepted_tokens.tolist() == [1]
+    assert metadata[1].num_accepted_tokens.tolist() == [4, 1]
+    assert metadata[1].num_decode_draft_tokens_cpu.tolist() == [0, 3]
+
+    build_calls = []
+
+    def build_metadata(**kwargs):
+        build_calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(mamba_hybrid, "build_attn_metadata", build_metadata)
+    for i, request_slice in enumerate(slices):
+        queries = batch.num_scheduled_tokens[request_slice].tolist()
+        sub = _input_batch(
+            queries,
+            batch.num_draft_tokens_per_req[request_slice].tolist(),
+            batch.is_prefilling_np[request_slice].tolist(),
+        )
+        state.prepare_attn(
+            sub,
+            CUDAGraphMode.NONE,
+            (),
+            torch.empty(0),
+            groups,
+            Mock(),
+            ubatch_idx=i,
+            model_specific_attn_metadata=metadata[i],
+        )
+    # Preparing slice 1 cannot overwrite slice 0's indices or the full-step
+    # offsets/masks consumed once after sampling the merged outputs.
+    assert [call["ubatch_idx"] for call in build_calls] == [0, 1]
+    torch.testing.assert_close(builders[0].mamba_aligned_state_indices, indices[0, :1])
+    torch.testing.assert_close(builders[1].mamba_aligned_state_indices, indices[0, 1:])
+    assert state._replayssm_query_start_loc is batch.query_start_loc
+    assert state._is_prefilling_gpu.tolist() == [True, False, False]
+    state._mamba_ctx.compute_aligned_state_indices.assert_called_once()
+
+
+def test_secondary_mamba_microbatch_requires_presliced_metadata(monkeypatch):
+    state = _mamba_hybrid_state(num_speculative_tokens=0)
+    batch = _input_batch([8], None, [True])
+    with pytest.raises(AssertionError, match="full-batch Mamba metadata"):
+        state.prepare_attn(
+            batch, CUDAGraphMode.NONE, (), torch.empty(0), [], Mock(), ubatch_idx=1
+        )

@@ -1787,19 +1787,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        whole_request_ubatching = (
+            self.ubatch_runner is not None
+            and self.model_state.requires_whole_request_ubatches
+        )
         batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
-            self.cudagraph_manager,
+            None if whole_request_ubatching else self.cudagraph_manager,
             num_reqs,
             num_toks,
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or whole_request_ubatching,
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(
-                self.ubatch_runner is not None and not skip_attn_for_dummy_run
+                self.ubatch_runner is not None
+                and not skip_attn_for_dummy_run
+                and (
+                    not whole_request_ubatching
+                    or (self.parallel_config.num_ubatches == 2 and num_reqs >= 2)
+                )
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
         )

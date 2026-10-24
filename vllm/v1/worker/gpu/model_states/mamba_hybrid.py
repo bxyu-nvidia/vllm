@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -43,6 +43,29 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    aligned_state_indices: torch.Tensor | None = None
+
+    def slice_requests(self, request_slice: slice) -> "MambaHybridAttnMetadata":
+        """Keep full-batch state indexing while narrowing request-owned metadata."""
+        return replace(
+            self,
+            is_prefilling=self.is_prefilling[request_slice],
+            num_accepted_tokens=(
+                None
+                if self.num_accepted_tokens is None
+                else self.num_accepted_tokens[request_slice]
+            ),
+            num_decode_draft_tokens_cpu=(
+                None
+                if self.num_decode_draft_tokens_cpu is None
+                else self.num_decode_draft_tokens_cpu[request_slice]
+            ),
+            aligned_state_indices=(
+                None
+                if self.aligned_state_indices is None
+                else self.aligned_state_indices[:, request_slice]
+            ),
+        )
 
     def get_extra_common_attn_kwargs(
         self, kv_cache_group_id: int, num_reqs: int
@@ -74,6 +97,8 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
 
 class MambaHybridModelState(DefaultModelState):
     """Model state for hybrid attention + Mamba / linear-attention models."""
+
+    requires_whole_request_ubatches: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -262,8 +287,6 @@ class MambaHybridModelState(DefaultModelState):
         ubatch_idx: int = 0,
         model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     ) -> dict[str, Any]:
-        assert ubatch_idx == 0, "DBO is not supported"
-        assert model_specific_attn_metadata is None
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
@@ -283,6 +306,71 @@ class MambaHybridModelState(DefaultModelState):
         else:
             max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
 
+        if model_specific_attn_metadata is None:
+            assert ubatch_idx == 0, "Microbatches require full-batch Mamba metadata"
+            mamba_attn_metadata = self._prepare_mamba_metadata(
+                input_batch, num_reqs, attn_groups, kv_cache_config, for_capture
+            )
+        else:
+            assert isinstance(model_specific_attn_metadata, MambaHybridAttnMetadata)
+            mamba_attn_metadata = model_specific_attn_metadata
+
+        all_group_indices = mamba_attn_metadata.aligned_state_indices
+        if all_group_indices is not None:
+            mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+            for group_idx, group_id in enumerate(mamba_group_ids):
+                for group in attn_groups[group_id]:
+                    builder = group.get_metadata_builder(ubatch_idx)
+                    if hasattr(builder, "mamba_aligned_state_indices"):
+                        builder.mamba_aligned_state_indices = all_group_indices[
+                            group_idx
+                        ]
+
+        attn_metadata = build_attn_metadata(
+            attn_groups=attn_groups,
+            ubatch_idx=ubatch_idx,
+            num_reqs=num_reqs,
+            num_tokens=num_tokens,
+            query_start_loc_gpu=input_batch.query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            max_query_len=max_query_len,
+            seq_lens=input_batch.seq_lens,
+            max_seq_len=max_seq_len,
+            block_tables=block_tables,
+            slot_mappings=slot_mappings,
+            kv_cache_config=kv_cache_config,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
+            positions=input_batch.positions,
+            model_specific_attn_metadata=mamba_attn_metadata,
+            for_cudagraph_capture=for_capture,
+            rswa_prefix_lens=input_batch.prompt_lens,
+            mamba_checkpoint_block_ids={
+                group_id: [
+                    destinations.get(req_id, -1) for req_id in input_batch.req_ids
+                ]
+                + [-1] * (num_reqs - input_batch.num_reqs)
+                for group_id, destinations in (
+                    input_batch.mamba_checkpoint_block_ids or {}
+                ).items()
+            },
+        )
+        if self.recoverssm is not None:
+            self.recoverssm.record_step(
+                attn_metadata, attn_groups, for_capture=for_capture
+            )
+        return attn_metadata
+
+    def _prepare_mamba_metadata(
+        self,
+        input_batch: InputBatch,
+        num_reqs: int,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        for_capture: bool,
+    ) -> MambaHybridAttnMetadata:
+        query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+        seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
         is_prefilling_np = input_batch.is_prefilling_np
         if input_batch.prefill_runs_as_decode_np is not None:
             # A prompt tail the scheduler padded with placeholder drafts must run
@@ -349,60 +437,40 @@ class MambaHybridModelState(DefaultModelState):
             )
             async_tensor_h2d(prefill_tail, out=self._is_prefill_tail_gpu[:num_reqs])
 
+        all_group_indices = None
         if self._align_mode:
             mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
-            aligned_index_builders = []
-            for group_idx, group_id in enumerate(mamba_group_ids):
-                for group in attn_groups[group_id]:
-                    builder = group.get_metadata_builder(0)
-                    if hasattr(builder, "mamba_aligned_state_indices"):
-                        aligned_index_builders.append((group_idx, builder))
-            if aligned_index_builders:
+            if any(
+                hasattr(group.get_metadata_builder(0), "mamba_aligned_state_indices")
+                for group_id in mamba_group_ids
+                for group in attn_groups[group_id]
+            ):
                 assert self._mamba_ctx is not None
                 all_group_indices = self._mamba_ctx.compute_aligned_state_indices(
                     input_batch.seq_lens, num_reqs
                 )
-                for group_idx, builder in aligned_index_builders:
-                    builder.mamba_aligned_state_indices = all_group_indices[group_idx]
 
-        mamba_attn_metadata = MambaHybridAttnMetadata(
+        return MambaHybridAttnMetadata(
+            aligned_state_indices=all_group_indices,
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
-        attn_metadata = build_attn_metadata(
-            attn_groups=attn_groups,
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            query_start_loc_gpu=input_batch.query_start_loc,
-            query_start_loc_cpu=query_start_loc_cpu,
-            max_query_len=max_query_len,
-            seq_lens=input_batch.seq_lens,
-            max_seq_len=max_seq_len,
-            block_tables=block_tables,
-            slot_mappings=slot_mappings,
-            kv_cache_config=kv_cache_config,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
-            positions=input_batch.positions,
-            model_specific_attn_metadata=mamba_attn_metadata,
-            for_cudagraph_capture=for_capture,
-            rswa_prefix_lens=input_batch.prompt_lens,
-            mamba_checkpoint_block_ids={
-                group_id: [
-                    destinations.get(req_id, -1) for req_id in input_batch.req_ids
-                ]
-                + [-1] * (num_reqs - input_batch.num_reqs)
-                for group_id, destinations in (
-                    input_batch.mamba_checkpoint_block_ids or {}
-                ).items()
-            },
+
+    def prepare_ubatch_metadata(
+        self,
+        input_batch: InputBatch,
+        request_slices: list[slice],
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+    ) -> list[ModelSpecificAttnMetadata | None]:
+        # ReplaySSM acceptance runs once after the merged forward. Preserve its
+        # full-batch query offsets and masks; metadata builders get disjoint views.
+        assert self.recoverssm is None, "RecoverSSM microbatching is not supported"
+        metadata = self._prepare_mamba_metadata(
+            input_batch, input_batch.num_reqs, attn_groups, kv_cache_config, False
         )
-        if self.recoverssm is not None:
-            self.recoverssm.record_step(
-                attn_metadata, attn_groups, for_capture=for_capture
-            )
-        return attn_metadata
+        return [metadata.slice_requests(s) for s in request_slices]
 
     def postprocess_state(
         self,

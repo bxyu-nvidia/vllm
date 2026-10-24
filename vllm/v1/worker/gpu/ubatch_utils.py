@@ -25,6 +25,7 @@ from vllm.utils.torch_utils import current_stream
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+from vllm.v1.worker.gpu.dp_utils import sync_ubatch_token_counts
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.ubatch_utils import (
@@ -44,6 +45,24 @@ class UBatchState(NamedTuple):
 
     slices: UBatchSlices
     forward_contexts: list[ForwardContext]
+
+
+def create_whole_request_ubatch_slices(input_batch: InputBatch) -> UBatchSlices:
+    """Split two eager microbatches at the request boundary nearest half the work."""
+    if input_batch.num_reqs < 2:
+        raise ValueError("Whole-request DBO requires at least two requests per rank")
+    boundaries = input_batch.query_start_loc_np[1 : input_batch.num_reqs]
+    split_req = int(np.argmin(np.abs(2 * boundaries - input_batch.num_tokens))) + 1
+    split_token = int(input_batch.query_start_loc_np[split_req])
+    if not 0 < split_token < input_batch.num_tokens:
+        raise ValueError("Whole-request DBO requires two nonempty microbatches")
+    return [
+        UBatchSlice(slice(0, split_req), slice(0, split_token)),
+        UBatchSlice(
+            slice(split_req, input_batch.num_reqs_after_padding),
+            slice(split_token, input_batch.num_tokens_after_padding),
+        ),
+    ]
 
 
 def create_ubatch_slices(input_batch: InputBatch, num_ubatches: int) -> UBatchSlices:
@@ -348,7 +367,25 @@ class UBatchRunner:
         FULL uses padded sizes; `for_capture` refreshes metadata from dummy
         block tables.
         """
-        ubatch_slices = create_ubatch_slices(input_batch, self.num_ubatches)
+        whole_requests = self.model_state.requires_whole_request_ubatches
+        token_counts = None
+        if whole_requests:
+            assert self.num_ubatches == 2
+            assert cg_mode == CUDAGraphMode.NONE and not for_capture
+            ubatch_slices = create_whole_request_ubatch_slices(input_batch)
+            token_counts = sync_ubatch_token_counts(
+                [s.num_tokens for s in ubatch_slices],
+                self.parallel_config.data_parallel_size,
+                self.parallel_config.data_parallel_rank,
+            )
+        else:
+            ubatch_slices = create_ubatch_slices(input_batch, self.num_ubatches)
+        specific_metadata = self.model_state.prepare_ubatch_metadata(
+            input_batch,
+            [s.request_slice for s in ubatch_slices],
+            self.attn_groups,
+            self.kv_cache_config,
+        )
 
         attn_metadata = []
         slot_mappings_by_layer = []
@@ -378,6 +415,11 @@ class UBatchRunner:
                     self.kv_cache_config,
                     ubatch_idx=i,
                     for_capture=for_capture,
+                    **(
+                        {"model_specific_attn_metadata": specific_metadata[i]}
+                        if specific_metadata[i] is not None
+                        else {}
+                    ),
                 )
             )
             slot_mappings_by_layer.append(
@@ -388,7 +430,11 @@ class UBatchRunner:
         return UBatchState(
             slices=ubatch_slices,
             forward_contexts=self._make_forward_contexts(
-                ubatch_slices, attn_metadata, slot_mappings_by_layer, is_padding
+                ubatch_slices,
+                attn_metadata,
+                slot_mappings_by_layer,
+                is_padding,
+                token_counts=token_counts,
             ),
         )
 
@@ -398,19 +444,24 @@ class UBatchRunner:
         attn_metadata: list[dict[str, Any]],
         slot_mappings_by_layer: list[dict[str, torch.Tensor]],
         is_padding: list[torch.Tensor | None],
+        *,
+        token_counts: torch.Tensor | None = None,
     ) -> list[ForwardContext]:
         """Build one forward context per microbatch.
 
         The expert all-to-all runs once per microbatch, so each context's DP
-        metadata carries that microbatch's token count. Microbatching pads every
-        DP rank alike, so each rank can assume that count for the others too.
+        metadata carries that microbatch's token count. Request-boundary
+        splitting exchanges counts explicitly; fixed-size splitting pads ranks
+        alike and can infer them locally.
         """
         dp_size = self.parallel_config.data_parallel_size
         forward_contexts = []
         for i, ubatch_slice in enumerate(ubatch_slices):
             num_tokens = ubatch_slice.num_tokens
-            num_tokens_across_dp = torch.full(
-                (dp_size,), num_tokens, dtype=torch.int32, device="cpu"
+            num_tokens_across_dp = (
+                torch.full((dp_size,), num_tokens, dtype=torch.int32, device="cpu")
+                if token_counts is None
+                else token_counts[i]
             )
             forward_contexts.append(
                 create_forward_context(
