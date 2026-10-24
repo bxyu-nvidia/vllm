@@ -8160,3 +8160,30 @@ def test_prefill_outcomes_preempted_request_counted_once(monkeypatch) -> None:
     assert stats.request_outcomes == {"kv_capacity": 1, "not_examined": 1}
     assert stats.unexamined_by_stop_reason == {"preemption": 1}
     assert stats.underfilled_outcome_steps == 0
+
+
+@pytest.mark.parametrize("collect_metrics", [False, True])
+def test_dbo_execution_metrics_follow_model_output(collect_metrics: bool):
+    from vllm.v1.metrics.dbo import DBOStats
+
+    scheduler = create_scheduler(max_num_batched_tokens=128, max_model_len=1024)
+    (request,) = create_requests(num_requests=1, num_tokens=32)
+    scheduler.add_request(request)
+    scheduled = scheduler.schedule()
+    dbo = DBOStats(outcome="below_threshold") if collect_metrics else None
+    outputs = scheduler.update_from_output(
+        scheduled,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[42]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            dbo_stats=dbo,
+        ),
+    )
+    stats = next(iter(outputs.values())).scheduler_stats
+    assert stats is not None
+    assert stats.dbo_stats is dbo
+    assert scheduler.make_stats().dbo_stats is None

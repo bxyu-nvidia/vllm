@@ -4,16 +4,20 @@ from pathlib import Path
 from queue import Queue
 from unittest.mock import Mock
 
+import msgspec
 import prometheus_client
 import pytest
 from transformers import GPT2Config
 
-from vllm.config import ModelConfig, VllmConfig
+from vllm.config import ModelConfig, ObservabilityConfig, VllmConfig
+from vllm.engine.arg_utils import EngineArgs
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.metrics.batching import (
     OUTCOME_COUNTER_FIELDS,
     UNDERFILL_REASONS,
     PrefillBatchingStats,
 )
+from vllm.v1.metrics.dbo import DBOStats
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import SchedulerStats
@@ -170,6 +174,7 @@ def test_dp_load_stats_roundtrip_with_prefill_batching_field(lockstep: bool) -> 
     assert (stats.num_running_reqs, stats.num_waiting_reqs) == (3, 7)
     assert stats.kv_cache_usage == 0.25
     assert stats.prefill_batching_stats is None
+    assert stats.dbo_stats is None
     if lockstep:
         assert (stats.step_counter, stats.current_wave) == (11, 2)
 
@@ -226,3 +231,74 @@ def test_outcome_averages_have_separate_idle_full_and_underfilled_denominators()
         "not_examined": 2,
     }
     assert stats.underfilled_unexamined_by_stop_reason == {"mamba_alignment": 2}
+
+
+def test_dbo_flag_is_opt_in():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    assert not EngineArgs.from_cli_args(parser.parse_args([])).enable_dbo_metrics
+    assert EngineArgs.from_cli_args(
+        parser.parse_args(["--enable-dbo-metrics"])
+    ).enable_dbo_metrics
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_dbo_metrics_export_per_engine_without_counting_empty_updates(
+    tmp_path: Path, enabled: bool
+):
+    GPT2Config(architectures=["GPT2LMHeadModel"]).save_pretrained(tmp_path)
+    config = VllmConfig(
+        model_config=ModelConfig(model=str(tmp_path)),
+        observability_config=ObservabilityConfig(enable_dbo_metrics=enabled),
+    )
+    try:
+        logger = PrometheusStatLogger(config, engine_indexes=[0, 1])
+        stats = SchedulerStats(
+            dbo_stats=DBOStats(
+                outcome="executed",
+                microbatch_tokens=[9, 9],
+                microbatch_requests=[1, 1],
+                microbatch_padding_tokens=[0, 6],
+            )
+        )
+        # Exercise Python's nested dataclass MessagePack transport.
+        decoded = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(stats), type=SchedulerStats
+        )
+        assert decoded.dbo_stats == stats.dbo_stats
+        for _ in range(2):
+            logger.record(decoded, None, engine_idx=0)
+        logger.record(SchedulerStats(), None, engine_idx=0)
+        logger.record(
+            SchedulerStats(dbo_stats=DBOStats(outcome="disabled")), None, engine_idx=1
+        )
+        samples = [
+            sample
+            for family in prometheus_client.REGISTRY.collect()
+            for sample in family.samples
+            if sample.name.startswith("vllm:dbo_")
+            and not sample.name.endswith("_created")
+        ]
+        if not enabled:
+            assert not samples
+            return
+
+        def value(name, engine, **labels):
+            return [
+                sample.value
+                for sample in samples
+                if sample.name == "vllm:dbo_" + name
+                and sample.labels
+                == {"model_name": str(tmp_path), "engine": str(engine), **labels}
+            ]
+
+        assert value("steps_total", 0, outcome="executed") == [2]
+        assert value("steps_total", 1, outcome="disabled") == [1]
+        assert value("microbatch_tokens_sum", 0, microbatch="0") == [18]
+        assert value("microbatch_tokens_count", 0, microbatch="1") == [2]
+        assert value("microbatch_requests_sum", 0, microbatch="1") == [2]
+        assert value("microbatch_padding_tokens_sum", 0, microbatch="1") == [12]
+        assert not [
+            s for s in samples if s.labels["engine"] == "1" and "microbatch" in s.name
+        ]
+    finally:
+        unregister_vllm_metrics()

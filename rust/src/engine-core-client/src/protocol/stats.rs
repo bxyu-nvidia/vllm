@@ -5,6 +5,16 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// One successful non-dummy target forward; absent when DBO metrics are disabled.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DboStats {
+    pub outcome: String,
+    pub microbatch_tokens: Vec<u64>,
+    pub microbatch_requests: Vec<u64>,
+    pub microbatch_padding_tokens: Vec<u64>,
+}
+
 /// Stores cache hit statistics.
 ///
 /// Original Python definition:
@@ -341,6 +351,8 @@ pub struct PrefillBatchingStats {
 /// <https://github.com/vllm-project/vllm/blob/906a8c15d0beded2cca8b357877266c631340f74/vllm/v1/metrics/stats.py#L170-L196>
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerStats {
+    #[serde(default)]
+    pub dbo_stats: Option<DboStats>,
     #[serde(default)]
     pub prefill_batching_stats: Option<PrefillBatchingStats>,
     /// Number of requests in model execution batches.

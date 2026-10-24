@@ -31,6 +31,7 @@ from vllm.v1.metrics.batching import (
 )
 from vllm.v1.metrics.buckets import histogram_buckets
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
+from vllm.v1.metrics.dbo import DBO_REQUEST_BUCKETS, DBO_TOKEN_BUCKETS
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
@@ -511,6 +512,28 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             idx: [model_name, str(idx)] for idx in engine_indexes
         }
         per_engine_labelvalues = self.per_engine_labelvalues
+
+        self.dbo_steps = None
+        self.dbo_sizes = {}
+        if vllm_config.observability_config.enable_dbo_metrics:
+            self.dbo_steps = self._counter_cls(
+                name="vllm:dbo_steps_total",
+                documentation="Successful non-dummy target forwards by DBO outcome.",
+                labelnames=labelnames + ["outcome"],
+            )
+            for name, buckets in (
+                ("tokens", DBO_TOKEN_BUCKETS),
+                ("requests", DBO_REQUEST_BUCKETS),
+                ("padding_tokens", DBO_TOKEN_BUCKETS),
+            ):
+                self.dbo_sizes[name] = self._histogram_cls(
+                    name=f"vllm:dbo_microbatch_{name}",
+                    documentation=(
+                        f"Per-engine DBO microbatch {name}; tokens exclude padding."
+                    ),
+                    labelnames=labelnames + ["microbatch"],
+                    buckets=buckets,
+                )
 
         # Sums/counts preserve interval averages across DP engines and scrapes.
         self.prefill_batch_counters = {
@@ -1229,6 +1252,13 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.num_kv_fetch_reqs_by_stage.get(stage, 0)
                 )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            if self.dbo_steps is not None and scheduler_stats.dbo_stats is not None:
+                dbo = scheduler_stats.dbo_stats
+                labels = self.per_engine_labelvalues[engine_idx]
+                self.dbo_steps.labels(*labels, dbo.outcome).inc()
+                for name, histogram in self.dbo_sizes.items():
+                    for index, size in enumerate(getattr(dbo, f"microbatch_{name}")):
+                        histogram.labels(*labels, str(index)).observe(size)
             if (batching := scheduler_stats.prefill_batching_stats) is not None:
                 for name, counters in self.prefill_batch_counters.items():
                     counters[engine_idx].inc(getattr(batching, name))

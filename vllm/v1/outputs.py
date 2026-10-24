@@ -13,6 +13,7 @@ import torch
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.dbo import DBOStats
 
 if TYPE_CHECKING:
     from vllm.distributed.aux_output_connector.connector import AuxRequestOutput
@@ -304,6 +305,7 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+    dbo_stats: DBOStats | None = None
 
     aux_output_connector_output: dict[str, AuxRequestOutput] | None = None
 

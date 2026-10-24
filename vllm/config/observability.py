@@ -79,6 +79,11 @@ class ObservabilityConfig:
     Note that every extra bucket adds one time series per metric and label
     set."""
 
+    enable_dbo_metrics: bool = False
+    """Collect V2 DBO execution/fallback counters and per-engine microbatch size
+    histograms. Excludes dummy, profiling, and draft forwards; requires log stats.
+    Measures dispatch/execution, not GPU overlap duration. Disabled by default."""
+
     cudagraph_metrics: bool = False
     """Enable CUDA graph metrics (number of padded/unpadded tokens, runtime cudagraph
     dispatch modes, and their observed frequencies at every logging interval)."""

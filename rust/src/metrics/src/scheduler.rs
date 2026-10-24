@@ -334,8 +334,41 @@ impl SchedulerLogStatsAccumulator {
     }
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DboOutcomeLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub outcome: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DboMicrobatchLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub microbatch: u32,
+}
+
+pub type DboHistogramFamily = Family<DboMicrobatchLabels, Histogram, fn() -> Histogram>;
+
+fn dbo_token_histogram() -> Histogram {
+    Histogram::new(
+        [
+            0., 32., 128., 512., 1024., 2048., 4096., 8192., 16384., 32768., 65536.,
+        ]
+        .into_iter(),
+    )
+}
+
+fn dbo_request_histogram() -> Histogram {
+    Histogram::new([0., 1., 2., 4., 8., 16., 32., 64., 128., 256., 512., 1024.].into_iter())
+}
+
 /// Scheduler/batch-scoped Prometheus families exported from `SchedulerStats`.
 pub struct SchedulerMetrics {
+    pub dbo_steps: Family<DboOutcomeLabels, U64Counter>,
+    pub dbo_microbatch_tokens: DboHistogramFamily,
+    pub dbo_microbatch_requests: DboHistogramFamily,
+    pub dbo_microbatch_padding_tokens: DboHistogramFamily,
     pub prefill_batching: BTreeMap<&'static str, Family<EngineLabels, U64Counter>>,
     pub prefill_underfilled_batches_by_reason: Family<WaitingReasonLabels, U64Counter>,
     pub prefill_outcomes: BTreeMap<&'static str, Family<PrefillOutcomeLabels, U64Counter>>,
@@ -398,6 +431,30 @@ impl SchedulerMetrics {
     /// Register the scheduler-oriented metric families into the shared
     /// registry.
     pub(crate) fn register(registry: &mut Registry) -> Self {
+        // Resolve child labels only when an opted-in engine sends DBO stats.
+        let dbo_steps = Family::default();
+        registry.register(
+            "vllm:dbo_steps",
+            "Successful non-dummy target forwards by DBO outcome",
+            dbo_steps.clone(),
+        );
+        let dbo_microbatch_tokens =
+            Family::new_with_constructor(dbo_token_histogram as fn() -> Histogram);
+        let dbo_microbatch_requests =
+            Family::new_with_constructor(dbo_request_histogram as fn() -> Histogram);
+        let dbo_microbatch_padding_tokens =
+            Family::new_with_constructor(dbo_token_histogram as fn() -> Histogram);
+        for (name, family) in [
+            ("tokens", &dbo_microbatch_tokens),
+            ("requests", &dbo_microbatch_requests),
+            ("padding_tokens", &dbo_microbatch_padding_tokens),
+        ] {
+            registry.register(
+                format!("vllm:dbo_microbatch_{name}"),
+                format!("Per-engine DBO microbatch {name}; tokens exclude padding"),
+                family.clone(),
+            );
+        }
         let prefill_batching = PREFILL_BATCH_COUNTER_FIELDS
             .into_iter()
             .map(|field| {
@@ -704,6 +761,10 @@ impl SchedulerMetrics {
         );
 
         Self {
+            dbo_steps,
+            dbo_microbatch_tokens,
+            dbo_microbatch_requests,
+            dbo_microbatch_padding_tokens,
             prefill_batching,
             prefill_delays,
             prefill_outcomes,

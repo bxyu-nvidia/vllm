@@ -6,12 +6,12 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vllm_metrics::{
-    CacheHitSourceLabels, EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric,
-    LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
-    MooncakeOperationHistogramFamily, MooncakeOperationLabels, PREFILL_DELAY_REASONS,
-    PREFILL_QUEUE_STOP_REASONS, PREFILL_REQUEST_OUTCOMES, PREFILL_UNDERFILL_REASONS,
-    PrefillOutcomeLabels, PrefillStopLabels, RequestMetrics, SchedulerLogStatsAccumulator,
-    SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
+    CacheHitSourceLabels, DboHistogramFamily, DboMicrobatchLabels, DboOutcomeLabels, EngineLabels,
+    EnginePositionLabels, F64Gauge, Family, HistogramMetric, LoraAdapterNames, LoraInfoLabels,
+    MooncakeOperationCounterFamily, MooncakeOperationHistogramFamily, MooncakeOperationLabels,
+    PREFILL_DELAY_REASONS, PREFILL_QUEUE_STOP_REASONS, PREFILL_REQUEST_OUTCOMES,
+    PREFILL_UNDERFILL_REASONS, PrefillOutcomeLabels, PrefillStopLabels, RequestMetrics,
+    SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
 use crate::protocol::stats::{
@@ -48,6 +48,10 @@ pub(crate) struct SchedulerStatsRecorder {
 
 /// Per-engine cached metric handles used while recording `SchedulerStats`.
 struct SchedulerStatsHandles {
+    dbo_steps: Family<DboOutcomeLabels, U64Counter>,
+    dbo_microbatch_tokens: DboHistogramFamily,
+    dbo_microbatch_requests: DboHistogramFamily,
+    dbo_microbatch_padding_tokens: DboHistogramFamily,
     prefill_batching: BTreeMap<&'static str, U64Counter>,
     prefill_underfill_reasons: BTreeMap<&'static str, U64Counter>,
     prefill_outcomes: BTreeMap<&'static str, BTreeMap<&'static str, U64Counter>>,
@@ -160,6 +164,10 @@ fn resolve_scheduler_stats_handles(
     };
 
     SchedulerStatsHandles {
+        dbo_steps: metrics.dbo_steps.clone(),
+        dbo_microbatch_tokens: metrics.dbo_microbatch_tokens.clone(),
+        dbo_microbatch_requests: metrics.dbo_microbatch_requests.clone(),
+        dbo_microbatch_padding_tokens: metrics.dbo_microbatch_padding_tokens.clone(),
         prefill_batching: metrics
             .prefill_batching
             .iter()
@@ -313,6 +321,34 @@ fn resolve_scheduler_stats_handles(
 
 /// Record scheduler-stats values through pre-resolved metric handles.
 fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &SchedulerStats) {
+    if let Some(dbo) = &stats.dbo_stats {
+        handles
+            .dbo_steps
+            .get_or_create_owned(&DboOutcomeLabels {
+                model_name: handles.labels.model_name.clone(),
+                engine: handles.labels.engine,
+                outcome: dbo.outcome.clone(),
+            })
+            .inc();
+        for (family, sizes) in [
+            (&handles.dbo_microbatch_tokens, &dbo.microbatch_tokens),
+            (&handles.dbo_microbatch_requests, &dbo.microbatch_requests),
+            (
+                &handles.dbo_microbatch_padding_tokens,
+                &dbo.microbatch_padding_tokens,
+            ),
+        ] {
+            for (index, size) in sizes.iter().enumerate() {
+                family
+                    .get_or_create_owned(&DboMicrobatchLabels {
+                        model_name: handles.labels.model_name.clone(),
+                        engine: handles.labels.engine,
+                        microbatch: index as u32,
+                    })
+                    .observe(*size as f64);
+            }
+        }
+    }
     if let Some(batching) = &stats.prefill_batching_stats {
         for (name, value) in [
             ("completed_requests", batching.completed_requests),
@@ -848,5 +884,69 @@ mod prefill_batching_tests {
         }
         assert!(rendered.contains("vllm:prefill_delayed_requests_by_reason_total{model_name=\"model\",engine=\"0\",reason=\"kv_lookup_pending\"} 3"));
         assert!(!rendered.contains("prefill_batch_tokens_bucket"));
+    }
+}
+
+#[cfg(test)]
+mod dbo_tests {
+    use super::*;
+    use crate::protocol::stats::DboStats;
+    use itertools::Itertools;
+    use vllm_metrics::Metrics;
+
+    #[test]
+    fn dbo_metrics_are_optional_and_keep_engine_and_microbatch_labels() {
+        let metrics = Metrics::new();
+        let handles = resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        record_scheduler_stats_with_handles(&handles, &SchedulerStats::default());
+        assert!(!metrics.render().unwrap().lines().any(|s| s.starts_with("vllm:dbo_")));
+        let stats = SchedulerStats {
+            dbo_stats: Some(DboStats {
+                outcome: "executed".into(),
+                microbatch_tokens: vec![9, 9],
+                microbatch_requests: vec![1, 1],
+                microbatch_padding_tokens: vec![0, 6],
+            }),
+            ..Default::default()
+        };
+        let wire = rmp_serde::to_vec_named(&stats).unwrap();
+        let decoded: SchedulerStats = rmp_serde::from_slice(&wire).unwrap();
+        assert_eq!(stats, decoded);
+        record_scheduler_stats_with_handles(&handles, &decoded);
+        record_scheduler_stats_with_handles(&handles, &decoded);
+        record_scheduler_stats_with_handles(&handles, &SchedulerStats::default());
+        let other = resolve_scheduler_stats_handles(&metrics.scheduler, "model", 1);
+        record_scheduler_stats_with_handles(
+            &other,
+            &SchedulerStats {
+                dbo_stats: Some(DboStats {
+                    outcome: "disabled".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let rendered = metrics.render().unwrap();
+        let lines = rendered
+            .lines()
+            .filter(|s| s.starts_with("vllm:dbo_") && !s.contains("_bucket{"))
+            .sorted()
+            .collect::<Vec<_>>()
+            .join("\n");
+        expect_test::expect![[r#"
+            vllm:dbo_microbatch_padding_tokens_count{model_name="model",engine="0",microbatch="0"} 2
+            vllm:dbo_microbatch_padding_tokens_count{model_name="model",engine="0",microbatch="1"} 2
+            vllm:dbo_microbatch_padding_tokens_sum{model_name="model",engine="0",microbatch="0"} 0.0
+            vllm:dbo_microbatch_padding_tokens_sum{model_name="model",engine="0",microbatch="1"} 12.0
+            vllm:dbo_microbatch_requests_count{model_name="model",engine="0",microbatch="0"} 2
+            vllm:dbo_microbatch_requests_count{model_name="model",engine="0",microbatch="1"} 2
+            vllm:dbo_microbatch_requests_sum{model_name="model",engine="0",microbatch="0"} 2.0
+            vllm:dbo_microbatch_requests_sum{model_name="model",engine="0",microbatch="1"} 2.0
+            vllm:dbo_microbatch_tokens_count{model_name="model",engine="0",microbatch="0"} 2
+            vllm:dbo_microbatch_tokens_count{model_name="model",engine="0",microbatch="1"} 2
+            vllm:dbo_microbatch_tokens_sum{model_name="model",engine="0",microbatch="0"} 18.0
+            vllm:dbo_microbatch_tokens_sum{model_name="model",engine="0",microbatch="1"} 18.0
+            vllm:dbo_steps_total{model_name="model",engine="0",outcome="executed"} 2
+            vllm:dbo_steps_total{model_name="model",engine="1",outcome="disabled"} 1"#]].assert_eq(&lines);
     }
 }

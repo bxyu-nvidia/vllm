@@ -562,17 +562,20 @@ def test_dummy_graph_padding_preserves_dp_sync(
     assert reused is sync
 
 
+@pytest.mark.parametrize("collect_metrics", [False, True])
+@pytest.mark.parametrize("dummy_run", [False, True])
 @pytest.mark.parametrize("microbatched", [False, True])
 @pytest.mark.parametrize("drafting", [False, True])
 def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
-    monkeypatch, microbatched, drafting
+    monkeypatch, microbatched, drafting, dummy_run, collect_metrics
 ):
     """MTP must not see a microbatch's offsets or overwrite live builder buffers."""
     from vllm.config.compilation import CUDAGraphMode
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
     from vllm.v1.worker.gpu.dp_utils import DPSyncState
-    from vllm.v1.worker.gpu.input_batch import InputBuffers
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.ubatch_utils import create_whole_request_ubatch_slices
 
     events = []
     runner = Mock()
@@ -585,12 +588,23 @@ def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
     runner.dp_size, runner.dp_rank, runner.dcp_size = 4, 0, 1
     runner.parallel_config.num_ubatches = 2
     runner.model_state.requires_whole_request_ubatches = True
-    runner.input_buffers = InputBuffers(4, 18, torch.device("cpu"))
-    runner.gather_batch_req_state.return_value = (None, 6)
+    runner.input_buffers = InputBuffers(4, 24, torch.device("cpu"))
+    runner.observability_config.enable_dbo_metrics = collect_metrics
+    runner.observability_config.cudagraph_metrics = False
+    runner.aux_output_connector = None
+    runner.parallel_config.use_ubatching = microbatched
+    runner.gather_batch_req_state.return_value = (
+        SimpleNamespace(num_tokens=18, has_prefill=True),
+        6,
+    )
+    runner.prepare_inputs.return_value = InputBatch.make_dummy(
+        2, 18, runner.input_buffers, num_tokens_after_padding=24
+    )
     runner.model_state.prepare_inputs.return_value = {}
     blocks = (torch.tensor([[11], [22]]),)
     slots = torch.arange(18).reshape(1, -1)
     runner.prepare_dummy_attn.return_value = (blocks, slots)
+    runner.prepare_attn.return_value = (blocks, slots)
     full_metadata = {"attention": object()}
     full_slots = {"attention": slots[0]}
 
@@ -608,7 +622,11 @@ def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
         return torch.arange(18).reshape(18, 1)
 
     if microbatched:
-        runner.ubatch_runner.prepare.return_value = SimpleNamespace(slices=[])
+        runner.ubatch_runner.prepare.side_effect = (
+            lambda batch, *args, **kwargs: SimpleNamespace(
+                slices=create_whole_request_ubatch_slices(batch)
+            )
+        )
         runner.ubatch_runner.run.side_effect = target_forward
     else:
         runner.ubatch_runner = None
@@ -620,9 +638,13 @@ def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
         num_ubatches=2 if microbatched else 1,
     )
     sync = DPSyncState(torch.full((4,), 18), None, True, 2)
-    monkeypatch.setattr(
-        model_runner_module, "dispatch_cg_and_sync_dp", Mock(return_value=(desc, sync))
-    )
+
+    def dispatch(*args, **kwargs):
+        if kwargs["dbo_stats"] is not None and microbatched:
+            kwargs["dbo_stats"].outcome = "executed"
+        return desc, sync
+
+    monkeypatch.setattr(model_runner_module, "dispatch_cg_and_sync_dp", dispatch)
     monkeypatch.setattr(
         model_runner_module,
         "build_slot_mappings_by_layer",
@@ -636,9 +658,19 @@ def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
     output = SchedulerOutput.make_empty()
     output.num_scheduled_tokens = {"a": 6, "b": 6}
     output.total_num_scheduled_tokens = 12
-    GPUModelRunner.execute_model(runner, output, dummy_run=True)
+    GPUModelRunner.execute_model(runner, output, dummy_run=dummy_run)
 
     state = runner.execute_model_state
+    if collect_metrics and not dummy_run:
+        assert state.dbo_stats is not None
+        assert state.dbo_stats.outcome == ("executed" if microbatched else "disabled")
+        assert state.dbo_stats.microbatch_tokens == ([9, 9] if microbatched else [])
+        assert state.dbo_stats.microbatch_requests == ([1, 1] if microbatched else [])
+        assert state.dbo_stats.microbatch_padding_tokens == (
+            [0, 6] if microbatched else []
+        )
+    else:
+        assert state.dbo_stats is None
     if microbatched and not drafting:
         assert events == ["target_joined"]
         assert state.attn_metadata is None

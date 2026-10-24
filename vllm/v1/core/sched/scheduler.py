@@ -61,6 +61,7 @@ from vllm.v1.kv_cache_interface import (
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.metrics.batching import PrefillBatchingStats
+from vllm.v1.metrics.dbo import DBOStats
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     KV_FETCH_COMPLETED_WAITING,
@@ -2841,6 +2842,7 @@ class Scheduler(SchedulerInterface):
                 cudagraph_stats,
                 perf_stats,
                 ec_connector_stats=ec_connector_stats,
+                dbo_stats=model_runner_output.dbo_stats,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -3352,6 +3354,8 @@ class Scheduler(SchedulerInterface):
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
         ec_connector_stats: ECConnectorStats | None = None,
+        *,
+        dbo_stats: DBOStats | None = None,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -3381,6 +3385,7 @@ class Scheduler(SchedulerInterface):
             self.prefill_batching_stats = PrefillBatchingStats()
         return SchedulerStats(
             prefill_batching_stats=batching_stats,
+            dbo_stats=dbo_stats,
             num_running_reqs=num_running,
             num_waiting_reqs=num_waiting - num_deferred,
             num_skipped_waiting_reqs=num_deferred,

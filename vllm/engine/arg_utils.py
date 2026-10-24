@@ -735,6 +735,7 @@ class EngineArgs:
     custom_histogram_buckets: dict[str, list[float]] | None = (
         ObservabilityConfig.custom_histogram_buckets
     )
+    enable_dbo_metrics: bool = ObservabilityConfig.enable_dbo_metrics
     cudagraph_metrics: bool = ObservabilityConfig.cudagraph_metrics
     enable_layerwise_nvtx_tracing: bool = (
         ObservabilityConfig.enable_layerwise_nvtx_tracing
@@ -1672,6 +1673,10 @@ class EngineArgs:
             **observability_kwargs["custom_histogram_buckets"],
         )
         observability_group.add_argument(
+            "--enable-dbo-metrics",
+            **observability_kwargs["enable_dbo_metrics"],
+        )
+        observability_group.add_argument(
             "--cudagraph-metrics",
             **observability_kwargs["cudagraph_metrics"],
         )
@@ -2190,6 +2195,7 @@ class EngineArgs:
             kv_cache_metrics=self.kv_cache_metrics,
             kv_cache_metrics_sample=self.kv_cache_metrics_sample,
             custom_histogram_buckets=self.custom_histogram_buckets,
+            enable_dbo_metrics=self.enable_dbo_metrics,
             cudagraph_metrics=self.cudagraph_metrics,
             enable_layerwise_nvtx_tracing=self.enable_layerwise_nvtx_tracing,
             enable_prefill_batching_metrics=self.enable_prefill_batching_metrics,

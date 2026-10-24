@@ -10,6 +10,7 @@ import torch.distributed as dist
 from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dp_group
+from vllm.v1.metrics.dbo import DBOStats
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
@@ -67,6 +68,8 @@ def sync_cudagraph_and_dp_padding(
     parallel_config: ParallelConfig | None = None,
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
+    dbo_stats: DBOStats | None = None,
+    dbo_whole_requests: bool = False,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Coordinates the batch descriptor and DP padding across all ranks.
 
@@ -109,7 +112,20 @@ def sync_cudagraph_and_dp_padding(
         )
         return synced_desc, None
 
+    if (
+        dbo_stats is not None
+        and parallel_config is not None
+        and parallel_config.use_ubatching
+    ):
+        dbo_stats.outcome = (
+            "insufficient_requests"
+            if dbo_whole_requests and int(num_reqs_across_dp.min()) < 2
+            else "rank_ineligible"
+        )
+
     if torch.all(allow_ubatching_across_dp == 1):
+        if dbo_stats is not None:
+            dbo_stats.outcome = "below_threshold"
         # This rank voted too, so its caller passed a config.
         assert parallel_config is not None
         # A uniform decode only if every rank runs the same uniform query
@@ -156,6 +172,8 @@ def sync_cudagraph_and_dp_padding(
             if ubatch_desc.cg_mode == CUDAGraphMode.FULL:
                 assert ubatch_desc.num_reqs is not None
                 num_reqs = ubatch_desc.num_reqs
+            if dbo_stats is not None:
+                dbo_stats.outcome = "executed"
             return ubatch_desc, DPSyncState(
                 num_tokens_across_dp=torch.full_like(
                     num_tokens_across_dp, ubatch_num_tokens
@@ -237,6 +255,8 @@ def dispatch_cg_and_sync_dp(
     allow_ubatching: bool = False,
     uniform_decode: bool = False,
     dp_sync_state: DPSyncState | None = None,
+    dbo_stats: DBOStats | None = None,
+    dbo_whole_requests: bool = False,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """Pick a cudagraph descriptor for this batch, agreeing it across DP ranks.
 
@@ -267,6 +287,8 @@ def dispatch_cg_and_sync_dp(
             microbatches. Agreed across ranks before it takes effect.
         uniform_decode: Whether this rank's batch is a uniform decode, used
             to pick the microbatching split.
+        dbo_stats: Optional diagnostics populated from the existing DP handshake.
+        dbo_whole_requests: Whether a rank needs two whole requests to split.
         dp_sync_state: Agreement from a prior dispatch over this same batch, to reuse.
             Must come from a batch with this same padded `num_tokens` and the
             same `uniform_token_count`; `num_reqs` may differ, as neither
@@ -335,4 +357,6 @@ def dispatch_cg_and_sync_dp(
         parallel_config=parallel_config,
         allow_ubatching=allow_ubatching,
         uniform_decode=uniform_decode,
+        dbo_stats=dbo_stats,
+        dbo_whole_requests=dbo_whole_requests,
     )

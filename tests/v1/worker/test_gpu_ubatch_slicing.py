@@ -31,6 +31,7 @@ from vllm.config import (
 from vllm.forward_context import create_forward_context
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics.dbo import DBOStats
 from vllm.v1.worker import gpu_ubatch_wrapper as legacy_gpu_ubatch_wrapper
 from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils
@@ -285,6 +286,9 @@ def _sync_dp(
     uniform_token_count_per_rank: list[int] | None = None,
     allow_ubatching: bool | list[bool] = True,
     cudagraph_manager: Any = None,
+    dbo_stats: DBOStats | None = None,
+    num_reqs_per_rank: list[int] | None = None,
+    whole_requests: bool = False,
 ) -> tuple[BatchExecutionDescriptor, dp_utils.DPSyncState | None]:
     """Run the DP handshake with the all-reduce stubbed out.
 
@@ -301,7 +305,7 @@ def _sync_dp(
     reduced[2] = torch.tensor(uniform_token_counts, dtype=torch.int32)
     reduced[3] = -1  # max_query_len, -1 means None
     reduced[4] = torch.tensor(allow_ubatching, dtype=torch.int32)
-    reduced[5] = 8  # num_reqs
+    reduced[5] = torch.tensor(num_reqs_per_rank or [8] * dp_size)
 
     with (
         patch.object(dp_utils.dist, "all_reduce", lambda t, group: t.copy_(reduced)),
@@ -330,6 +334,8 @@ def _sync_dp(
                 else allow_ubatching
             ),
             uniform_decode=uniform_token_counts[0] == DECODE_QUERY_LEN,
+            dbo_stats=dbo_stats,
+            dbo_whole_requests=whole_requests,
         )
 
 
@@ -1025,3 +1031,31 @@ def test_request_boundary_microbatches_exchange_actual_rank_sizes(monkeypatch, r
     monkeypatch.setattr(dp_utils.dist, "all_reduce", all_reduce)
     counts = dp_utils.sync_ubatch_token_counts(expected[:, rank].tolist(), 2, rank)
     torch.testing.assert_close(counts, expected)
+
+
+@pytest.mark.parametrize(
+    "tokens,votes,requests,whole_requests,outcome",
+    [
+        ([256, 256], [True, True], [8, 8], False, "executed"),
+        ([256, 100], [True, True], [8, 8], False, "below_threshold"),
+        ([256, 256], [True, False], [8, 8], False, "rank_ineligible"),
+        ([256, 256], [True, False], [8, 1], True, "insufficient_requests"),
+        ([256, 256], [True, True], [8, 8], True, "executed"),
+    ],
+)
+def test_dbo_metrics_leave_dispatch_unchanged(
+    tokens, votes, requests, whole_requests, outcome
+):
+    stats = DBOStats(outcome="rank_ineligible")
+    kwargs = dict(
+        allow_ubatching=votes, num_reqs_per_rank=requests, whole_requests=whole_requests
+    )
+    baseline_desc, baseline_sync = _sync_dp(tokens, **kwargs)
+    desc, sync = _sync_dp(tokens, dbo_stats=stats, **kwargs)
+    assert stats.outcome == outcome
+    assert desc == baseline_desc
+    assert sync is not None and baseline_sync is not None
+    torch.testing.assert_close(
+        sync.num_tokens_across_dp, baseline_sync.num_tokens_across_dp
+    )
+    assert stats.microbatch_tokens == []  # Sizes are recorded by the actual runner.

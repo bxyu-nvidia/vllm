@@ -71,6 +71,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.metrics.dbo import DBOStats
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
@@ -1791,6 +1792,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.ubatch_runner is not None
             and self.model_state.requires_whole_request_ubatches
         )
+        dbo_stats = None
+        if (
+            self.observability_config.enable_dbo_metrics
+            and not dummy_run
+            and not is_profile
+        ):
+            dbo_stats = DBOStats(
+                outcome=(
+                    "disabled"
+                    if not self.parallel_config.use_ubatching
+                    else "dp_unavailable"
+                    if self.dp_size <= 1
+                    else "rank_ineligible"
+                )
+            )
         batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             None if whole_request_ubatching else self.cudagraph_manager,
             num_reqs,
@@ -1811,6 +1827,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
+            dbo_stats=dbo_stats,
+            dbo_whole_requests=whole_request_ubatching,
         )
 
         if batch_desc.num_tokens == 0:
@@ -1951,6 +1969,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+
+        if dbo_stats is not None and ubatch_state is not None:
+            for s in ubatch_state.slices:
+                tokens = max(
+                    0,
+                    min(s.token_slice.stop, input_batch.num_tokens)
+                    - s.token_slice.start,
+                )
+                requests = max(
+                    0,
+                    min(s.request_slice.stop, input_batch.num_reqs)
+                    - s.request_slice.start,
+                )
+                dbo_stats.microbatch_tokens.append(tokens)
+                dbo_stats.microbatch_requests.append(requests if tokens else 0)
+                dbo_stats.microbatch_padding_tokens.append(s.num_tokens - tokens)
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -2115,6 +2149,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finished_req_ids=finished_req_ids,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=cudagraph_stats,
+            dbo_stats=dbo_stats,
             num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
 
@@ -2145,6 +2180,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
+        dbo_stats = self.execute_model_state.dbo_stats
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
         self.execute_model_state = None
 
@@ -2219,6 +2255,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             prompt_token_id_logprobs_dict=prompt_token_id_logprobs_dict,
             cudagraph_stats=cudagraph_stats,
+            dbo_stats=dbo_stats,
         )
         pending_aux_output = None
         if self.aux_output_connector is not None:
@@ -2347,6 +2384,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
+        dbo_stats = self.execute_model_state.dbo_stats
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
@@ -2368,6 +2406,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output,
+            dbo_stats=dbo_stats,
         )
         async_output = AsyncPoolingOutput(
             model_runner_output=model_runner_output,
@@ -2467,6 +2506,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     num_spec_tokens_to_schedule: int
+    dbo_stats: DBOStats | None = None
 
 
 class BatchReqState(NamedTuple):

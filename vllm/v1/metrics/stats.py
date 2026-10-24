@@ -11,6 +11,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
 from vllm.v1.metrics.batching import PrefillBatchingStats
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
+from vllm.v1.metrics.dbo import DBOStats
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -252,6 +253,7 @@ class SchedulerStats:
     running_lora_adapters: dict[str, int] = field(default_factory=dict)
 
     cudagraph_stats: CUDAGraphStat | None = None
+    dbo_stats: DBOStats | None = field(default=None, kw_only=True)
 
     perf_stats: PerfStats | None = None
 
