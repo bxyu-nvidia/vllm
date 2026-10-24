@@ -10,6 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
@@ -30,8 +31,13 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
     hidden states (and, for Gemma4, its KV cache) at each draft step.
     """
 
+    # Preserve draft KV for future chunks/transfers without generating drafts.
+    prefill_only: bool = False
+    _constant_dp_speculative_tokens: int | None = None
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self._configure_constant_dp_speculation()
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -48,6 +54,18 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
+
+    def _configure_constant_dp_speculation(self) -> None:
+        self._constant_dp_speculative_tokens = None
+        if self.dp_size <= 1:
+            return
+        schedule = self.speculative_config.num_speculative_tokens_per_batch_size
+        if self.scheduler_config.async_scheduling and schedule is not None:
+            lookup = build_dynamic_sd_schedule_lookup(
+                schedule, self.max_num_reqs, self.num_speculative_steps
+            )
+            if len(set(lookup[1:])) == 1:
+                self._constant_dp_speculative_tokens = lookup[1]
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
@@ -81,7 +99,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
 
     def _configure_decode_metadata_update(self) -> None:
         # With one speculative step there are no draft decode steps to update.
-        if self.num_speculative_steps == 1:
+        if self.num_speculative_steps == 1 or self.prefill_only:
             self.supports_decode_metadata_update = False
             return
         super()._configure_decode_metadata_update()
@@ -137,7 +155,7 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         )
         self.on_prefill_end(self.max_num_reqs)
 
-        if self.num_speculative_steps == 1:
+        if self.num_speculative_steps == 1 or self.prefill_only:
             return
 
         self.on_multi_step_decode_begin(self.max_num_reqs)
@@ -192,7 +210,12 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
         if num_speculative_tokens is None:
-            num_speculative_tokens = self.num_speculative_steps
+            # Idle DP ranks must match active ranks' draft forward count.
+            num_speculative_tokens = (
+                self._constant_dp_speculative_tokens
+                if self._constant_dp_speculative_tokens is not None
+                else self.num_speculative_steps
+            )
         num_tokens = input_batch.num_tokens
         num_tokens_padded = input_batch.num_tokens_after_padding
         max_query_len = input_batch.num_scheduled_tokens.max()
@@ -293,8 +316,8 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             )
         self.on_prefill_end(num_reqs)
 
-        if num_speculative_tokens <= 1:
-            if num_speculative_tokens == 0:
+        if self.prefill_only or num_speculative_tokens <= 1:
+            if self.prefill_only or num_speculative_tokens == 0:
                 self.draft_tokens[:num_reqs].fill_(-1)
             return self.draft_tokens[:num_reqs]
 
@@ -459,6 +482,9 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
             last_hidden_states, hidden_states = self.pcp_manager.restore_draft_prefill(
                 last_hidden_states, hidden_states
             )
+
+        if self.prefill_only:
+            return
 
         sample_hidden_states = last_hidden_states[last_token_indices]
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(

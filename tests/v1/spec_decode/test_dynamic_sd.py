@@ -7,6 +7,7 @@ import logging
 import pytest
 
 from tests.v1.core.utils import create_requests, create_scheduler
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.structured_output import StructuredOutputManager
@@ -214,6 +215,81 @@ def test_dynamic_sd_is_disabled_with_data_parallel(caplog_vllm):
     output = _add_requests_and_schedule(scheduler, 256)
     assert len(output.num_scheduled_tokens) == 256
     assert output.num_spec_tokens_to_schedule == 3
+
+
+def _make_dp_scheduler(monkeypatch, schedule, *, use_v2=True, async_scheduling=True):
+    # Build the scheduler-only fixture without requiring a GPU model runner.
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    base = create_scheduler(
+        max_num_seqs=16,
+        max_num_batched_tokens=1024,
+        num_speculative_tokens=5,
+        data_parallel_size=4,
+    )
+    config = base.vllm_config
+    assert config.speculative_config is not None
+    config.speculative_config.num_speculative_tokens_per_batch_size = schedule
+    config.scheduler_config.async_scheduling = async_scheduling
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1" if use_v2 else "0")
+    config._maybe_disable_dynamic_sd_for_data_parallel()
+    scheduler_cls = AsyncScheduler if async_scheduling else Scheduler
+    return scheduler_cls(
+        vllm_config=config,
+        kv_cache_config=base.kv_cache_config,
+        block_size=base.block_size,
+        log_stats=True,
+        structured_output_manager=StructuredOutputManager(config),
+    )
+
+
+@pytest.mark.parametrize(
+    ("schedule", "expected_k"),
+    [
+        ([(1, 1024, 0)], 0),
+        ([(1, 4, 2), (8, 16, 2)], 2),  # Carry forward gaps and tails.
+        ([(1, 4, 5), (5, 16, 9)], 5),  # Clamp to the static maximum.
+        ([(1, 16, 0), (17, 32, 3)], 0),  # Ignore unreachable batch sizes.
+    ],
+)
+def test_constant_dp_schedule_controls_async_verification(
+    monkeypatch, schedule, expected_k
+):
+    """Uneven DP batches retain the same K without changing drafter capacity."""
+    for num_requests in (1, 4, 16):
+        scheduler = _make_dp_scheduler(monkeypatch, schedule)
+        spec = scheduler.vllm_config.speculative_config
+        assert spec is not None
+        assert spec.num_speculative_tokens == 5
+        assert spec.num_speculative_tokens_per_batch_size == schedule
+        requests = create_requests(num_requests=num_requests, num_tokens=10)
+        for request in requests:
+            scheduler.add_request(request)
+        prefill = scheduler.schedule()
+        assert prefill.num_spec_tokens_to_schedule == expected_k
+        assert all(len(r.spec_token_ids) == expected_k for r in requests)
+        decode = scheduler.schedule()
+        assert decode.num_spec_tokens_to_schedule == expected_k
+        assert set(decode.num_scheduled_tokens.values()) == {1 + expected_k}
+
+
+@pytest.mark.parametrize("use_v2,async_scheduling", [(False, True), (True, False)])
+def test_constant_dp_schedule_keeps_fallback_outside_v2_async(
+    monkeypatch, use_v2, async_scheduling
+):
+    scheduler = _make_dp_scheduler(
+        monkeypatch,
+        [(1, 16, 0)],
+        use_v2=use_v2,
+        async_scheduling=async_scheduling,
+    )
+    assert scheduler.dynamic_sd_lookup is None
+    assert _add_requests_and_schedule(scheduler, 1).num_spec_tokens_to_schedule == 5
+
+
+def test_variable_dp_schedule_still_disabled_with_v2_async(monkeypatch):
+    scheduler = _make_dp_scheduler(monkeypatch, [(1, 4, 0), (5, 16, 5)])
+    assert scheduler.dynamic_sd_lookup is None
+    assert _add_requests_and_schedule(scheduler, 1).num_spec_tokens_to_schedule == 5
 
 
 def test_scheduler_uses_static_k_when_no_requests_are_scheduled():

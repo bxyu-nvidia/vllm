@@ -215,6 +215,7 @@ def test_mm_support_configured_after_model_load(monkeypatch):
 
     def init_base(speculator, vllm_config, device):
         speculator.vllm_config = vllm_config
+        speculator.dp_size = 1
         speculator.device = device
         speculator.max_num_tokens = 4
         speculator.max_num_reqs = 2
@@ -619,3 +620,188 @@ def test_decode_metadata_update_needs_draft_decode_steps(
     speculator._configure_decode_metadata_update()
 
     assert speculator.supports_decode_metadata_update is expected
+
+
+@pytest.mark.parametrize(
+    "schedule,async_scheduling,prefill_only",
+    [
+        (None, True, False),
+        ([(1, 1024, 0)], True, True),
+        ([(1, 1, 0), (3, 4, 0)], True, True),
+        ([(1, 4, 0), (5, 8, 3)], True, True),
+        ([(1, 2, 0), (3, 4, 3)], True, False),
+        ([(1, 4, 2)], True, False),
+        ([(1, 4, 0)], False, False),
+    ],
+)
+def test_mtp_prefill_only_requires_constant_zero_async_schedule(
+    monkeypatch, schedule, async_scheduling, prefill_only
+):
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    def init_base(self, config, device):
+        self.speculative_config = config.speculative_config
+        self.scheduler_config = config.scheduler_config
+        self.max_num_reqs = 4
+        self.num_speculative_steps = 5
+
+    monkeypatch.setattr(TargetDependentARSpeculator, "__init__", init_base)
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens_per_batch_size=schedule
+        ),
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+    )
+    speculator = MTPSpeculator(config, torch.device("cpu"))
+    assert speculator.prefill_only is prefill_only
+    assert speculator.num_speculative_steps == 5
+
+
+@pytest.mark.parametrize("num_steps", [1, 5])
+@pytest.mark.parametrize("scheduled_k", [0, 1, 2])
+@pytest.mark.parametrize(
+    "cg_mode,dummy_run,is_profile",
+    [
+        (CUDAGraphMode.NONE, False, False),
+        (CUDAGraphMode.FULL, False, False),
+        (CUDAGraphMode.NONE, True, False),
+        (CUDAGraphMode.FULL, True, False),
+        (CUDAGraphMode.NONE, True, True),
+    ],
+)
+def test_mtp_constant_schedule_matches_real_and_dummy_draft_counts(
+    monkeypatch, num_steps, scheduled_k, cg_mode, dummy_run, is_profile
+):
+    """Idle ranks must issue the same number of draft forwards as active ranks."""
+    from vllm.v1.worker.gpu.dp_utils import DPSyncState
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    speculator = object.__new__(MTPSpeculator)
+    scheduled_k = min(scheduled_k, num_steps)
+    speculator.prefill_only = scheduled_k == 0
+    speculator.num_speculative_steps = num_steps
+    speculator.max_num_reqs = 2
+    speculator.max_model_len = 128
+    speculator.dp_size, speculator.dp_rank = 4, 0
+    speculator.speculative_config = SimpleNamespace(
+        num_speculative_tokens_per_batch_size=[(1, 1024, scheduled_k)]
+    )
+    speculator.scheduler_config = SimpleNamespace(async_scheduling=True)
+    speculator._configure_constant_dp_speculation()
+    speculator.supports_decode_metadata_update = False
+    speculator.temperature = speculator.seeds = speculator.draft_logits = None
+    speculator.sample_src_positions = torch.zeros(2, dtype=torch.int64)
+    speculator.pcp_manager = None
+    speculator.last_token_indices = torch.tensor([3, 7])
+    speculator.current_draft_step = torch.tensor(0)
+    speculator.idx_mapping = torch.arange(2)
+    speculator.input_buffers = SimpleNamespace(positions=torch.arange(8))
+    speculator.hidden_states = torch.zeros(8, 3)
+    speculator.draft_tokens = torch.full((2, num_steps), 42)
+    speculator._copy_request_inputs = Mock()
+    speculator._prepare_eplb_forward = Mock()
+    speculator.sample_draft = Mock(return_value=torch.zeros(2, dtype=torch.int64))
+    speculator.decode_cudagraph_manager = Mock()
+    speculator._multi_step_decode = Mock()
+    speculator._fused_multi_step_decode = Mock(
+        side_effect=AssertionError("unused fused drafts")
+    )
+    monkeypatch.setattr(spec_module, "prepare_prefill_inputs", Mock())
+    prepare_decode = Mock()
+    monkeypatch.setattr(spec_module, "prepare_decode_inputs", prepare_decode)
+
+    hidden = torch.ones(8, 3)
+    kv_updates = []
+
+    def run_model(num_tokens, attn_metadata, slot_mappings, **kwargs):
+        kv_updates.append((num_tokens, attn_metadata, slot_mappings))
+        return hidden, hidden
+
+    speculator._run_model = Mock(side_effect=run_model)
+    attn_metadata, slot_mappings = {"draft": object()}, {"draft": torch.arange(8)}
+    desc = BatchExecutionDescriptor(cg_mode, 8, 2)
+    sync = DPSyncState(torch.full((4,), 8), None, cg_mode == CUDAGraphMode.NONE, 2)
+    dispatch = Mock(return_value=(desc, sync))
+    monkeypatch.setattr(spec_module, "dispatch_cg_and_sync_dp", dispatch)
+    speculator.prefill_cudagraph_manager = Mock()
+    speculator.prefill_cudagraph_manager.run_fullgraph.side_effect = lambda _: (
+        speculator._prefill(
+            2, 8, attn_metadata, slot_mappings, sync.num_tokens_across_dp
+        )
+    )
+    batch = SimpleNamespace(
+        num_tokens=8,
+        num_tokens_after_padding=8,
+        num_reqs=2,
+        num_scheduled_tokens=torch.tensor([4, 4]),
+        seq_lens_cpu_upper_bound=torch.tensor([4, 4]),
+        seq_lens=torch.tensor([4, 4]),
+        idx_mapping=torch.arange(2),
+        decode_graph_eligible=False,
+    )
+    request_state = torch.zeros(2, dtype=torch.int64)
+    for chunk in range(2):
+        batch.seq_lens_cpu_upper_bound += 4
+        drafts = speculator.propose(
+            batch,
+            attn_metadata,
+            slot_mappings,
+            hidden,
+            None,
+            request_state,
+            request_state,
+            request_state,
+            request_state,
+            request_state,
+            request_state,
+            dp_sync_state=sync,
+            dummy_run=dummy_run,
+            is_profile=is_profile,
+            num_speculative_tokens=None if dummy_run else scheduled_k,
+        )
+        assert drafts.shape == (2, num_steps)
+        if scheduled_k == 0:
+            assert torch.all(drafts == -1)
+        assert len(kv_updates) == chunk + 1
+        assert kv_updates[-1] == (8, attn_metadata, slot_mappings)
+        assert dispatch.call_count == (chunk + 1) * (2 if scheduled_k > 1 else 1)
+        assert dispatch.call_args_list[0].kwargs["dp_sync_state"] is sync
+        assert speculator.draft_max_seq_len == 8 + chunk * 4 + scheduled_k
+    assert speculator.sample_draft.call_count == (2 if scheduled_k else 0)
+    if scheduled_k > 1:
+        assert prepare_decode.call_count == 2
+        assert speculator._multi_step_decode.call_count == 2
+        assert all(
+            call.args[-1] == scheduled_k
+            for call in speculator._multi_step_decode.call_args_list
+        )
+    else:
+        prepare_decode.assert_not_called()
+        speculator._multi_step_decode.assert_not_called()
+    speculator._fused_multi_step_decode.assert_not_called()
+    speculator.decode_cudagraph_manager.run_fullgraph.assert_not_called()
+
+
+def test_mtp_zero_schedule_captures_only_kv_prefill():
+    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
+
+    speculator = object.__new__(MTPSpeculator)
+    speculator.prefill_only = True
+    speculator.num_speculative_steps = 5
+    speculator.max_num_reqs = 2
+    speculator.last_token_indices = torch.zeros(2)
+    speculator.idx_mapping = torch.zeros(2)
+    speculator.model_state = speculator.target_input_buffers = None
+    speculator.block_tables = speculator.target_attn_groups = None
+    speculator.kv_cache_config = None
+    speculator.prefill_cudagraph_manager = Mock(use_breakable_cg=False)
+    speculator.decode_cudagraph_manager = Mock()
+    speculator.share_mtp_topk_indices = True
+    speculator.model = Mock()
+
+    speculator.capture()
+
+    speculator.prefill_cudagraph_manager.capture.assert_called_once()
+    speculator.decode_cudagraph_manager.capture.assert_not_called()
+    speculator.model.model.compact_topk_indices.assert_not_called()
+    speculator.model.model.set_skip_topk.assert_called_once_with(False)
