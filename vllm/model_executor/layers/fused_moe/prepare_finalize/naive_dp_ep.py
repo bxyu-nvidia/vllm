@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable, Sequence
+from typing import TypeVar
+
 import torch
+from torch.utils._pytree import tree_leaves
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_ep_group
@@ -12,6 +16,42 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+from vllm.utils.torch_utils import current_stream
+from vllm.v1.worker.ubatching import (
+    dbo_enabled,
+    dbo_switch_to_comm_sync,
+    dbo_switch_to_compute_sync,
+    dbo_yield_and_switch_from_comm_to_compute,
+)
+
+_CollectiveResult = TypeVar("_CollectiveResult")
+
+
+def _run_dbo_collective(
+    collective: Callable[[], _CollectiveResult],
+    inputs: Sequence[torch.Tensor],
+) -> _CollectiveResult:
+    if not dbo_enabled():
+        return collective()
+
+    dbo_switch_to_comm_sync()
+    try:
+        # NCCL uses raw pointers: protect compute-stream allocations until
+        # communication finishes, even if the caller drops its references.
+        for tensor in inputs:
+            tensor.record_stream(current_stream())
+        result = collective()
+    except Exception:
+        dbo_switch_to_compute_sync()
+        raise
+
+    dbo_yield_and_switch_from_comm_to_compute()
+    # The outputs were allocated on the communication stream but are consumed
+    # by compute. The stream wait orders execution; record_stream protects reuse.
+    for tensor in tree_leaves(result):
+        if isinstance(tensor, torch.Tensor):
+            tensor.record_stream(current_stream())
+    return result
 
 
 def _quantize_and_setup_dispatch(
@@ -289,11 +329,14 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
             a1, quant_config, defer_input_quant
         )
 
-        res = get_ep_group().dispatch_router_logits(
-            a1q,
-            router_logits,
-            is_sequence_parallel=self.is_sequence_parallel,
-            extra_tensors=scales,
+        res = _run_dbo_collective(
+            lambda: get_ep_group().dispatch_router_logits(
+                a1q,
+                router_logits,
+                is_sequence_parallel=self.is_sequence_parallel,
+                extra_tensors=scales,
+            ),
+            [a1q, router_logits, *(scales or [])],
         )
 
         if scales is None:
@@ -311,10 +354,12 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
         self,
         fused_expert_output: torch.Tensor,
     ) -> torch.Tensor:
-        out = get_ep_group().combine(
-            fused_expert_output, is_sequence_parallel=self.is_sequence_parallel
+        return _run_dbo_collective(
+            lambda: get_ep_group().combine(
+                fused_expert_output, is_sequence_parallel=self.is_sequence_parallel
+            ),
+            [fused_expert_output],
         )
-        return out
 
 
 def make_moe_prepare_and_finalize_naive_dp_ep(
