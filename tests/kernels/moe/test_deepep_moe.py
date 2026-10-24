@@ -13,7 +13,6 @@ from tests.kernels.moe.utils import make_dummy_moe_config
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.fused_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
@@ -21,11 +20,20 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.fused_batched_moe import (
     BatchedTritonExperts,
 )
+from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
+    TrtLlmBf16ExpertsModular,
+)
 from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+    UnquantizedMoeBackend,
+    convert_to_unquantized_kernel_format,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
 from vllm.platforms import current_platform
+from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 from vllm.utils.import_utils import has_deep_ep
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -95,6 +103,10 @@ class TestConfig:
     k: int
     n: int
     num_experts: int
+    use_trtllm: bool = False
+    activation: MoEActivation = MoEActivation.SILU
+    empty_expert_rank: bool = False
+    apply_router_weight_on_input: bool = False
 
 
 @dataclasses.dataclass
@@ -123,6 +135,15 @@ class TestTensors:
             low=0, high=config.num_experts, size=(config.m, config.topk), device="cuda"
         ).to(dtype=torch.int64)
         topk_weights = torch.randn(topk.shape, dtype=torch.float32, device="cuda")
+        if config.use_trtllm:
+            # Unique routes, with positive, non-normalized weights to catch
+            # accidental renormalization or double weighting after dispatch.
+            routed_experts = config.num_experts // (
+                2 if config.empty_expert_rank else 1
+            )
+            scores = torch.rand(config.m, routed_experts, device="cuda")
+            topk_weights, topk = scores.topk(config.topk, dim=-1)
+            topk_weights = topk_weights * 0.25 + 0.25
         return TestTensors(
             rank_tokens=rank_tokens,
             rank_token_scales=rank_token_scales,
@@ -143,6 +164,7 @@ def make_modular_kernel(
     q_dtype: torch.dtype | None,
     use_fp8_dispatch: bool,
     quant_config: FusedMoEQuantConfig,
+    test_config: TestConfig,
 ) -> FusedMoEKernel:
     ht_args: DeepEPHTArgs | None = None
     ll_args: DeepEPLLArgs | None = None
@@ -182,6 +204,22 @@ def make_modular_kernel(
             moe_config=moe_config,
             quant_config=quant_config,
         )
+    elif test_config.use_trtllm:
+        moe_config = make_dummy_moe_config(
+            num_experts=num_experts,
+            num_local_experts=num_local_experts,
+            experts_per_token=test_config.topk,
+            hidden_dim=hidden_size,
+            intermediate_size=test_config.n,
+            max_num_tokens=test_config.m * pgi.world_size,
+            activation=test_config.activation,
+        )
+        moe_config.moe_parallel_config.ep_rank = pgi.rank
+        moe_config.moe_parallel_config.ep_size = pgi.world_size
+        moe_config.moe_parallel_config.dp_size = dp_size
+        moe_config.moe_parallel_config.use_ep = True
+        moe_config.moe_parallel_config.all2all_backend = "deepep_high_throughput"
+        fused_experts = TrtLlmBf16ExpertsModular(moe_config, quant_config)
     else:
         fused_experts = TritonExperts(
             moe_config=moe_config,
@@ -252,7 +290,15 @@ def deep_ep_moe_impl(
         q_dtype,
         use_fp8_dispatch,
         quant_config,
+        test_tensors.config,
     )
+    if test_tensors.config.use_trtllm:
+        w1, w2 = convert_to_unquantized_kernel_format(
+            UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+            mk.fused_experts.moe_config,
+            w1,
+            w2,
+        )
 
     def process_chunk(chunk_start, chunk_end, skip_result_store=False):
         rank_tokens_chunk = test_tensors.rank_tokens[chunk_start:chunk_end]
@@ -274,10 +320,10 @@ def deep_ep_moe_impl(
             w2=w2,
             topk_weights=topk_weights_chunk,
             topk_ids=topk_chunk,
-            activation=MoEActivation.SILU,
+            activation=test_tensors.config.activation,
             global_num_experts=num_experts,
             expert_map=build_expert_map(),
-            apply_router_weight_on_input=False,
+            apply_router_weight_on_input=test_tensors.config.apply_router_weight_on_input,
         )
 
         if not skip_result_store:
@@ -347,9 +393,18 @@ def torch_moe_impl(
             e_w = topk_weights[i][j]
             w1_e = w1[e]
             w2_e = w2[e]
-            o_i += (
-                SiluAndMul()(a_i @ w1_e.transpose(0, 1)) @ w2_e.transpose(0, 1)
-            ) * e_w
+            x = a_i
+            if test_tensors.config.apply_router_weight_on_input:
+                x = x * e_w.to(x.dtype)
+            intermediate = x @ w1_e.transpose(0, 1)
+            if test_tensors.config.activation == MoEActivation.RELU2_NO_MUL:
+                intermediate = intermediate.relu().square()
+            else:
+                intermediate = SiluAndMul()(intermediate)
+            expert_output = intermediate @ w2_e.transpose(0, 1)
+            if not test_tensors.config.apply_router_weight_on_input:
+                expert_output = expert_output * e_w
+            o_i += expert_output
 
     if is_quantized:
         out = out.to(dtype=a_dtype)
@@ -450,7 +505,12 @@ def _deep_ep_moe(
             per_act_token_quant,
         )
 
-    assert_deepep_close(torch_combined, deepep_combined, config.k, use_fp8_dispatch)
+    if config.use_trtllm:
+        torch.testing.assert_close(
+            torch_combined, deepep_combined, atol=2e-3, rtol=2e-2
+        )
+    else:
+        assert_deepep_close(torch_combined, deepep_combined, config.k, use_fp8_dispatch)
 
 
 MNKs = [
@@ -568,3 +628,34 @@ def test_low_latency_deep_ep_moe(
         use_fp8_dispatch,
         False,
     )
+
+
+@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
+@pytest.mark.parametrize("empty_expert_rank", [False, True])
+@pytest.mark.parametrize("topk", [1, 8])
+@multi_gpu_test(num_gpus=2)
+@requires_deep_ep
+@pytest.mark.skipif(
+    not has_flashinfer_trtllm_fused_moe()
+    or not current_platform.is_device_capability_family(100),
+    reason="Requires FlashInfer TRTLLM BF16 MoE on SM100",
+)
+def test_deep_ep_ht_trtllm_bf16(activation, empty_expert_rank, topk, workspace_init):
+    """Compare dispatch/TRTLLM/combine with torch, including an empty receiver."""
+    set_random_seed(7)
+    config = TestConfig(
+        dtype=torch.bfloat16,
+        topk=topk,
+        m=32,
+        k=1024,
+        n=128,
+        num_experts=32,
+        use_trtllm=True,
+        activation=activation,
+        empty_expert_rank=empty_expert_rank,
+        apply_router_weight_on_input=topk == 1,
+    )
+    w1, w2, _, _ = make_weights(config.num_experts, config.n, config.k, config.dtype)
+    if activation == MoEActivation.RELU2_NO_MUL:
+        w1 = w1[:, : config.n].contiguous()
+    parallel_launch(2, _deep_ep_moe, False, 2, config, w1, w2, None, None, False, False)
