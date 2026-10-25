@@ -4,17 +4,23 @@
 
 import threading
 from types import SimpleNamespace
+from typing import cast
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
 
 from tests.utils import ensure_current_vllm_config
+from vllm.config import ParallelConfig
 from vllm.distributed.device_communicators.all2all import AgRsAll2AllManager
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.forward_context import DPMetadata, ForwardContext
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep as naive
+from vllm.v1.worker.gpu import dp_utils
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.ubatch_utils import create_whole_request_ubatch_slices
 from vllm.v1.worker.ubatching import make_ubatch_contexts
 
 from .parallel_utils import ProcessGroupInfo, parallel_launch
@@ -101,12 +107,63 @@ def test_collective_error_restores_compute_stream(monkeypatch):
     assert events == ["comm", "compute"]
 
 
-def _ag_rs_dbo_worker(pgi: ProcessGroupInfo, sizes: list[list[int]], symmetric: bool):
+def _ag_rs_dbo_worker(
+    pgi: ProcessGroupInfo,
+    sizes: list[list[int]],
+    symmetric: bool,
+    query_lens: list[list[int]] | None = None,
+):
     """Exercise real AG/RS and DBO threads without loading a model or DeepEP."""
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("VLLM_USE_NCCL_SYMM_MEM", "1" if symmetric else "0")
         patch.setenv("VLLM_BATCH_INVARIANT", "0")
         cpu_group = dist.new_group(backend="gloo")
+        if query_lens is not None:
+            # Exercise the production DP handshake and request-boundary split
+            # before the real NCCL collectives, with different full-batch sizes.
+            patch.setattr(
+                dp_utils, "get_dp_group", lambda: SimpleNamespace(cpu_group=cpu_group)
+            )
+            patch.setattr(dp_utils, "should_skip_dp_coordination", lambda: False)
+            local_queries = query_lens[pgi.rank]
+            local_tokens = sum(local_queries)
+            desc, sync = dp_utils.dispatch_cg_and_sync_dp(
+                None,
+                len(local_queries),
+                local_tokens,
+                None,
+                pgi.world_size,
+                pgi.rank,
+                need_eager=True,
+                parallel_config=ParallelConfig(
+                    enable_dbo=True,
+                    dbo_prefill_token_threshold=2,
+                    dbo_decode_token_threshold=2,
+                    all2all_backend="allgather_reducescatter",
+                ),
+                allow_ubatching=True,
+                dbo_whole_requests=True,
+            )
+            assert desc.num_tokens == local_tokens and desc.num_ubatches == 2
+            assert sync is not None
+            assert sync.num_tokens_across_dp.tolist() == [sum(q) for q in query_lens]
+            batch = cast(
+                InputBatch,
+                SimpleNamespace(
+                    num_reqs=len(local_queries),
+                    num_reqs_after_padding=desc.num_reqs,
+                    num_tokens=local_tokens,
+                    num_tokens_after_padding=desc.num_tokens,
+                    query_start_loc_np=np.cumsum([0, *local_queries], dtype=np.int32),
+                ),
+            )
+            slices = create_whole_request_ubatch_slices(batch)
+            sizes = dp_utils.sync_ubatch_token_counts(
+                [s.num_tokens for s in slices], pgi.world_size, pgi.rank
+            ).tolist()
+            assert [sum(s[r] for s in sizes) for r in range(pgi.world_size)] == [
+                sum(q) for q in query_lens
+            ]
         with ensure_current_vllm_config():
             comm = CudaCommunicator(
                 cpu_group,
@@ -210,3 +267,14 @@ def _ag_rs_dbo_worker(pgi: ProcessGroupInfo, sizes: list[list[int]], symmetric: 
 def test_monolithic_dbo_ag_rs_gpu(sizes, symmetric):
     """Check repeated overlap, unequal ranks, idle ranks, and scratch reuse."""
     parallel_launch(2, _ag_rs_dbo_worker, sizes, symmetric)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.accelerator.device_count() < 2,
+    reason="Requires two CUDA GPUs",
+)
+@pytest.mark.parametrize("symmetric", [False, True])
+@pytest.mark.parametrize("query_lens", [[[2, 2, 4], [4, 4, 8]], [[1, 15], [4, 4, 1]]])
+def test_hybrid_dbo_ag_rs_unpadded_gpu(query_lens, symmetric):
+    """Unpadded whole-request dispatch feeds matching variable-size AG/RS calls."""
+    parallel_launch(2, _ag_rs_dbo_worker, [], symmetric, query_lens)

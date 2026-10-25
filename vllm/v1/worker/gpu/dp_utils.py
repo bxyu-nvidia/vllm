@@ -140,10 +140,36 @@ def sync_cudagraph_and_dp_padding(
             int(num_tokens_across_dp.min()),
             uniform_decode=uniform_decode_across_dp,
         ):
-            # Expert all-to-all requires every rank to split and pad equally.
-            # Empty microbatches run as dummy batches.
-            ubatch_num_tokens = int(num_tokens_across_dp.max())
             num_ubatches = get_num_ubatches(parallel_config)
+            if (
+                dbo_whole_requests
+                and parallel_config.all2all_backend == "allgather_reducescatter"
+            ):
+                assert desired_batch_desc.cg_mode == CUDAGraphMode.NONE
+                # Whole-request eager AG/RS exchanges each microbatch's actual
+                # sizes in UBatchRunner.prepare(). Padding the full batch here
+                # only adds work to its trailing microbatch and the MTP prefill.
+                if dbo_stats is not None:
+                    dbo_stats.outcome = "executed"
+                return (
+                    replace(
+                        desired_batch_desc,
+                        num_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                        num_ubatches=num_ubatches,
+                    ),
+                    DPSyncState(
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        uniform_token_count=synced_uniform_token_count,
+                        eager=True,
+                        # MTP's later uniform decode still needs a shared bound.
+                        num_reqs=int(num_reqs_across_dp.max()),
+                    ),
+                )
+
+            # Fixed-token splits retain equal DP padding for their collective
+            # sizes and CUDA graph shapes. Empty microbatches are dummy batches.
+            ubatch_num_tokens = int(num_tokens_across_dp.max())
             ubatch_desc = None
             if cudagraph_manager is not None:
                 # Match a FULL microbatched CUDA graph, falling back to an eager
@@ -288,7 +314,8 @@ def dispatch_cg_and_sync_dp(
         uniform_decode: Whether this rank's batch is a uniform decode, used
             to pick the microbatching split.
         dbo_stats: Optional diagnostics populated from the existing DP handshake.
-        dbo_whole_requests: Whether a rank needs two whole requests to split.
+        dbo_whole_requests: Split only between requests. Eager AG/RS keeps
+            local token counts; other paths retain equal DP padding.
         dp_sync_state: Agreement from a prior dispatch over this same batch, to reuse.
             Must come from a batch with this same padded `num_tokens` and the
             same `uniform_token_count`; `num_reqs` may differ, as neither

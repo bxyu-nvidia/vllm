@@ -289,15 +289,17 @@ def _sync_dp(
     dbo_stats: DBOStats | None = None,
     num_reqs_per_rank: list[int] | None = None,
     whole_requests: bool = False,
+    dp_rank: int = 0,
 ) -> tuple[BatchExecutionDescriptor, dp_utils.DPSyncState | None]:
     """Run the DP handshake with the all-reduce stubbed out.
 
     The microbatching decision lives inside `sync_cudagraph_and_dp_padding`, so
     the cases below stand in for the collective rather than for the decision,
     and need no process group. Every rank asks for eager, which keeps the
-    non-microbatched path off the cudagraph manager. This rank is rank 0.
+    non-microbatched path off the cudagraph manager.
     """
     dp_size = len(num_tokens_per_rank)
+    local_reqs = num_reqs_per_rank[dp_rank] if num_reqs_per_rank else 8
     uniform_token_counts = uniform_token_count_per_rank or [0] * dp_size
     reduced = torch.zeros(6, dp_size, dtype=torch.int32)
     reduced[0] = torch.tensor(num_tokens_per_rank, dtype=torch.int32)
@@ -315,25 +317,25 @@ def _sync_dp(
             cudagraph_manager=cudagraph_manager,
             desired_batch_desc=BatchExecutionDescriptor(
                 cg_mode=CUDAGraphMode.NONE,
-                num_tokens=num_tokens_per_rank[0],
-                num_reqs=8,
+                num_tokens=num_tokens_per_rank[dp_rank],
+                num_reqs=local_reqs,
             ),
-            num_tokens=num_tokens_per_rank[0],
-            num_reqs=8,
-            uniform_token_count=uniform_token_counts[0] or None,
+            num_tokens=num_tokens_per_rank[dp_rank],
+            num_reqs=local_reqs,
+            uniform_token_count=uniform_token_counts[dp_rank] or None,
             dp_size=dp_size,
-            dp_rank=0,
+            dp_rank=dp_rank,
             parallel_config=ParallelConfig(
                 enable_dbo=True,
                 dbo_decode_token_threshold=DECODE_THRESHOLD,
                 dbo_prefill_token_threshold=PREFILL_THRESHOLD,
             ),
             allow_ubatching=(
-                allow_ubatching[0]
+                allow_ubatching[dp_rank]
                 if isinstance(allow_ubatching, list)
                 else allow_ubatching
             ),
-            uniform_decode=uniform_token_counts[0] == DECODE_QUERY_LEN,
+            uniform_decode=uniform_token_counts[dp_rank] == DECODE_QUERY_LEN,
             dbo_stats=dbo_stats,
             dbo_whole_requests=whole_requests,
         )
@@ -360,7 +362,7 @@ def test_decode_threshold_only_applies_when_every_rank_is_a_uniform_decode():
 
 
 def test_microbatching_pads_all_ranks_to_the_largest():
-    """Ranks must run the same token count so microbatch sizes line up."""
+    """Fixed-token splits retain equal sizes across ranks (including graphs)."""
     desc, dp_sync_state = _sync_dp([200, 256])
     assert desc.num_tokens == 256
     assert dp_sync_state is not None
@@ -1059,3 +1061,73 @@ def test_dbo_metrics_leave_dispatch_unchanged(
         sync.num_tokens_across_dp, baseline_sync.num_tokens_across_dp
     )
     assert stats.microbatch_tokens == []  # Sizes are recorded by the actual runner.
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+@pytest.mark.parametrize("collect_metrics", [False, True])
+def test_whole_request_dbo_removes_dp_padding_and_preserves_mtp_sync(
+    monkeypatch, rank: int, collect_metrics: bool
+):
+    """Unequal ranks keep local shapes through target DBO and draft prefill."""
+    from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+    from vllm.v1.worker.gpu.ubatch_utils import merge_ubatch_outputs
+
+    query_lens = [[32, 32, 64], [64, 64, 64, 64], [64, 128]]
+    totals = [sum(lengths) for lengths in query_lens]
+    counts = [len(lengths) for lengths in query_lens]
+    stats = DBOStats("rank_ineligible") if collect_metrics else None
+    desc, sync = _sync_dp(
+        totals,
+        num_reqs_per_rank=counts,
+        whole_requests=True,
+        dbo_stats=stats,
+        dp_rank=rank,
+    )
+    assert desc.cg_mode == CUDAGraphMode.NONE and desc.num_ubatches == 2
+    assert desc.num_tokens == totals[rank]
+    assert desc.num_reqs == counts[rank]
+    assert sync is not None and sync.eager
+    assert sync.num_tokens_across_dp.tolist() == totals
+    assert sync.num_reqs == max(counts)
+    if stats is not None:
+        assert stats.outcome == "executed"
+
+    batch = _make_input_batch(
+        query_lens[rank],
+        [q + 128 for q in query_lens[rank]],
+        InputBuffers(MAX_NUM_REQS, max(totals), torch.device("cpu")),
+        num_tokens_padded=desc.num_tokens,
+    )
+    slices = create_whole_request_ubatch_slices(batch)
+    assert sum(s.num_tokens for s in slices) == totals[rank]
+    assert slices[-1].request_slice.stop == counts[rank]
+    assert [s.num_tokens for s in slices] == [[64, 64], [128, 128], [64, 128]][rank]
+    # Merging keeps token order, so sampling and MTP still use full-batch indices.
+    tokens = torch.arange(totals[rank]).unsqueeze(1)
+    torch.testing.assert_close(
+        merge_ubatch_outputs([tokens[s.token_slice] for s in slices]), tokens
+    )
+
+    def unexpected_collective(*args, **kwargs):
+        pytest.fail("MTP prefill must reuse the target DP agreement")
+
+    monkeypatch.setattr(dp_utils.dist, "all_reduce", unexpected_collective)
+    draft_desc, draft_sync = dp_utils.dispatch_cg_and_sync_dp(
+        None,
+        counts[rank],
+        totals[rank],
+        None,
+        len(totals),
+        rank,
+        dp_sync_state=sync,
+    )
+    assert draft_desc.num_tokens == totals[rank]
+    assert draft_sync is sync
+    # Uniform draft steps still pad request counts consistently across ranks.
+    uniform_sync, num_tokens = DraftModelSpeculator._build_uniform_batch_dp_sync(
+        cast(DraftModelSpeculator, None), sync, counts[rank]
+    )
+    assert num_tokens == max(counts)
+    assert uniform_sync.num_tokens_across_dp.tolist() == [max(counts)] * len(totals)
+    assert uniform_sync.uniform_token_count == 1
+    assert sync.num_tokens_across_dp.tolist() == totals
