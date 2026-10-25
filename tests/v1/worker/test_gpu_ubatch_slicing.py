@@ -14,7 +14,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -34,7 +34,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.dbo import DBOStats
 from vllm.v1.worker import gpu_ubatch_wrapper as legacy_gpu_ubatch_wrapper
 from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
-from vllm.v1.worker.gpu import cudagraph_utils, dp_utils
+from vllm.v1.worker.gpu import cudagraph_utils, dp_utils, ubatch_utils
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
@@ -1006,10 +1006,17 @@ def test_whole_request_slices_preserve_recurrent_state_ownership(query_lens):
     )
 
 
-def test_single_request_cannot_be_split_for_recurrent_dbo():
+def test_single_request_keeps_one_recurrent_state_owner():
     batch = _make_input_batch([32], [128], _make_buffers())
-    with pytest.raises(ValueError, match="at least two requests"):
-        create_whole_request_ubatch_slices(batch)
+    slices = create_whole_request_ubatch_slices(batch)
+    assert slices == [
+        UBatchSlice(slice(0, 1), slice(0, 32)),
+        UBatchSlice(slice(1, 1), slice(32, 32)),
+    ]
+    assert slices[1].is_empty()
+    first = _slice_input_batch(batch, slices[0], *_make_ubatch_buffers()[0])
+    assert first.num_scheduled_tokens.tolist() == [32]
+    torch.testing.assert_close(first.seq_lens, batch.seq_lens)
 
 
 def test_unsplittable_rank_disables_dbo_for_the_entire_dp_group():
@@ -1041,7 +1048,7 @@ def test_request_boundary_microbatches_exchange_actual_rank_sizes(monkeypatch, r
         ([256, 256], [True, True], [8, 8], False, "executed"),
         ([256, 100], [True, True], [8, 8], False, "below_threshold"),
         ([256, 256], [True, False], [8, 8], False, "rank_ineligible"),
-        ([256, 256], [True, False], [8, 1], True, "insufficient_requests"),
+        ([256, 256], [True, False], [8, 1], True, "rank_ineligible"),
         ([256, 256], [True, True], [8, 8], True, "executed"),
     ],
 )
@@ -1131,3 +1138,134 @@ def test_whole_request_dbo_removes_dp_padding_and_preserves_mtp_sync(
     assert uniform_sync.num_tokens_across_dp.tolist() == [max(counts)] * len(totals)
     assert uniform_sync.uniform_token_count == 1
     assert sync.num_tokens_across_dp.tolist() == totals
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+@pytest.mark.parametrize(
+    "tokens,requests,outcome",
+    [
+        ([256, 32, 6], [8, 1, 1], "executed"),  # last rank is an idle dummy
+        ([256, 32, 6], [1, 2, 1], "below_threshold"),
+        ([256, 256, 6], [1, 1, 1], "insufficient_requests"),
+        ([256, 32, 6], [2, 2, 1], "executed"),
+    ],
+)
+def test_one_request_peers_do_not_veto_useful_dbo(rank, tokens, requests, outcome):
+    stats = DBOStats("rank_ineligible")
+    desc, sync = _sync_dp(
+        tokens,
+        num_reqs_per_rank=requests,
+        whole_requests=True,
+        dp_rank=rank,
+        dbo_stats=stats,
+    )
+    assert desc.num_ubatches == (2 if outcome == "executed" else 1)
+    assert desc.num_tokens == tokens[rank]
+    assert desc.num_reqs == requests[rank]
+    assert stats.outcome == outcome
+    assert sync is not None
+    assert sync.num_tokens_across_dp.tolist() == tokens
+
+
+@pytest.mark.parametrize("idle", [False, True])
+def test_empty_microbatch_has_no_attention_or_recurrent_state(monkeypatch, idle):
+    buffers = _make_buffers()
+    batch = (
+        InputBatch.make_dummy(1, 6, buffers)
+        if idle
+        else _make_input_batch([32], [128], buffers)
+    )
+    runner = object.__new__(UBatchRunner)
+    runner.num_ubatches = 2
+    runner.parallel_config = SimpleNamespace(
+        data_parallel_size=2,
+        data_parallel_rank=0,
+        is_moe_model=True,
+    )
+    runner.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            fast_moe_cold_start=False,
+            static_forward_context={},
+        )
+    )
+    runner.model_state = Mock(requires_whole_request_ubatches=True)
+    runner.model_state.prepare_ubatch_metadata.return_value = [object(), object()]
+    runner.model_state.prepare_attn.return_value = {"live": object()}
+    runner.attn_groups, runner.kv_cache_config = [], Mock()
+    runner.ubatch_query_start_loc, runner.ubatch_seq_lens = zip(*_make_ubatch_buffers())
+    runner.ubatch_dcp_local_seq_lens = [None, None]
+    runner.dcp_size, runner.dcp_rank, runner.cp_interleave = 1, 0, 1
+    runner.empty_ubatch_is_padding = torch.ones(1, dtype=torch.bool)
+    counts = torch.tensor([[batch.num_tokens, 64], [1, 64]], dtype=torch.int32)
+    exchange = Mock(return_value=counts)
+    monkeypatch.setattr(ubatch_utils, "sync_ubatch_token_counts", exchange)
+    monkeypatch.setattr(ubatch_utils, "build_slot_mappings_by_layer", lambda *a: {})
+    original_offsets = batch.query_start_loc.clone()
+    state = runner.prepare(batch, (), torch.empty(0, batch.num_tokens))
+    exchange.assert_called_once_with([batch.num_tokens, 1], 2, 0)
+    runner.model_state.prepare_ubatch_metadata.assert_called_once()
+    assert runner.model_state.prepare_ubatch_metadata.call_args.args[0] is batch
+    assert runner.model_state.prepare_ubatch_metadata.call_args.args[1] == [
+        slice(0, 1),
+        slice(1, 1),
+    ]
+    runner.model_state.prepare_attn.assert_called_once()
+    assert state.forward_contexts[0].attn_metadata == {
+        "live": runner.model_state.prepare_attn.return_value["live"]
+    }
+    empty = state.forward_contexts[1]
+    assert empty.attn_metadata is None and empty.slot_mapping == {}
+    assert empty.is_padding.tolist() == [True]
+    assert empty.dp_metadata.num_tokens_across_dp_cpu.tolist() == [1, 64]
+    torch.testing.assert_close(batch.query_start_loc, original_offsets)
+
+
+@pytest.mark.parametrize("mrope", [False, True])
+def test_empty_microbatch_inputs_cannot_overwrite_live_tokens(mrope):
+    inputs = _make_model_inputs(4, torch.device("cpu"))
+    inputs["inputs_embeds"] = torch.ones(4, 8)
+    if mrope:
+        inputs["positions"] = inputs["positions"].repeat(3, 1)
+    snapshots = {k: v.clone() for k, v in inputs.items() if isinstance(v, torch.Tensor)}
+    empty = ubatch_utils.make_empty_ubatch_inputs(inputs)
+    for key, original in snapshots.items():
+        expected_shape = (
+            (*original.shape[:-1], 1)
+            if key == "positions"
+            else (1, *original.shape[1:])
+        )
+        assert empty[key].shape == expected_shape
+        assert torch.count_nonzero(empty[key]) == 0
+        empty[key].fill_(7)
+        torch.testing.assert_close(inputs[key], original)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DBO needs a GPU")
+@pytest.mark.parametrize("aux_output", [False, True])
+def test_empty_microbatch_participates_in_handoffs_but_not_merged_output(aux_output):
+    config = _make_dbo_config()
+    runner = _make_execution_runner(config)
+    inputs = _make_model_inputs(8, torch.device("cuda:0"))
+    state = _make_ubatch_state(
+        config,
+        [
+            UBatchSlice(slice(0, 1), slice(0, 8)),
+            UBatchSlice(slice(1, 1), slice(8, 8)),
+        ],
+    )
+    trace: list[tuple[str, int]] = []
+    model = _YieldingModel(trace)
+
+    def forward(**kwargs):
+        if dbo_current_ubatch_id() == 1:
+            assert kwargs["input_ids"].shape == (1,)
+        out = model(**kwargs)
+        return (out, out + 1) if aux_output else out
+
+    result = runner.run(forward, inputs, state)
+    expected = (inputs["input_ids"] * 3).float().unsqueeze(-1)
+    if aux_output:
+        torch.testing.assert_close(result, (expected, expected + 1))
+    else:
+        torch.testing.assert_close(result, expected)
+    assert trace == [("enter", 0), ("enter", 1), ("exit", 0), ("exit", 1)]

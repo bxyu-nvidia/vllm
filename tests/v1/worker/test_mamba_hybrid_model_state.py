@@ -648,8 +648,9 @@ def test_separate_checkpoint_destinations_follow_batch_order_and_padding(
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("empty_second", [False, True])
 def test_microbatches_keep_full_batch_replayssm_and_disjoint_aligned_indices(
-    monkeypatch, device
+    monkeypatch, device, empty_second
 ):
     """The second microbatch must never restart at block-table row zero."""
     if device == "cuda" and not torch.cuda.is_available():
@@ -670,13 +671,14 @@ def test_microbatches_keep_full_batch_replayssm_and_disjoint_aligned_indices(
     state._get_mamba_group_info = Mock(return_value=([0], None))
     builders = [SimpleNamespace(mamba_aligned_state_indices=None) for _ in range(2)]
     groups = [[SimpleNamespace(get_metadata_builder=lambda i: builders[i])]]
-    slices = [slice(0, 1), slice(1, 3)]
+    split = 3 if empty_second else 1
+    slices = [slice(0, split), slice(split, 3)]
     metadata = state.prepare_ubatch_metadata(batch, slices, groups, Mock())
     assert state._replayssm_query_start_loc is batch.query_start_loc
     assert state._is_prefilling_gpu.tolist() == [True, False, False]
-    assert metadata[0].num_accepted_tokens.tolist() == [1]
-    assert metadata[1].num_accepted_tokens.tolist() == [4, 1]
-    assert metadata[1].num_decode_draft_tokens_cpu.tolist() == [0, 3]
+    assert metadata[0].num_accepted_tokens.tolist() == [1, 4, 1][:split]
+    assert metadata[1].num_accepted_tokens.tolist() == [1, 4, 1][split:]
+    assert metadata[1].num_decode_draft_tokens_cpu.tolist() == [0, 0, 3][split:]
 
     build_calls = []
 
@@ -686,6 +688,8 @@ def test_microbatches_keep_full_batch_replayssm_and_disjoint_aligned_indices(
 
     monkeypatch.setattr(mamba_hybrid, "build_attn_metadata", build_metadata)
     for i, request_slice in enumerate(slices):
+        if request_slice.start == request_slice.stop:
+            continue  # Empty microbatches run without attention metadata.
         queries = batch.num_scheduled_tokens[request_slice].tolist()
         sub = _input_batch(
             queries,
@@ -704,9 +708,18 @@ def test_microbatches_keep_full_batch_replayssm_and_disjoint_aligned_indices(
         )
     # Preparing slice 1 cannot overwrite slice 0's indices or the full-step
     # offsets/masks consumed once after sampling the merged outputs.
-    assert [call["ubatch_idx"] for call in build_calls] == [0, 1]
-    torch.testing.assert_close(builders[0].mamba_aligned_state_indices, indices[0, :1])
-    torch.testing.assert_close(builders[1].mamba_aligned_state_indices, indices[0, 1:])
+    assert [call["ubatch_idx"] for call in build_calls] == (
+        [0] if empty_second else [0, 1]
+    )
+    torch.testing.assert_close(
+        builders[0].mamba_aligned_state_indices, indices[0, :split]
+    )
+    if empty_second:
+        assert builders[1].mamba_aligned_state_indices is None
+    else:
+        torch.testing.assert_close(
+            builders[1].mamba_aligned_state_indices, indices[0, split:]
+        )
     assert state._replayssm_query_start_loc is batch.query_start_loc
     assert state._is_prefilling_gpu.tolist() == [True, False, False]
     state._mamba_ctx.compute_aligned_state_indices.assert_called_once()
@@ -719,3 +732,27 @@ def test_secondary_mamba_microbatch_requires_presliced_metadata(monkeypatch):
         state.prepare_attn(
             batch, CUDAGraphMode.NONE, (), torch.empty(0), [], Mock(), ubatch_idx=1
         )
+
+
+def test_mamba_padding_forward_initializes_output_without_accessing_live_state(
+    monkeypatch,
+):
+    from vllm.model_executor.layers.mamba import mamba_mixer2
+
+    # No cache fields: a metadata-free forward must never access live state.
+    layer = SimpleNamespace(
+        tped_intermediate_size=4,
+        tped_conv_size=8,
+        tped_dt_size=2,
+        cache_config=object(),
+        num_spec=5,
+        _warmup_ssd_kernels=Mock(),
+        split_hidden_states_B_C_fn=lambda x: (x[:, :4], x[:, 4:6], x[:, 6:]),
+    )
+    monkeypatch.setattr(
+        mamba_mixer2, "get_forward_context", lambda: SimpleNamespace(attn_metadata=None)
+    )
+    projected = torch.arange(14).float().reshape(1, 14)
+    output = torch.full((1, 4), float("nan"))
+    mamba_mixer2.MambaMixer2.conv_ssm_forward(layer, projected, output)
+    torch.testing.assert_close(output, projected[:, 4:8])

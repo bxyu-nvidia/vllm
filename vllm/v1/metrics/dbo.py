@@ -11,7 +11,9 @@ class DBOStats:
     rank_ineligible, or below_threshold. Fallback reasons describe the first
     failed group-wide eligibility check, not every possible blocker.
     Microbatch lists are empty for unsplit steps. Tokens exclude DP padding;
-    requests count the real requests touched by each slice.
+    requests count the real requests touched by each slice. For whole-request
+    AG/RS, insufficient_requests means no rank can split; one-request peers
+    participate with a padding-only microbatch, counted in padding tokens.
     """
 
     outcome: str

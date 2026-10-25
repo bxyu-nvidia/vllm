@@ -562,12 +562,13 @@ def test_dummy_graph_padding_preserves_dp_sync(
     assert reused is sync
 
 
+@pytest.mark.parametrize("num_reqs", [1, 2])
 @pytest.mark.parametrize("collect_metrics", [False, True])
 @pytest.mark.parametrize("dummy_run", [False, True])
 @pytest.mark.parametrize("microbatched", [False, True])
 @pytest.mark.parametrize("drafting", [False, True])
 def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
-    monkeypatch, microbatched, drafting, dummy_run, collect_metrics
+    monkeypatch, microbatched, drafting, dummy_run, collect_metrics, num_reqs
 ):
     """MTP must not see a microbatch's offsets or overwrite live builder buffers."""
     from vllm.config.compilation import CUDAGraphMode
@@ -598,7 +599,7 @@ def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
         6,
     )
     runner.prepare_inputs.return_value = InputBatch.make_dummy(
-        2, 18, runner.input_buffers, num_tokens_after_padding=24
+        num_reqs, 18, runner.input_buffers, num_tokens_after_padding=24
     )
     runner.model_state.prepare_inputs.return_value = {}
     blocks = (torch.tensor([[11], [22]]),)
@@ -610,8 +611,10 @@ def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
 
     def prepare_metadata(batch, mode, block_tables, slot_mappings, *args, **kwargs):
         events.append("full_metadata")
-        assert batch.num_reqs == 2
-        assert batch.query_start_loc_np.tolist() == [0, 9, 18]
+        assert batch.num_reqs == num_reqs
+        assert batch.query_start_loc_np.tolist() == (
+            [0, 18] if num_reqs == 1 else [0, 9, 18]
+        )
         assert block_tables is blocks and slot_mappings is slots
         return full_metadata
 
@@ -634,12 +637,13 @@ def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
     desc = BatchExecutionDescriptor(
         cg_mode=CUDAGraphMode.NONE,
         num_tokens=18,
-        num_reqs=2,
+        num_reqs=num_reqs,
         num_ubatches=2 if microbatched else 1,
     )
     sync = DPSyncState(torch.full((4,), 18), None, True, 2)
 
     def dispatch(*args, **kwargs):
+        assert kwargs["allow_ubatching"] == microbatched
         if kwargs["dbo_stats"] is not None and microbatched:
             kwargs["dbo_stats"].outcome = "executed"
         return desc, sync
@@ -656,18 +660,22 @@ def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
         lambda *a, **kw: contextlib.nullcontext(),
     )
     output = SchedulerOutput.make_empty()
-    output.num_scheduled_tokens = {"a": 6, "b": 6}
-    output.total_num_scheduled_tokens = 12
+    output.num_scheduled_tokens = {str(i): 6 for i in range(num_reqs)}
+    output.total_num_scheduled_tokens = 6 * num_reqs
     GPUModelRunner.execute_model(runner, output, dummy_run=dummy_run)
 
     state = runner.execute_model_state
     if collect_metrics and not dummy_run:
         assert state.dbo_stats is not None
         assert state.dbo_stats.outcome == ("executed" if microbatched else "disabled")
-        assert state.dbo_stats.microbatch_tokens == ([9, 9] if microbatched else [])
-        assert state.dbo_stats.microbatch_requests == ([1, 1] if microbatched else [])
+        assert state.dbo_stats.microbatch_tokens == (
+            ([18, 0] if num_reqs == 1 else [9, 9]) if microbatched else []
+        )
+        assert state.dbo_stats.microbatch_requests == (
+            ([1, 0] if num_reqs == 1 else [1, 1]) if microbatched else []
+        )
         assert state.dbo_stats.microbatch_padding_tokens == (
-            [0, 6] if microbatched else []
+            ([6, 1] if num_reqs == 1 else [0, 6]) if microbatched else []
         )
     else:
         assert state.dbo_stats is None

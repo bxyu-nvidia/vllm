@@ -1823,7 +1823,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 and not skip_attn_for_dummy_run
                 and (
                     not whole_request_ubatching
-                    or (self.parallel_config.num_ubatches == 2 and num_reqs >= 2)
+                    or self.parallel_config.num_ubatches == 2
                 )
             ),
             uniform_decode=uniform_tok_count == self.decode_query_len,
@@ -1984,7 +1984,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 dbo_stats.microbatch_tokens.append(tokens)
                 dbo_stats.microbatch_requests.append(requests if tokens else 0)
-                dbo_stats.microbatch_padding_tokens.append(s.num_tokens - tokens)
+                dbo_stats.microbatch_padding_tokens.append(
+                    max(1, s.num_tokens) - tokens
+                )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None

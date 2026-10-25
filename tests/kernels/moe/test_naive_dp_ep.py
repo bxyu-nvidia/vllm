@@ -159,10 +159,10 @@ def _ag_rs_dbo_worker(
             )
             slices = create_whole_request_ubatch_slices(batch)
             sizes = dp_utils.sync_ubatch_token_counts(
-                [s.num_tokens for s in slices], pgi.world_size, pgi.rank
+                [max(1, s.num_tokens) for s in slices], pgi.world_size, pgi.rank
             ).tolist()
             assert [sum(s[r] for s in sizes) for r in range(pgi.world_size)] == [
-                sum(q) for q in query_lens
+                sum(q) + (len(q) == 1) for q in query_lens
             ]
         with ensure_current_vllm_config():
             comm = CudaCommunicator(
@@ -274,7 +274,15 @@ def test_monolithic_dbo_ag_rs_gpu(sizes, symmetric):
     reason="Requires two CUDA GPUs",
 )
 @pytest.mark.parametrize("symmetric", [False, True])
-@pytest.mark.parametrize("query_lens", [[[2, 2, 4], [4, 4, 8]], [[1, 15], [4, 4, 1]]])
+@pytest.mark.parametrize(
+    "query_lens",
+    [
+        [[2, 2, 4], [4, 4, 8]],
+        [[1, 15], [4, 4, 1]],
+        [[16], [4, 4, 8]],
+        [[4, 4, 8], [6]],
+    ],
+)
 def test_hybrid_dbo_ag_rs_unpadded_gpu(query_lens, symmetric):
     """Unpadded whole-request dispatch feeds matching variable-size AG/RS calls."""
     parallel_launch(2, _ag_rs_dbo_worker, [], symmetric, query_lens)

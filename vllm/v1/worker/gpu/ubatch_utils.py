@@ -49,8 +49,15 @@ class UBatchState(NamedTuple):
 
 def create_whole_request_ubatch_slices(input_batch: InputBatch) -> UBatchSlices:
     """Split two eager microbatches at the request boundary nearest half the work."""
-    if input_batch.num_reqs < 2:
-        raise ValueError("Whole-request DBO requires at least two requests per rank")
+    # Idle workers arrive through execute_dummy_batch with a synthetic request.
+    assert input_batch.num_reqs >= 1
+    if input_batch.num_reqs == 1:
+        num_reqs = input_batch.num_reqs_after_padding
+        num_tokens = input_batch.num_tokens_after_padding
+        return [
+            UBatchSlice(slice(0, num_reqs), slice(0, num_tokens)),
+            UBatchSlice(slice(num_reqs, num_reqs), slice(num_tokens, num_tokens)),
+        ]
     boundaries = input_batch.query_start_loc_np[1 : input_batch.num_reqs]
     split_req = int(np.argmin(np.abs(2 * boundaries - input_batch.num_tokens))) + 1
     split_token = int(input_batch.query_start_loc_np[split_req])
@@ -279,6 +286,17 @@ def slice_model_inputs(
     return sliced
 
 
+def make_empty_ubatch_inputs(model_inputs: dict[str, Any]) -> dict[str, Any]:
+    """Make one padding token without aliasing any live request's input buffers."""
+    inputs = slice_model_inputs(model_inputs, slice(0, 1))
+    for key in ("input_ids", "inputs_embeds", "positions"):
+        if inputs.get(key) is not None:
+            inputs[key] = torch.zeros_like(inputs[key])
+    # Whole-request DBO does not support pipeline parallelism.
+    assert inputs.get("intermediate_tensors") is None
+    return inputs
+
+
 def merge_ubatch_outputs(outputs: list[Any]) -> Any:
     """Reassemble the full-batch model output from the per-microbatch ones.
 
@@ -343,6 +361,7 @@ class UBatchRunner:
             else None
             for _ in range(self.num_ubatches)
         ]
+        self.empty_ubatch_is_padding = torch.ones(1, dtype=torch.bool, device=device)
         self.comm_stream = torch.cuda.Stream(device=device)
         # Threads and graph capture must use the same compute stream.
         self.capture_stream = torch.cuda.Stream(device=device)
@@ -374,7 +393,7 @@ class UBatchRunner:
             assert cg_mode == CUDAGraphMode.NONE and not for_capture
             ubatch_slices = create_whole_request_ubatch_slices(input_batch)
             token_counts = sync_ubatch_token_counts(
-                [s.num_tokens for s in ubatch_slices],
+                [max(1, s.num_tokens) for s in ubatch_slices],
                 self.parallel_config.data_parallel_size,
                 self.parallel_config.data_parallel_rank,
             )
@@ -387,10 +406,18 @@ class UBatchRunner:
             self.kv_cache_config,
         )
 
-        attn_metadata = []
-        slot_mappings_by_layer = []
+        attn_metadata: list[dict[str, Any] | None] = []
+        slot_mappings_by_layer: list[dict[str, torch.Tensor]] = []
         is_padding = []
         for i, ubatch_slice in enumerate(ubatch_slices):
+            if ubatch_slice.is_empty():
+                assert whole_requests
+                # Still execute MoE/AG/RS, but never give this padding token
+                # attention slots or recurrent state belonging to a request.
+                attn_metadata.append(None)
+                slot_mappings_by_layer.append({})
+                is_padding.append(self.empty_ubatch_is_padding)
+                continue
             ubatch = _slice_input_batch(
                 input_batch,
                 ubatch_slice,
@@ -441,7 +468,7 @@ class UBatchRunner:
     def _make_forward_contexts(
         self,
         ubatch_slices: UBatchSlices,
-        attn_metadata: list[dict[str, Any]],
+        attn_metadata: list[dict[str, Any] | None],
         slot_mappings_by_layer: list[dict[str, torch.Tensor]],
         is_padding: list[torch.Tensor | None],
         *,
@@ -457,7 +484,7 @@ class UBatchRunner:
         dp_size = self.parallel_config.data_parallel_size
         forward_contexts = []
         for i, ubatch_slice in enumerate(ubatch_slices):
-            num_tokens = ubatch_slice.num_tokens
+            num_tokens = max(1, ubatch_slice.num_tokens)
             num_tokens_across_dp = (
                 torch.full((dp_size,), num_tokens, dtype=torch.int32, device="cpu")
                 if token_counts is None
@@ -552,7 +579,9 @@ class UBatchRunner:
                 target=run_ubatch,
                 args=(
                     ubatch_context,
-                    slice_model_inputs(model_inputs, ubatch_slice.token_slice),
+                    make_empty_ubatch_inputs(model_inputs)
+                    if ubatch_slice.is_empty()
+                    else slice_model_inputs(model_inputs, ubatch_slice.token_slice),
                 ),
             )
             threads.append(thread)
@@ -575,7 +604,10 @@ class UBatchRunner:
                 raise RuntimeError(
                     f"Microbatch {failed} of {self.num_ubatches} failed"
                 ) from errors[failed]
-            return merge_ubatch_outputs([outputs[i] for i in range(self.num_ubatches)])
+            # Padding-only outputs must not reach sampling, MTP or ReplaySSM.
+            return merge_ubatch_outputs(
+                [outputs[i] for i, s in enumerate(ubatch_slices) if not s.is_empty()]
+            )
 
         self._pending_finish = finish
         return finish

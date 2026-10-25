@@ -112,16 +112,17 @@ def sync_cudagraph_and_dp_padding(
         )
         return synced_desc, None
 
+    whole_request_ag_rs = (
+        dbo_whole_requests
+        and parallel_config is not None
+        and parallel_config.all2all_backend == "allgather_reducescatter"
+    )
     if (
         dbo_stats is not None
         and parallel_config is not None
         and parallel_config.use_ubatching
     ):
-        dbo_stats.outcome = (
-            "insufficient_requests"
-            if dbo_whole_requests and int(num_reqs_across_dp.min()) < 2
-            else "rank_ineligible"
-        )
+        dbo_stats.outcome = "rank_ineligible"
 
     if torch.all(allow_ubatching_across_dp == 1):
         if dbo_stats is not None:
@@ -133,18 +134,25 @@ def sync_cudagraph_and_dp_padding(
         uniform_decode_across_dp = uniform_decode and torch.all(
             uniform_token_counts_across_dp == (uniform_token_count or 0)
         )
-        if check_ubatch_thresholds(
+        threshold_tokens = int(num_tokens_across_dp.min())
+        can_split = True
+        if whole_request_ag_rs:
+            # One-request and idle peers participate with a masked microbatch.
+            # At least one rank must have useful work in both microbatches.
+            splittable = num_reqs_across_dp >= 2
+            can_split = bool(splittable.any())
+            threshold_tokens = (
+                int(num_tokens_across_dp[splittable].max()) if can_split else 0
+            )
+            if not can_split and dbo_stats is not None:
+                dbo_stats.outcome = "insufficient_requests"
+        if can_split and check_ubatch_thresholds(
             parallel_config,
-            # Thresholds only grow with the token count, so holding the smallest
-            # rank to them holds every rank to them.
-            int(num_tokens_across_dp.min()),
+            threshold_tokens,
             uniform_decode=uniform_decode_across_dp,
         ):
             num_ubatches = get_num_ubatches(parallel_config)
-            if (
-                dbo_whole_requests
-                and parallel_config.all2all_backend == "allgather_reducescatter"
-            ):
+            if whole_request_ag_rs:
                 assert desired_batch_desc.cg_mode == CUDAGraphMode.NONE
                 # Whole-request eager AG/RS exchanges each microbatch's actual
                 # sizes in UBatchRunner.prepare(). Padding the full batch here

@@ -786,6 +786,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 hidden_states_B_C.transpose(0, 1).clone().transpose(0, 1)
             ).contiguous()
             hidden_states, _B, _C = self.split_hidden_states_B_C_fn(hidden_states_B_C)
+            # Empty DBO microbatches also take this state-free path. The custom
+            # op's caller consumes output, not the Python return value.
+            output.copy_(hidden_states)
             return hidden_states
 
         num_prefills = attn_metadata.num_prefills
