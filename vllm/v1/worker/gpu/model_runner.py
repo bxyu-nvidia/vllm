@@ -2094,7 +2094,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if ubatch_state is not None:
                     assert self.ubatch_runner is not None
                     if dbo_stats is not None:
-                        dbo_timing = self.ubatch_runner.create_timing()
+                        dbo_timing = self.ubatch_runner.create_timing(
+                            input_batch=input_batch, ubatch_state=ubatch_state
+                        )
                     model_output = self.ubatch_runner.run(
                         self.model, model_inputs, ubatch_state, timing=dbo_timing
                     )

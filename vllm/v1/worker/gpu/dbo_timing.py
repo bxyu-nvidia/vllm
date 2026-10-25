@@ -2,7 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUDA-event timing of eager AG/RS DBO stream windows."""
 
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.dbo_trace import DBOTrace
 
 from vllm.v1.metrics.dbo import DBOTimingStats
 
@@ -53,7 +58,8 @@ class DBOTimingEvents:
     This recorder is attached only to the eager AG/RS handoff protocol.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, trace: "DBOTrace | None" = None) -> None:
+        self.trace = trace
         self._active: dict[int, tuple[str, torch.Stream, torch.Event]] = {}
         self._intervals: dict[str, list[tuple[torch.Event, torch.Event]]] = {
             "compute": [],
@@ -68,12 +74,16 @@ class DBOTimingEvents:
         if self._origin is None:
             self._origin = event
         self._active[ubatch] = (phase, stream, event)
+        if self.trace is not None:
+            self.trace.start(ubatch, phase, event)
 
     def stop(self, ubatch: int) -> None:
         phase, stream, start = self._active.pop(ubatch)
         end = torch.Event(enable_timing=True)
         end.record(stream)
         self._intervals[phase].append((start, end))
+        if self.trace is not None:
+            self.trace.stop(ubatch, end)
 
     def resolve(self) -> DBOTimingStats:
         """Read completed events; never synchronize or wait for GPU work here."""
@@ -90,4 +100,7 @@ class DBOTimingEvents:
             ]
             for phase, spans in self._intervals.items()
         }
+        if self.trace is not None:
+            self.trace.resolve(origin)
+            self.trace = None
         return summarize_dbo_timing(intervals["compute"], intervals["comm"])

@@ -11,6 +11,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_dcp_group
 from vllm.forward_context import (
@@ -26,6 +27,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.dbo_timing import DBOTimingEvents
+from vllm.v1.worker.gpu.dbo_trace import DBOTraceWriter
 from vllm.v1.worker.gpu.dp_utils import sync_ubatch_token_counts
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -342,6 +344,7 @@ class UBatchRunner:
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_size > 1 else 0
         self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         self.device = device
+        self._dbo_trace_writer: DBOTraceWriter | None = None
         self.model_state = model_state
         self.attn_groups = attn_groups
         self.kv_cache_config = kv_cache_config
@@ -505,14 +508,31 @@ class UBatchRunner:
             )
         return forward_contexts
 
-    def create_timing(self) -> DBOTimingEvents | None:
+    def create_timing(
+        self,
+        *,
+        input_batch: InputBatch | None = None,
+        ubatch_state: UBatchState | None = None,
+    ) -> DBOTimingEvents | None:
         """Time every eligible forward; callers exclude dummy/profile steps."""
         if (
             not self.vllm_config.observability_config.enable_dbo_metrics
             or self.parallel_config.all2all_backend != "allgather_reducescatter"
         ):
             return None
-        return DBOTimingEvents()
+        trace = None
+        if envs.VLLM_DBO_TRACE_DIR:
+            assert input_batch is not None and ubatch_state is not None
+            if self._dbo_trace_writer is None:
+                self._dbo_trace_writer = DBOTraceWriter(
+                    envs.VLLM_DBO_TRACE_DIR,
+                    dp_rank=self.parallel_config.data_parallel_rank,
+                    device_index=self.device.index,
+                )
+            trace = self._dbo_trace_writer.new_trace(
+                input_batch, ubatch_state.slices, ubatch_state.forward_contexts
+            )
+        return DBOTimingEvents(trace=trace)
 
     def run(
         self,

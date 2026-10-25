@@ -1363,3 +1363,173 @@ def test_dbo_timing_excludes_dependency_waits_and_parked_threads(monkeypatch, ha
     assert result.comm_seconds == pytest.approx(0.003)
     assert result.overlap_seconds == 0
     assert result.wall_seconds > 2  # Waits remain visible in wall time only.
+
+
+@pytest.mark.parametrize(
+    "queries,prefixes,ranges,expected",
+    [
+        (
+            [4, 8],
+            [100, 200],
+            [(0, 4, 0, 1), (4, 12, 1, 2)],
+            [([4], [100], 410, 0), ([8], [200], 1636, 0)],
+        ),
+        (
+            [8],
+            [100],
+            [(0, 3, 0, 1), (3, 10, 0, 1)],
+            [([3], [100], 306, 0), ([5], [103], 530, 2)],
+        ),
+        (
+            [8],
+            [100],
+            [(0, 8, 0, 1), (8, 8, 1, 1)],
+            [([8], [100], 836, 0), ([], [], 0, 1)],
+        ),
+        ([], [], [(0, 0, 0, 0), (0, 0, 0, 0)], [([], [], 0, 1), ([], [], 0, 1)]),
+    ],
+)
+def test_dbo_trace_workload_preserves_context_and_excludes_padding(
+    queries, prefixes, ranges, expected
+):
+    from vllm.v1.worker.gpu.dbo_trace import microbatch_workloads
+
+    batch = SimpleNamespace(
+        num_reqs=len(queries),
+        num_tokens=sum(queries),
+        query_start_loc_np=np.cumsum([0, *queries]),
+        num_computed_tokens_np=np.array(prefixes),
+    )
+    slices = [
+        UBatchSlice(request_slice=slice(c, d), token_slice=slice(a, b))
+        for a, b, c, d in ranges
+    ]
+    contexts = [SimpleNamespace(dp_metadata=None) for _ in slices]
+    workloads = microbatch_workloads(batch, slices, contexts)
+    # These CPU arrays are reused by the runner before async output resolves.
+    batch.num_computed_tokens_np.fill(0)
+    batch.query_start_loc_np.fill(0)
+    assert [
+        (
+            w["query_lens"],
+            w["prefix_lens_cpu"],
+            w["causal_attention_pairs_cpu"],
+            w["padding_tokens"],
+        )
+        for w in workloads
+    ] == expected
+    assert sum(w["query_tokens"] for w in workloads) == sum(queries)
+
+
+def test_dbo_trace_reuses_events_and_preserves_microbatch_window_identity(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from vllm.v1.worker.gpu.dbo_timing import DBOTimingEvents
+    from vllm.v1.worker.gpu.dbo_trace import DBOTraceWriter
+
+    clock, events, nvtx = [0.0], [], []
+
+    class Event:
+        def __init__(self, **kwargs):
+            events.append(self)
+
+        def record(self, stream):
+            self.time = clock[0]
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, other):
+            return other.time - self.time
+
+        def synchronize(self):
+            pytest.fail("Tracing must not synchronize")
+
+    monkeypatch.setattr(torch, "Event", Event)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda s: nvtx.append(s))
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: nvtx.append("pop"))
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_tokens=12,
+        query_start_loc_np=np.array([0, 4, 12]),
+        num_computed_tokens_np=np.array([100, 200]),
+    )
+    slices = [
+        UBatchSlice(request_slice=slice(0, 1), token_slice=slice(0, 4)),
+        UBatchSlice(request_slice=slice(1, 2), token_slice=slice(4, 12)),
+    ]
+    counts = torch.tensor([4, 12])
+    contexts = [
+        SimpleNamespace(dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=counts))
+        for _ in slices
+    ]
+    writer = DBOTraceWriter(str(tmp_path), dp_rank=2, device_index=0)
+    trace = writer.new_trace(batch, slices, contexts)
+    counts.fill_(99)
+    timing = DBOTimingEvents(trace=trace)
+    for ubatch, phase, start, end in [
+        (0, "compute", 0, 2),
+        (0, "comm", 2, 7),
+        (1, "compute", 3, 6),
+        (1, "comm", 7, 8),
+    ]:
+        clock[0] = start
+        timing.start(ubatch, phase, phase)
+        clock[0] = end
+        timing.stop(ubatch)
+    result = timing.resolve()
+    assert len(events) == 8  # Two existing events per span; none added by trace.
+    lines = next(tmp_path.glob("*.jsonl")).read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["dp_rank"] == 2 and record["step"] == 0
+    assert [w["dp_padded_tokens"] for w in record["microbatches"]] == [[4, 12]] * 2
+    assert [w["compute_seconds"] for w in record["microbatches"]] == pytest.approx(
+        [0.002, 0.003]
+    )
+    assert [w["comm_seconds"] for w in record["microbatches"]] == pytest.approx(
+        [0.005, 0.001]
+    )
+    comm = [w for w in record["windows"] if w["phase"] == "comm"]
+    assert [w["gpu_start_offset_seconds"] for w in comm] == pytest.approx(
+        [0.002, 0.007]
+    )
+    assert [w["microbatch"] for w in comm] == [0, 1]
+    assert all(w["ordinal"] == 0 for w in comm)
+    assert all(w["host_end_monotonic_ns"] >= w["host_start_monotonic_ns"] for w in comm)
+    assert result.compute_seconds == pytest.approx(0.005)
+    assert result.overlap_seconds == pytest.approx(0.003)
+    assert nvtx[0] == "dbo:step=0:dp=2:ubatch=0:compute=0"
+    assert nvtx.count("pop") == 4
+    # Resolution is idempotent with respect to trace output.
+    timing.resolve()
+    assert len(next(tmp_path.glob("*.jsonl")).read_text().splitlines()) == 1
+    writer.close()
+
+
+def test_dbo_trace_io_failure_disables_diagnostics(tmp_path):
+    from vllm.v1.worker.gpu.dbo_trace import DBOTraceWriter
+
+    occupied = tmp_path / "file"
+    occupied.write_text("not a directory")
+    writer = DBOTraceWriter(str(occupied), dp_rank=0, device_index=0)
+    assert writer.new_trace(None, [], []) is None
+
+
+@pytest.mark.parametrize(
+    "metrics,backend",
+    [(False, "allgather_reducescatter"), (True, "deepep_high_throughput")],
+)
+def test_dbo_trace_requires_metrics_and_eligible_backend(
+    monkeypatch, tmp_path, metrics, backend
+):
+    monkeypatch.setenv("VLLM_DBO_TRACE_DIR", str(tmp_path / "not-created"))
+    runner = object.__new__(UBatchRunner)
+    runner.vllm_config = SimpleNamespace(
+        observability_config=SimpleNamespace(enable_dbo_metrics=metrics)
+    )
+    runner.parallel_config = SimpleNamespace(all2all_backend=backend)
+    assert runner.create_timing() is None
+    assert not (tmp_path / "not-created").exists()

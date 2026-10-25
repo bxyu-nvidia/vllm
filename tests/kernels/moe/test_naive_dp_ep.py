@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """AG/RS monolithic DBO: stream ownership and concurrent collective correctness."""
 
+import json
+import tempfile
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
@@ -20,6 +23,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep as naive
 from vllm.v1.worker.gpu import dp_utils
 from vllm.v1.worker.gpu.dbo_timing import DBOTimingEvents
+from vllm.v1.worker.gpu.dbo_trace import DBOTraceWriter
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.ubatch_utils import create_whole_request_ubatch_slices
 from vllm.v1.worker.ubatching import make_ubatch_contexts
@@ -154,6 +158,7 @@ def _ag_rs_dbo_worker(
                     num_reqs=len(local_queries),
                     num_reqs_after_padding=desc.num_reqs,
                     num_tokens=local_tokens,
+                    num_computed_tokens_np=np.zeros(len(local_queries), dtype=np.int64),
                     num_tokens_after_padding=desc.num_tokens,
                     query_start_loc_np=np.cumsum([0, *local_queries], dtype=np.int32),
                 ),
@@ -203,7 +208,16 @@ def _ag_rs_dbo_worker(
             ],
             barrier,
         )
-        timing = DBOTimingEvents() if query_lens is not None else None
+        timing = None
+        if query_lens is not None:
+            trace_dir = tempfile.TemporaryDirectory()
+            writer = DBOTraceWriter(
+                trace_dir.name, dp_rank=pgi.rank, device_index=pgi.device.index
+            )
+            trace = writer.new_trace(
+                batch, slices, [ctx.forward_context for ctx in contexts]
+            )
+            timing = DBOTimingEvents(trace=trace)
         for context in contexts:
             context.dbo_timing = timing
         outputs, errors = {}, []
@@ -248,6 +262,27 @@ def _ag_rs_dbo_worker(
         torch.accelerator.synchronize()
         if timing is not None:
             measured = timing.resolve()
+            writer.close()
+            record = json.loads(next(Path(trace_dir.name).glob("*.jsonl")).read_text())
+            assert record["dp_rank"] == pgi.rank
+            assert (
+                sum(w["query_tokens"] for w in record["microbatches"]) == local_tokens
+            )
+            for index in range(2):
+                windows = [
+                    w
+                    for w in record["windows"]
+                    if w["microbatch"] == index and w["phase"] == "comm"
+                ]
+                assert [w["ordinal"] for w in windows] == list(range(16))
+                assert all(
+                    w["gpu_end_offset_seconds"] >= w["gpu_start_offset_seconds"]
+                    for w in windows
+                )
+            assert sum(
+                w["compute_seconds"] for w in record["microbatches"]
+            ) == pytest.approx(measured.compute_seconds, abs=1e-6)
+            trace_dir.cleanup()
             assert measured.compute_seconds > 0 and measured.comm_seconds > 0
             assert (
                 0

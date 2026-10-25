@@ -85,7 +85,9 @@ class ObservabilityConfig:
     events, exported with normal stats at the existing logging/scrape cadence.
     Excludes dummy, profiling, draft and CUDA graph timings; requires log stats.
     Timing measures stream windows, not kernel utilization or DBO speedup, and
-    adds event-recording overhead. Disabled by default."""
+    adds event-recording overhead. Set VLLM_DBO_TRACE_DIR to also write per-forward
+    microbatch workload and stream-window diagnostics with NVTX correlation.
+    Disabled by default."""
 
     cudagraph_metrics: bool = False
     """Enable CUDA graph metrics (number of padded/unpadded tokens, runtime cudagraph
