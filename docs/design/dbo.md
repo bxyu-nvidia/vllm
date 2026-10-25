@@ -86,3 +86,50 @@ The `dbo_register_recv_hook` method registers a callback that can be returned by
 The `dbo_maybe_run_recv_hook` method runs a callback that’s set by the `dbo_register_recv_hook` function if that callback exists.
 
 The `dbo_yield` method puts the current thread to sleep and wakes up the other UBatch thread.
+
+## Overlap metrics for eager V2 AG/RS
+
+With the V2 runner and `allgather_reducescatter`, enable counters and per-forward
+CUDA-event timing using:
+
+```bash
+--enable-dbo-metrics
+```
+
+Timing is disabled by default. With DBO metrics enabled, every eligible forward
+contributes timings to the same metrics stream as the execution counters.
+The existing logging/scrape cadence controls publication; there is no separate
+sampling interval. Only real, eager DBO target forwards are eligible; dummy,
+profiling, draft and CUDA graph forwards are excluded. Normal stats logging must
+be enabled.
+
+The Python and Rust frontends expose per-engine histograms:
+
+* `vllm:dbo_compute_seconds`: union of compute-stream windows.
+* `vllm:dbo_comm_seconds`: union of AG/RS communication-stream windows.
+* `vllm:dbo_overlap_seconds`: intersection of those two unions.
+* `vllm:dbo_wall_seconds`: first window start to last window end.
+
+Windows start after explicit handoff dependency waits and end before yields or
+waits. CUDA events are resolved after the existing output-copy completion wait;
+timing adds no extra GPU synchronization. Recording events adds overhead to each
+eligible forward when DBO metrics are enabled.
+These are stream-window estimates: CPU launch gaps and waiting for collective
+peers can remain inside windows. They do not measure SM utilization, exact kernel
+concurrency, or the speedup caused by DBO. Use a GPU profiler for kernel-level
+confirmation.
+
+For the measured fraction of communication overlapped by compute, use:
+
+```promql
+sum(rate(vllm:dbo_overlap_seconds_sum[5m]))
+/
+sum(rate(vllm:dbo_comm_seconds_sum[5m]))
+```
+
+Divide by `dbo_compute_seconds_sum` instead for the fraction of compute overlapped
+by communication. Use `sum by (engine, instance)` to inspect individual ranks.
+Histogram counts report the number of measured forwards; no eligible forwards
+means no overlap observation. These timings exclude unsplit and dummy steps and
+therefore do not represent total rollout time. Rebuild the Rust frontend when
+using these fields with `VLLM_USE_RUST_FRONTEND=1`.

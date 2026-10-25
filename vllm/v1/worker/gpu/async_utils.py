@@ -21,6 +21,7 @@ from vllm.v1.worker.utils import raise_if_nan_logits
 
 if TYPE_CHECKING:
     from vllm.distributed.aux_output_connector.worker import PendingAuxOutput
+    from vllm.v1.worker.gpu.dbo_timing import DBOTimingEvents
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
@@ -122,11 +123,14 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool,
         pending_aux_output: "PendingAuxOutput | None",
+        *,
+        dbo_timing: "DBOTimingEvents | None" = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
         # the one where the tensors were created.
         self.model_runner_output = model_runner_output
+        self.dbo_timing = dbo_timing
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
@@ -172,6 +176,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
+        if self.dbo_timing is not None:
+            assert self.model_runner_output.dbo_stats is not None
+            self.model_runner_output.dbo_stats.timing = self.dbo_timing.resolve()
+            self.dbo_timing = None
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
@@ -225,8 +233,11 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         finished_mask: list[bool],
         main_stream: torch.cuda.Stream,
         copy_stream: torch.cuda.Stream,
+        *,
+        dbo_timing: "DBOTimingEvents | None" = None,
     ):
         self.model_runner_output = model_runner_output
+        self.dbo_timing = dbo_timing
         self.pooler_output = pooler_output
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
@@ -257,6 +268,10 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         else:
             pooler_output = self.pooler_output_cpu
         self.copy_event.synchronize()
+        if self.dbo_timing is not None:
+            assert self.model_runner_output.dbo_stats is not None
+            self.model_runner_output.dbo_stats.timing = self.dbo_timing.resolve()
+            self.dbo_timing = None
         self.model_runner_output.pooler_output = pooler_output
         return self.model_runner_output
 

@@ -110,6 +110,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
 )
+from vllm.v1.worker.gpu.dbo_timing import DBOTimingEvents
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -2057,6 +2058,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        dbo_timing = None
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2091,8 +2093,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_connector.pre_forward(scheduler_output, input_batch)
                 if ubatch_state is not None:
                     assert self.ubatch_runner is not None
+                    if dbo_stats is not None:
+                        dbo_timing = self.ubatch_runner.create_timing()
                     model_output = self.ubatch_runner.run(
-                        self.model, model_inputs, ubatch_state
+                        self.model, model_inputs, ubatch_state, timing=dbo_timing
                     )
                 elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable
@@ -2152,6 +2156,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ec_connector_output=ec_connector_output,
             cudagraph_stats=cudagraph_stats,
             dbo_stats=dbo_stats,
+            dbo_timing=dbo_timing,
             num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
 
@@ -2183,6 +2188,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         dbo_stats = self.execute_model_state.dbo_stats
+        dbo_timing = self.execute_model_state.dbo_timing
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
         self.execute_model_state = None
 
@@ -2272,6 +2278,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             copy_stream=self.output_copy_stream,
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
+            dbo_timing=dbo_timing,
         )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -2387,6 +2394,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         dbo_stats = self.execute_model_state.dbo_stats
+        dbo_timing = self.execute_model_state.dbo_timing
         self.execute_model_state = None
 
         # Post-step KV connector related operations.
@@ -2413,6 +2421,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         async_output = AsyncPoolingOutput(
             model_runner_output=model_runner_output,
             pooler_output=pooler_output,
+            dbo_timing=dbo_timing,
             finished_mask=finished_mask,
             main_stream=self.main_stream,
             copy_stream=self.output_copy_stream,
@@ -2509,6 +2518,7 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
     num_spec_tokens_to_schedule: int
     dbo_stats: DBOStats | None = None
+    dbo_timing: DBOTimingEvents | None = None
 
 
 class BatchReqState(NamedTuple):

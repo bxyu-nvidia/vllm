@@ -19,6 +19,7 @@ from vllm.forward_context import DPMetadata, ForwardContext
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep as naive
 from vllm.v1.worker.gpu import dp_utils
+from vllm.v1.worker.gpu.dbo_timing import DBOTimingEvents
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.ubatch_utils import create_whole_request_ubatch_slices
 from vllm.v1.worker.ubatching import make_ubatch_contexts
@@ -202,6 +203,9 @@ def _ag_rs_dbo_worker(
             ],
             barrier,
         )
+        timing = DBOTimingEvents() if query_lens is not None else None
+        for context in contexts:
+            context.dbo_timing = timing
         outputs, errors = {}, []
 
         def run(index):
@@ -242,6 +246,18 @@ def _ag_rs_dbo_worker(
         if errors:
             raise errors[0]
         torch.accelerator.synchronize()
+        if timing is not None:
+            measured = timing.resolve()
+            assert measured.compute_seconds > 0 and measured.comm_seconds > 0
+            assert (
+                0
+                <= measured.overlap_seconds
+                <= min(measured.compute_seconds, measured.comm_seconds) + 1e-6
+            )
+            assert (
+                measured.wall_seconds
+                >= max(measured.compute_seconds, measured.comm_seconds) - 1e-6
+            )
         factor = sum(range(1, pgi.world_size + 1))
         for (index, iteration), output in outputs.items():
             expected = torch.full_like(

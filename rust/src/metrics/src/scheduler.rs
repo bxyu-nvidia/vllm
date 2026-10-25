@@ -349,6 +349,11 @@ pub struct DboMicrobatchLabels {
 }
 
 pub type DboHistogramFamily = Family<DboMicrobatchLabels, Histogram, fn() -> Histogram>;
+pub type DboTimingHistogramFamily = Family<EngineLabels, Histogram, fn() -> Histogram>;
+
+fn dbo_timing_histogram() -> Histogram {
+    Histogram::new([0., 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1., 5., 10., 30.])
+}
 
 fn dbo_token_histogram() -> Histogram {
     Histogram::new(
@@ -369,6 +374,7 @@ pub struct SchedulerMetrics {
     pub dbo_microbatch_tokens: DboHistogramFamily,
     pub dbo_microbatch_requests: DboHistogramFamily,
     pub dbo_microbatch_padding_tokens: DboHistogramFamily,
+    pub dbo_timing: BTreeMap<&'static str, DboTimingHistogramFamily>,
     pub prefill_batching: BTreeMap<&'static str, Family<EngineLabels, U64Counter>>,
     pub prefill_underfilled_batches_by_reason: Family<WaitingReasonLabels, U64Counter>,
     pub prefill_outcomes: BTreeMap<&'static str, Family<PrefillOutcomeLabels, U64Counter>>,
@@ -455,6 +461,19 @@ impl SchedulerMetrics {
                 family.clone(),
             );
         }
+        let dbo_timing = ["compute", "comm", "overlap", "wall"]
+            .into_iter()
+            .map(|phase| {
+                let family =
+                    Family::new_with_constructor(dbo_timing_histogram as fn() -> Histogram);
+                registry.register(
+                    format!("vllm:dbo_{phase}_seconds"),
+                    format!("Measured eager AG/RS DBO {phase} CUDA stream-window seconds"),
+                    family.clone(),
+                );
+                (phase, family)
+            })
+            .collect();
         let prefill_batching = PREFILL_BATCH_COUNTER_FIELDS
             .into_iter()
             .map(|field| {
@@ -765,6 +784,7 @@ impl SchedulerMetrics {
             dbo_microbatch_tokens,
             dbo_microbatch_requests,
             dbo_microbatch_padding_tokens,
+            dbo_timing,
             prefill_batching,
             prefill_delays,
             prefill_outcomes,

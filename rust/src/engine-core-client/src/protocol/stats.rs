@@ -13,6 +13,17 @@ pub struct DboStats {
     pub microbatch_tokens: Vec<u64>,
     pub microbatch_requests: Vec<u64>,
     pub microbatch_padding_tokens: Vec<u64>,
+    pub timing: Option<DboTimingStats>,
+}
+
+/// CUDA-event stream-window estimates for an eligible eager AG/RS DBO forward.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DboTimingStats {
+    pub compute_seconds: f64,
+    pub comm_seconds: f64,
+    pub overlap_seconds: f64,
+    pub wall_seconds: f64,
 }
 
 /// Stores cache hit statistics.

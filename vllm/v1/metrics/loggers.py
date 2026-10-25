@@ -31,7 +31,12 @@ from vllm.v1.metrics.batching import (
 )
 from vllm.v1.metrics.buckets import histogram_buckets
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
-from vllm.v1.metrics.dbo import DBO_REQUEST_BUCKETS, DBO_TOKEN_BUCKETS
+from vllm.v1.metrics.dbo import (
+    DBO_REQUEST_BUCKETS,
+    DBO_TIMING_BUCKETS,
+    DBO_TIMING_FIELDS,
+    DBO_TOKEN_BUCKETS,
+)
 from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
@@ -515,6 +520,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
         self.dbo_steps = None
         self.dbo_sizes = {}
+        self.dbo_timing = {}
         if vllm_config.observability_config.enable_dbo_metrics:
             self.dbo_steps = self._counter_cls(
                 name="vllm:dbo_steps_total",
@@ -533,6 +539,16 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     ),
                     labelnames=labelnames + ["microbatch"],
                     buckets=buckets,
+                )
+
+            for phase in DBO_TIMING_FIELDS:
+                self.dbo_timing[phase] = self._histogram_cls(
+                    name=f"vllm:dbo_{phase}_seconds",
+                    documentation=(
+                        f"Measured AG/RS DBO {phase} CUDA stream-window seconds."
+                    ),
+                    labelnames=labelnames,
+                    buckets=DBO_TIMING_BUCKETS,
                 )
 
         # Sums/counts preserve interval averages across DP engines and scrapes.
@@ -1259,6 +1275,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 for name, histogram in self.dbo_sizes.items():
                     for index, size in enumerate(getattr(dbo, f"microbatch_{name}")):
                         histogram.labels(*labels, str(index)).observe(size)
+                if dbo.timing is not None:
+                    for phase, histogram in self.dbo_timing.items():
+                        histogram.labels(*labels).observe(
+                            getattr(dbo.timing, f"{phase}_seconds")
+                        )
             if (batching := scheduler_stats.prefill_batching_stats) is not None:
                 for name, counters in self.prefill_batch_counters.items():
                     counters[engine_idx].inc(getattr(batching, name))

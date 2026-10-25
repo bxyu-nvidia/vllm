@@ -25,6 +25,7 @@ from vllm.utils.torch_utils import current_stream
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+from vllm.v1.worker.gpu.dbo_timing import DBOTimingEvents
 from vllm.v1.worker.gpu.dp_utils import sync_ubatch_token_counts
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -504,13 +505,26 @@ class UBatchRunner:
             )
         return forward_contexts
 
+    def create_timing(self) -> DBOTimingEvents | None:
+        """Time every eligible forward; callers exclude dummy/profile steps."""
+        if (
+            not self.vllm_config.observability_config.enable_dbo_metrics
+            or self.parallel_config.all2all_backend != "allgather_reducescatter"
+        ):
+            return None
+        return DBOTimingEvents()
+
     def run(
         self,
         model: Any,
         model_inputs: dict[str, Any],
         ubatch_state: UBatchState,
+        *,
+        timing: DBOTimingEvents | None = None,
     ) -> Any:
-        finish = self.begin_capturable_run(model, model_inputs, ubatch_state)
+        finish = self.begin_capturable_run(
+            model, model_inputs, ubatch_state, timing=timing
+        )
         return finish()
 
     def begin_capturable_run(
@@ -519,6 +533,8 @@ class UBatchRunner:
         model_inputs: dict[str, Any],
         ubatch_state: UBatchState,
         for_capture: bool = False,
+        *,
+        timing: DBOTimingEvents | None = None,
     ) -> Callable[[], Any]:
         """Start microbatch threads and return a callback to run and join them.
 
@@ -541,6 +557,10 @@ class UBatchRunner:
             forward_contexts=ubatch_state.forward_contexts,
             ready_barrier=self.ready_barrier,
         )
+
+        assert not for_capture or timing is None
+        for context in ubatch_contexts:
+            context.dbo_timing = timing
 
         outputs: dict[int, Any] = {}
         errors: dict[int, BaseException] = {}

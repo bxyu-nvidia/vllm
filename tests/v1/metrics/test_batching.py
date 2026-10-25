@@ -17,7 +17,7 @@ from vllm.v1.metrics.batching import (
     UNDERFILL_REASONS,
     PrefillBatchingStats,
 )
-from vllm.v1.metrics.dbo import DBOStats
+from vllm.v1.metrics.dbo import DBOStats, DBOTimingStats
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import SchedulerStats
@@ -235,10 +235,10 @@ def test_outcome_averages_have_separate_idle_full_and_underfilled_denominators()
 
 def test_dbo_flag_is_opt_in():
     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
-    assert not EngineArgs.from_cli_args(parser.parse_args([])).enable_dbo_metrics
-    assert EngineArgs.from_cli_args(
-        parser.parse_args(["--enable-dbo-metrics"])
-    ).enable_dbo_metrics
+    args = EngineArgs.from_cli_args(parser.parse_args([]))
+    assert not args.enable_dbo_metrics
+    args = EngineArgs.from_cli_args(parser.parse_args(["--enable-dbo-metrics"]))
+    assert args.create_observability_config().enable_dbo_metrics
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -248,7 +248,9 @@ def test_dbo_metrics_export_per_engine_without_counting_empty_updates(
     GPT2Config(architectures=["GPT2LMHeadModel"]).save_pretrained(tmp_path)
     config = VllmConfig(
         model_config=ModelConfig(model=str(tmp_path)),
-        observability_config=ObservabilityConfig(enable_dbo_metrics=enabled),
+        observability_config=ObservabilityConfig(
+            enable_dbo_metrics=enabled,
+        ),
     )
     try:
         logger = PrometheusStatLogger(config, engine_indexes=[0, 1])
@@ -258,6 +260,7 @@ def test_dbo_metrics_export_per_engine_without_counting_empty_updates(
                 microbatch_tokens=[9, 9],
                 microbatch_requests=[1, 1],
                 microbatch_padding_tokens=[0, 6],
+                timing=DBOTimingStats(2.0, 1.0, 0.5, 3.0),
             )
         )
         # Exercise Python's nested dataclass MessagePack transport.
@@ -291,6 +294,10 @@ def test_dbo_metrics_export_per_engine_without_counting_empty_updates(
                 == {"model_name": str(tmp_path), "engine": str(engine), **labels}
             ]
 
+        for phase, total in (("compute", 4), ("comm", 2), ("overlap", 1), ("wall", 6)):
+            assert value(f"{phase}_seconds_sum", 0) == [total]
+            assert value(f"{phase}_seconds_count", 0) == [2]
+            assert value(f"{phase}_seconds_count", 1) == []
         assert value("steps_total", 0, outcome="executed") == [2]
         assert value("steps_total", 1, outcome="disabled") == [1]
         assert value("microbatch_tokens_sum", 0, microbatch="0") == [18]

@@ -1269,3 +1269,97 @@ def test_empty_microbatch_participates_in_handoffs_but_not_merged_output(aux_out
     else:
         torch.testing.assert_close(result, expected)
     assert trace == [("enter", 0), ("enter", 1), ("exit", 0), ("exit", 1)]
+
+
+@pytest.mark.parametrize(
+    "compute,comm,expected",
+    [
+        ([], [], (0, 0, 0, 0)),
+        ([(0, 2)], [(2, 4)], (2, 2, 0, 4)),
+        ([(0, 4)], [(1, 3)], (4, 2, 2, 4)),
+        ([(0, 3), (2, 5)], [(1, 2), (4, 6)], (5, 3, 2, 6)),
+        ([(5, 7), (0, 2)], [(1, 6)], (4, 5, 2, 7)),
+    ],
+)
+def test_dbo_timing_unions_windows_before_intersection(compute, comm, expected):
+    from dataclasses import astuple
+
+    from vllm.v1.worker.gpu.dbo_timing import summarize_dbo_timing
+
+    assert astuple(summarize_dbo_timing(compute, comm)) == expected
+
+
+@pytest.mark.parametrize(
+    "enabled,backend,expected",
+    [
+        (False, "allgather_reducescatter", [False] * 5),
+        (True, "allgather_reducescatter", [True] * 5),
+        (True, "deepep_low_latency", [False] * 5),
+    ],
+)
+def test_overlap_timing_covers_every_eligible_forward_when_enabled(
+    enabled, backend, expected
+):
+    runner = object.__new__(UBatchRunner)
+    runner.vllm_config = SimpleNamespace(
+        observability_config=SimpleNamespace(
+            enable_dbo_metrics=enabled,
+        )
+    )
+    runner.parallel_config = SimpleNamespace(all2all_backend=backend)
+    with patch.object(torch, "Event", side_effect=AssertionError("unneeded event")):
+        assert [runner.create_timing() is not None for _ in range(5)] == expected
+
+
+@pytest.mark.parametrize(
+    "handoff",
+    [
+        "switch_to_compute_sync",
+        "yield_and_switch_from_comm_to_compute",
+    ],
+)
+def test_dbo_timing_excludes_dependency_waits_and_parked_threads(monkeypatch, handoff):
+    from vllm.v1.worker import ubatching
+    from vllm.v1.worker.gpu.dbo_timing import DBOTimingEvents
+
+    clock = [0.0]
+
+    class Event:
+        def __init__(self, **kwargs):
+            self.time = 0.0
+
+        def record(self, stream):
+            self.time = clock[0]
+
+        def query(self):
+            return True
+
+        def elapsed_time(self, other):
+            return other.time - self.time
+
+    monkeypatch.setattr(torch, "Event", Event)
+    ctx = object.__new__(ubatching.UBatchContext)
+    ctx.id = 0
+    ctx.compute_stream, ctx.comm_stream = "compute", "comm"
+    ctx.current_stream = "compute"
+    ctx.dbo_timing = DBOTimingEvents()
+    ctx.update_stream = lambda stream: setattr(ctx, "current_stream", stream)
+    ctx._signal_compute_done = ctx._signal_comm_done = lambda: None
+
+    def wait():
+        clock[0] += 1000
+
+    ctx._wait_compute_done = ctx._wait_comm_done = ctx._cpu_yield = wait
+    monkeypatch.setattr(ubatching, "current_stream", lambda: ctx.current_stream)
+    ctx.dbo_timing.start(0, "compute", ctx.compute_stream)
+    clock[0] += 2
+    ctx.switch_to_comm_sync()
+    clock[0] += 3
+    getattr(ctx, handoff)()
+    clock[0] += 4
+    ctx.dbo_timing.stop(0)
+    result = ctx.dbo_timing.resolve()
+    assert result.compute_seconds == pytest.approx(0.006)
+    assert result.comm_seconds == pytest.approx(0.003)
+    assert result.overlap_seconds == 0
+    assert result.wall_seconds > 2  # Waits remain visible in wall time only.

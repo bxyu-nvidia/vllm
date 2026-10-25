@@ -81,8 +81,11 @@ class ObservabilityConfig:
 
     enable_dbo_metrics: bool = False
     """Collect V2 DBO execution/fallback counters and per-engine microbatch size
-    histograms. Excludes dummy, profiling, and draft forwards; requires log stats.
-    Measures dispatch/execution, not GPU overlap duration. Disabled by default."""
+    histograms. Also time every eligible eager AG/RS target forward with CUDA
+    events, exported with normal stats at the existing logging/scrape cadence.
+    Excludes dummy, profiling, draft and CUDA graph timings; requires log stats.
+    Timing measures stream windows, not kernel utilization or DBO speedup, and
+    adds event-recording overhead. Disabled by default."""
 
     cudagraph_metrics: bool = False
     """Enable CUDA graph metrics (number of padded/unpadded tokens, runtime cudagraph

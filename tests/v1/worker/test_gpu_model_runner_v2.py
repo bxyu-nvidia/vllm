@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -625,6 +626,7 @@ def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
         return torch.arange(18).reshape(18, 1)
 
     if microbatched:
+        runner.ubatch_runner.create_timing.return_value = None
         runner.ubatch_runner.prepare.side_effect = (
             lambda batch, *args, **kwargs: SimpleNamespace(
                 slices=create_whole_request_ubatch_slices(batch)
@@ -665,6 +667,10 @@ def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
     GPUModelRunner.execute_model(runner, output, dummy_run=dummy_run)
 
     state = runner.execute_model_state
+    if microbatched:
+        assert runner.ubatch_runner.create_timing.call_count == int(
+            collect_metrics and not dummy_run
+        )
     if collect_metrics and not dummy_run:
         assert state.dbo_stats is not None
         assert state.dbo_stats.outcome == ("executed" if microbatched else "disabled")
@@ -692,3 +698,34 @@ def test_mtp_metadata_is_full_batch_and_rebuilt_after_dbo_join(
         assert state.slot_mappings_by_layer is full_slots
     assert state.dp_sync_state is sync
     torch.testing.assert_close(state.hidden_states, torch.arange(18).reshape(18, 1))
+
+
+@pytest.mark.parametrize("pooling", [False, True])
+def test_dbo_timing_resolves_after_existing_output_copy_wait(pooling):
+    from vllm.v1.metrics.dbo import DBOStats, DBOTimingStats
+    from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
+
+    output = object.__new__(AsyncPoolingOutput if pooling else AsyncOutput)
+    output.model_runner_output = SimpleNamespace(dbo_stats=DBOStats("executed"))
+    waited = []
+    output.copy_event = Mock()
+    output.copy_event.synchronize.side_effect = lambda: waited.append(True)
+    expected = DBOTimingStats(2, 1, 0.5, 3)
+
+    def resolve():
+        assert waited == [True]
+        return expected
+
+    output.dbo_timing = Mock(resolve=resolve)
+    if pooling:
+        output.pooler_output_cpu = []
+    else:
+        output.sampled_token_ids = np.array([[1]])
+        output.num_sampled_tokens_np = np.array([1])
+        output.sampling_mask_tensors = output.num_nans = output.logprobs_tensors = None
+        output.prompt_logprobs_dict = output.prompt_token_id_logprobs_dict = {}
+        output.pending_aux_output = output._has_fault = None
+    result = output.get_output()
+    assert result.dbo_stats.timing is expected
+    assert output.dbo_timing is None
+    output.copy_event.synchronize.assert_called_once()

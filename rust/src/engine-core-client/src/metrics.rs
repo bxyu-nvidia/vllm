@@ -6,12 +6,13 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vllm_metrics::{
-    CacheHitSourceLabels, DboHistogramFamily, DboMicrobatchLabels, DboOutcomeLabels, EngineLabels,
-    EnginePositionLabels, F64Gauge, Family, HistogramMetric, LoraAdapterNames, LoraInfoLabels,
-    MooncakeOperationCounterFamily, MooncakeOperationHistogramFamily, MooncakeOperationLabels,
-    PREFILL_DELAY_REASONS, PREFILL_QUEUE_STOP_REASONS, PREFILL_REQUEST_OUTCOMES,
-    PREFILL_UNDERFILL_REASONS, PrefillOutcomeLabels, PrefillStopLabels, RequestMetrics,
-    SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
+    CacheHitSourceLabels, DboHistogramFamily, DboMicrobatchLabels, DboOutcomeLabels,
+    DboTimingHistogramFamily, EngineLabels, EnginePositionLabels, F64Gauge, Family,
+    HistogramMetric, LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
+    MooncakeOperationHistogramFamily, MooncakeOperationLabels, PREFILL_DELAY_REASONS,
+    PREFILL_QUEUE_STOP_REASONS, PREFILL_REQUEST_OUTCOMES, PREFILL_UNDERFILL_REASONS,
+    PrefillOutcomeLabels, PrefillStopLabels, RequestMetrics, SchedulerLogStatsAccumulator,
+    SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
 use crate::protocol::stats::{
@@ -52,6 +53,7 @@ struct SchedulerStatsHandles {
     dbo_microbatch_tokens: DboHistogramFamily,
     dbo_microbatch_requests: DboHistogramFamily,
     dbo_microbatch_padding_tokens: DboHistogramFamily,
+    dbo_timing: BTreeMap<&'static str, DboTimingHistogramFamily>,
     prefill_batching: BTreeMap<&'static str, U64Counter>,
     prefill_underfill_reasons: BTreeMap<&'static str, U64Counter>,
     prefill_outcomes: BTreeMap<&'static str, BTreeMap<&'static str, U64Counter>>,
@@ -168,6 +170,7 @@ fn resolve_scheduler_stats_handles(
         dbo_microbatch_tokens: metrics.dbo_microbatch_tokens.clone(),
         dbo_microbatch_requests: metrics.dbo_microbatch_requests.clone(),
         dbo_microbatch_padding_tokens: metrics.dbo_microbatch_padding_tokens.clone(),
+        dbo_timing: metrics.dbo_timing.clone(),
         prefill_batching: metrics
             .prefill_batching
             .iter()
@@ -347,6 +350,16 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
                     })
                     .observe(*size as f64);
             }
+        }
+    }
+    if let Some(timing) = stats.dbo_stats.as_ref().and_then(|dbo| dbo.timing.as_ref()) {
+        for (phase, seconds) in [
+            ("compute", timing.compute_seconds),
+            ("comm", timing.comm_seconds),
+            ("overlap", timing.overlap_seconds),
+            ("wall", timing.wall_seconds),
+        ] {
+            handles.dbo_timing[phase].get_or_create_owned(&handles.labels).observe(seconds);
         }
     }
     if let Some(batching) = &stats.prefill_batching_stats {
@@ -890,7 +903,7 @@ mod prefill_batching_tests {
 #[cfg(test)]
 mod dbo_tests {
     use super::*;
-    use crate::protocol::stats::DboStats;
+    use crate::protocol::stats::{DboStats, DboTimingStats};
     use itertools::Itertools;
     use vllm_metrics::Metrics;
 
@@ -906,6 +919,12 @@ mod dbo_tests {
                 microbatch_tokens: vec![9, 9],
                 microbatch_requests: vec![1, 1],
                 microbatch_padding_tokens: vec![0, 6],
+                timing: Some(DboTimingStats {
+                    compute_seconds: 2.0,
+                    comm_seconds: 1.0,
+                    overlap_seconds: 0.5,
+                    wall_seconds: 3.0,
+                }),
             }),
             ..Default::default()
         };
@@ -934,6 +953,10 @@ mod dbo_tests {
             .collect::<Vec<_>>()
             .join("\n");
         expect_test::expect![[r#"
+            vllm:dbo_comm_seconds_count{model_name="model",engine="0"} 2
+            vllm:dbo_comm_seconds_sum{model_name="model",engine="0"} 2.0
+            vllm:dbo_compute_seconds_count{model_name="model",engine="0"} 2
+            vllm:dbo_compute_seconds_sum{model_name="model",engine="0"} 4.0
             vllm:dbo_microbatch_padding_tokens_count{model_name="model",engine="0",microbatch="0"} 2
             vllm:dbo_microbatch_padding_tokens_count{model_name="model",engine="0",microbatch="1"} 2
             vllm:dbo_microbatch_padding_tokens_sum{model_name="model",engine="0",microbatch="0"} 0.0
@@ -946,7 +969,11 @@ mod dbo_tests {
             vllm:dbo_microbatch_tokens_count{model_name="model",engine="0",microbatch="1"} 2
             vllm:dbo_microbatch_tokens_sum{model_name="model",engine="0",microbatch="0"} 18.0
             vllm:dbo_microbatch_tokens_sum{model_name="model",engine="0",microbatch="1"} 18.0
+            vllm:dbo_overlap_seconds_count{model_name="model",engine="0"} 2
+            vllm:dbo_overlap_seconds_sum{model_name="model",engine="0"} 1.0
             vllm:dbo_steps_total{model_name="model",engine="0",outcome="executed"} 2
-            vllm:dbo_steps_total{model_name="model",engine="1",outcome="disabled"} 1"#]].assert_eq(&lines);
+            vllm:dbo_steps_total{model_name="model",engine="1",outcome="disabled"} 1
+            vllm:dbo_wall_seconds_count{model_name="model",engine="0"} 2
+            vllm:dbo_wall_seconds_sum{model_name="model",engine="0"} 6.0"#]].assert_eq(&lines);
     }
 }

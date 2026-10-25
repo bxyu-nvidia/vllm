@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -8,6 +9,9 @@ from vllm import forward_context
 from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import current_stream
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.dbo_timing import DBOTimingEvents
 
 logger = init_logger(__name__)
 
@@ -45,6 +49,7 @@ class UBatchContext:
         self.gpu_compute_done_event = gpu_compute_done_event
         self.schedule = schedule
         self.recv_hook = None
+        self.dbo_timing: DBOTimingEvents | None = None
 
     def __enter__(self):
         global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
@@ -58,6 +63,8 @@ class UBatchContext:
         self._restore_context()
         # Assume we want to start on the compute stream
         self.update_stream(self.compute_stream)
+        if self.dbo_timing is not None:
+            self.dbo_timing.start(self.id, "compute", self.compute_stream)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -65,6 +72,8 @@ class UBatchContext:
         _CURRENT_CONTEXTS[self.id] = None
         del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
         self.maybe_run_recv_hook()
+        if self.dbo_timing is not None:
+            self.dbo_timing.stop(self.id)
         self.cpu_signal_event.set()
         self.cpu_wait_event.clear()
         return False
@@ -109,14 +118,22 @@ class UBatchContext:
         self.update_stream(self.compute_stream)
 
     def switch_to_comm_sync(self):
+        if self.dbo_timing is not None:
+            self.dbo_timing.stop(self.id)
         self._signal_compute_done()
         self.update_stream(self.comm_stream)
         self._wait_compute_done()
+        if self.dbo_timing is not None:
+            self.dbo_timing.start(self.id, "comm", self.comm_stream)
 
     def switch_to_compute_sync(self):
+        if self.dbo_timing is not None:
+            self.dbo_timing.stop(self.id)
         self._signal_comm_done()
         self.update_stream(self.compute_stream)
         self._wait_comm_done()
+        if self.dbo_timing is not None:
+            self.dbo_timing.start(self.id, "compute", self.compute_stream)
 
     def maybe_run_recv_hook(self):
         if self.recv_hook is not None:
@@ -137,12 +154,16 @@ class UBatchContext:
         self._wait_compute_done()
 
     def yield_and_switch_from_comm_to_compute(self):
+        if self.dbo_timing is not None:
+            self.dbo_timing.stop(self.id)
         assert current_stream() == self.comm_stream
         self._signal_comm_done()
         self._cpu_yield()
         assert self.current_stream == self.comm_stream
         self.update_stream(self.compute_stream)
         self._wait_comm_done()
+        if self.dbo_timing is not None:
+            self.dbo_timing.start(self.id, "compute", self.compute_stream)
 
 
 def dbo_enabled() -> bool:
