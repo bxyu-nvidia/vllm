@@ -41,7 +41,7 @@ def view_as_block_major_k(weight: torch.Tensor) -> torch.Tensor:
 
 
 class TrtLlmBf16ExpertsBase:
-    """BF16 unquantized TRTLLM-Gen MoE kernels. Shared base for modular and
+    """BF16 unquantized Prims-TS MoE kernels. Shared base for modular and
     monolithic interfaces.
     """
 
@@ -132,7 +132,7 @@ class TrtLlmBf16ExpertsBase:
 
 
 class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular):
-    """BF16 unquantized TRTLLM-Gen MoE kernels. Supports modular interface."""
+    """BF16 unquantized Prims-TS MoE kernels. Supports modular interface."""
 
     @staticmethod
     def _supports_parallel_config(
@@ -204,9 +204,12 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
         import flashinfer
         from flashinfer.fused_moe import WeightLayout
 
+        if hidden_states.shape[0] == 0:
+            return
+
         topk_ids = topk_ids.to(dtype=torch.int32)
 
-        result = flashinfer.fused_moe.trtllm_bf16_routed_moe(
+        result = flashinfer.fused_moe.prims_ts_bf16_routed_moe(
             topk_ids=(topk_ids, topk_weights),
             hidden_states=hidden_states,
             gemm1_weights=view_as_block_major_k(w1),
@@ -225,12 +228,11 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
         )
-        # FlashInfer's BF16 routed wrapper does not expose an output= argument.
         output.copy_(result[0] if isinstance(result, list) else result)
 
 
 class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonolithic):
-    """BF16 unquantized TRTLLM-Gen MoE kernels. Supports monolithic interface."""
+    """BF16 unquantized Prims-TS MoE kernels. Supports monolithic interface."""
 
     @staticmethod
     def _supports_parallel_config(
@@ -280,13 +282,13 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
         assert activation in [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL]
 
         num_tokens = hidden_states.shape[0]
-        # The runner divides by the token count on the host, so an idle rank's
-        # dummy 0-token forward has to keep the finalized (empty) form.
+        if num_tokens == 0:
+            return torch.empty_like(hidden_states)
         defer = self.moe_config.should_defer_moe_finalize(num_tokens)
 
-        flashinfer_output = flashinfer.fused_moe.trtllm_bf16_moe(
-            routing_logits=router_logits,
-            routing_bias=e_score_correction_bias,
+        from flashinfer.fused_moe import WeightLayout
+
+        moe_kwargs = dict(
             hidden_states=hidden_states,
             gemm1_weights=view_as_block_major_k(w1),
             gemm2_weights=view_as_block_major_k(w2),
@@ -299,11 +301,64 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
             local_num_experts=self.local_num_experts,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=self.routing_method_type,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.BlockMajorK,
             activation_type=activation_to_flashinfer_int(activation),
             tune_max_num_tokens=fi_moe_largest_bucket(self.moe_config),
             routing_replay_out=routing_replay_out,
             do_finalize=not defer,
         )
+        if self.routing_method_type in (
+            RoutingMethodType.DeepSeekV3,
+            RoutingMethodType.Sigmoid,
+        ):
+            # Prims BF16 rejects these fused routing modes. Keep the native
+            # router and supply its exact IDs/weights to the routed Prims GEMMs.
+            from flashinfer.fused_moe.core import (
+                allocate_trtllm_moe_canonical_routing,
+                canonicalize_trtllm_moe_routing_,
+            )
+
+            canonical = allocate_trtllm_moe_canonical_routing(
+                router_logits, top_k=self.topk, tile_n=128
+            )
+            canonicalize_trtllm_moe_routing_(
+                canonical,
+                router_logits,
+                e_score_correction_bias,
+                hidden_states,
+                top_k=self.topk,
+                n_group=num_expert_group,
+                topk_group=topk_group,
+                local_expert_offset=self.ep_rank * self.local_num_experts,
+                local_num_experts=self.local_num_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                routing_method_type=self.routing_method_type,
+                use_routing_scales_on_input=False,
+                use_deep_seek_fp8=False,
+                norm_topk_prob=True,
+                enable_pdl=True,
+            )
+            if routing_replay_out is not None:
+                routing_replay_out[:num_tokens].copy_(canonical.routing_replay_ids)
+            moe_kwargs.update(
+                routing_method_type=1,  # Ignored for precomputed routing.
+                routed_scaling_factor=None,  # Already included by the router.
+                routing_replay_out=None,
+            )
+            flashinfer_output = flashinfer.fused_moe.prims_ts_bf16_routed_moe(
+                topk_ids=(
+                    canonical.routing_replay_ids.to(torch.int32),
+                    canonical.expert_weights,
+                ),
+                **moe_kwargs,
+            )
+        else:
+            flashinfer_output = flashinfer.fused_moe.prims_ts_bf16_moe(
+                routing_logits=router_logits,
+                routing_bias=e_score_correction_bias,
+                **moe_kwargs,
+            )
         routed_output = convert_flashinfer_moe_output(
             flashinfer_output,
             do_finalize=not defer,

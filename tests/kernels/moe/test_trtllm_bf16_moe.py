@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the FlashInfer TRTLLM BF16 MoE backend
+"""Tests for the FlashInfer Prims-TS BF16 MoE backend
 (`TrtLlmBf16ExpertsModular`).
 
 This mirrors the TRTLLM NvFP4 modular test shape: construct the modular
@@ -27,6 +27,8 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
     TrtLlmBf16ExpertsModular,
+    TrtLlmBf16ExpertsMonolithic,
+    view_as_block_major_k,
 )
 from vllm.model_executor.layers.fused_moe.experts.trtllm_lora_moe import (
     TrtLlmBf16LoRAExperts,
@@ -62,6 +64,7 @@ MNK_FACTORS = [
 @pytest.mark.parametrize("e", [128])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
 @torch.inference_mode()
 def test_trtllm_bf16_moe_modular_no_graph(
     m: int,
@@ -70,6 +73,7 @@ def test_trtllm_bf16_moe_modular_no_graph(
     e: int,
     topk: int,
     dtype: torch.dtype,
+    activation: MoEActivation,
     workspace_init,
 ):
     set_random_seed(7)
@@ -77,7 +81,8 @@ def test_trtllm_bf16_moe_modular_no_graph(
         VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
     ):
         a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
-        w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
+        w1_rows = 2 * n if activation == MoEActivation.SILU else n
+        w1 = torch.randn((e, w1_rows, k), device="cuda", dtype=dtype) / 10
         w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
         # The FlashInfer conversion may rewrite unpadded input storage in place.
         # Preserve the original layout for the independent torch reference.
@@ -96,7 +101,7 @@ def test_trtllm_bf16_moe_modular_no_graph(
             intermediate_size=n,
             num_local_experts=e,
             num_logical_experts=e,
-            activation=MoEActivation.SILU,
+            activation=activation,
             device="cuda",
             moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
             in_dtype=dtype,
@@ -133,7 +138,7 @@ def test_trtllm_bf16_moe_modular_no_graph(
             w2=trtllm_w2,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            activation=MoEActivation.SILU,
+            activation=activation,
             global_num_experts=e,
             expert_map=None,
             apply_router_weight_on_input=False,
@@ -145,7 +150,7 @@ def test_trtllm_bf16_moe_modular_no_graph(
             reference_w2,
             score,
             topk,
-            activation=MoEActivation.SILU,
+            activation=activation,
         )
 
         torch.testing.assert_close(
@@ -199,3 +204,102 @@ def test_trtllm_bf16_lora_accepts_checkpoint_shaped_weights(has_lora_delta):
     expected = invoke(w1.view(128, 4, 256, 64), w2.view(128, 2, 256, 64))
     for actual_tensor, expected_tensor in zip(actual, expected):
         torch.testing.assert_close(actual_tensor, expected_tensor)
+
+
+@pytest.mark.parametrize(
+    "routing_method",
+    [
+        RoutingMethodType.DeepSeekV3,
+        RoutingMethodType.Sigmoid,
+        RoutingMethodType.SigmoidRenorm,
+    ],
+)
+@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
+@pytest.mark.parametrize("ep_rank", [None, 1])
+@torch.inference_mode()
+def test_prims_bf16_matches_trtllm_routing_and_output(
+    routing_method, activation, ep_rank, workspace_init
+):
+    """Preserve scaling, EP expert offsets, and capture with the new GEMMs."""
+    from flashinfer.fused_moe import WeightLayout, trtllm_bf16_moe
+
+    from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+        activation_to_flashinfer_int,
+    )
+
+    set_random_seed(7)
+    m, n, k, e, topk = 7, 128, 256, 128, 2
+    local_e = e if ep_rank is None else e // 2
+    rank = 0 if ep_rank is None else ep_rank
+    with set_current_vllm_config(VllmConfig()):
+        config = FusedMoEConfig(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=k,
+            intermediate_size=n,
+            num_local_experts=local_e,
+            num_logical_experts=e,
+            activation=activation,
+            device="cuda",
+            moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+            in_dtype=torch.bfloat16,
+            routing_method=routing_method,
+            max_num_tokens=16,
+        )
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / 10
+        logits = torch.randn(m, e, device="cuda", dtype=torch.float32)
+        rows = 2 * n if activation == MoEActivation.SILU else n
+        w1, w2 = convert_to_unquantized_kernel_format(
+            UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+            config,
+            torch.randn(local_e, rows, k, device="cuda", dtype=torch.bfloat16) / 10,
+            torch.randn(local_e, k, n, device="cuda", dtype=torch.bfloat16) / 10,
+        )
+        grouped = routing_method == RoutingMethodType.DeepSeekV3
+        bias = (
+            torch.randn(e, device="cuda", dtype=torch.float32) / 10 if grouped else None
+        )
+        expected_ids = torch.full((m + 1, topk), -1, device="cuda", dtype=torch.int16)
+        actual_ids = torch.full_like(expected_ids, -1)
+        expected = trtllm_bf16_moe(
+            routing_logits=logits,
+            routing_bias=bias,
+            hidden_states=x,
+            gemm1_weights=view_as_block_major_k(w1),
+            gemm2_weights=view_as_block_major_k(w2),
+            num_experts=e,
+            top_k=topk,
+            n_group=4 if grouped else None,
+            topk_group=2 if grouped else None,
+            intermediate_size=n,
+            local_expert_offset=rank * local_e,
+            local_num_experts=local_e,
+            routed_scaling_factor=1.7,
+            routing_method_type=routing_method,
+            weight_layout=WeightLayout.BlockMajorK,
+            activation_type=activation_to_flashinfer_int(activation),
+            routing_replay_out=expected_ids,
+        )
+        if isinstance(expected, list):
+            expected = expected[0]
+        experts = TrtLlmBf16ExpertsMonolithic(config, FUSED_MOE_UNQUANTIZED_CONFIG)
+        # Simulate the local expert slice without initializing a process group.
+        experts.ep_rank = rank
+        actual = experts.apply(
+            hidden_states=x,
+            w1=w1,
+            w2=w2,
+            router_logits=logits,
+            activation=activation,
+            global_num_experts=e,
+            expert_map=None,
+            a1q_scale=None,
+            apply_router_weight_on_input=False,
+            num_expert_group=4 if grouped else None,
+            e_score_correction_bias=bias,
+            routed_scaling_factor=1.7,
+            topk_group=2 if grouped else None,
+            routing_replay_out=actual_ids,
+        )
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=2e-2)
+        torch.testing.assert_close(actual_ids, expected_ids, atol=0, rtol=0)
