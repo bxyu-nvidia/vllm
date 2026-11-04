@@ -3,11 +3,15 @@
 """Configuration for model weight offloading."""
 
 import warnings
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field, model_validator
 
 from vllm.config.utils import config
+
+if TYPE_CHECKING:
+    from vllm.config.speculative import SpeculativeConfig
+
 
 OffloadBackend = Literal["auto", "uva", "prefetch", "dwdp"]
 
@@ -36,6 +40,17 @@ class DWDPConfig:
     """Read resident experts directly with Prims instead of copying them to staging."""
     allow_cuda_graph: bool = False
     """Allow CUDA graphs and vLLM piecewise compilation."""
+
+    def verify_speculative_config(
+        self, speculative_config: "SpeculativeConfig | None", *, enforce_eager: bool
+    ) -> None:
+        """Validate target-only DWDP with a replicated MTP drafter."""
+        if speculative_config is None:
+            return
+        if speculative_config.method != "mtp":
+            raise ValueError("DWDP currently supports only MTP speculative decoding")
+        if not enforce_eager:
+            raise ValueError("DWDP with MTP requires --enforce-eager")
 
     @model_validator(mode="after")
     def validate_rank(self) -> "DWDPConfig":

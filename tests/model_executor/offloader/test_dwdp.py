@@ -24,6 +24,79 @@ from vllm.model_executor.offloader.dwdp import (
 from vllm.model_executor.offloader.dwdp_health import PeerProcessMonitor
 
 
+@pytest.mark.parametrize(
+    "method,eager,error",
+    [
+        (None, False, None),
+        ("mtp", True, None),
+        ("mtp", False, "requires --enforce-eager"),
+        ("eagle", True, "only MTP"),
+        ("ngram", True, "only MTP"),
+    ],
+)
+def test_dwdp_speculative_policy(method, eager, error):
+    spec = SimpleNamespace(method=method) if method is not None else None
+    config = DWDPConfig()
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            config.verify_speculative_config(spec, enforce_eager=eager)
+    else:
+        config.verify_speculative_config(spec, enforce_eager=eager)
+
+
+@pytest.mark.parametrize("dwdp", [False, True])
+@pytest.mark.parametrize("fail_draft", [False, True])
+def test_draft_loading_preserves_target_offloader(monkeypatch, dwdp, fail_draft):
+    from vllm.model_executor import model_loader
+    from vllm.model_executor.offloader import base
+    from vllm.model_executor.offloader.dwdp import DWDPWeightOffloader
+
+    offloader = DWDPWeightOffloader(DWDPConfig()) if dwdp else base.NoopOffloader()
+    monkeypatch.setattr(base, "_instance", offloader)
+    target_config, draft_config = object(), object()
+    config = SimpleNamespace(
+        load_config=object(),
+        model_config=target_config,
+        speculative_config=SimpleNamespace(draft_model_config=draft_config),
+    )
+    loaded = []
+
+    def load_model(*, vllm_config, model_config, prefix):
+        active = base.get_offloader()
+        if model_config is draft_config and dwdp:
+            assert isinstance(active, base.NoopOffloader)
+        else:
+            assert active is offloader
+        if model_config is draft_config and fail_draft:
+            raise RuntimeError("draft load failed")
+        model = torch.nn.Linear(2, 2)
+        # Module construction must execute under the selected offloader too.
+        assert active.wrap_modules(iter([model]), prefix) == [model]
+        loaded.append(model_config)
+        return model
+
+    monkeypatch.setattr(
+        model_loader,
+        "get_model_loader",
+        lambda _: SimpleNamespace(load_model=load_model),
+    )
+    model_loader.get_model(vllm_config=config)
+    if fail_draft:
+        with pytest.raises(RuntimeError, match="draft load failed"):
+            model_loader.get_model(vllm_config=config, model_config=draft_config)
+    else:
+        model_loader.get_model(vllm_config=config, model_config=draft_config)
+    assert base.get_offloader() is offloader
+    model_loader.get_model(vllm_config=config, model_config=target_config)
+    assert loaded == (
+        [target_config, target_config]
+        if fail_draft
+        else [target_config, draft_config, target_config]
+    )
+    if dwdp:
+        assert offloader._manager is None
+
+
 @pytest.mark.parametrize("prims", [False, True])
 def test_empty_modular_moe_skips_kernel_and_keeps_output(prims):
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation

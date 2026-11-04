@@ -40,11 +40,28 @@ Route prefill requests to the independent engines. Configure decode engines
 separately without DWDP. This prototype does not switch weight ownership based
 on individual batches; every forward of a configured engine uses DWDP.
 
+For Nemotron MTP, add the following to each engine:
+
+```bash
+--speculative-config '{"method":"mtp","num_speculative_tokens":5}'
+```
+
+With NIXL
+prefill/decode disaggregation, configure the same speculative width on both
+sides. Prefill can use `"num_speculative_tokens_per_batch_size":[[1,1024,0]]`
+to disable draft proposals while retaining the matching cache configuration.
+Decode engines without DWDP can retain their existing CUDA graph settings.
+This integration still requires GPU correctness and end-to-end validation.
+
 ## Constraints and lifecycle
 
 - Requires unquantized BF16 experts without bias, at least one owned expert per
   worker and separate shared experts. TP, EP, DP, context
-  parallelism, DBO, EPLB, LoRA and speculative decoding are currently rejected.
+  parallelism, DBO, EPLB and LoRA are currently rejected.
+- MTP speculative decoding is supported with `--enforce-eager`. Only target
+  expert weights use DWDP; the drafter, including its MoE experts, is replicated
+  on each GPU. Budget for the additional draft weights and speculative KV/state
+  cache. Other speculative methods and DWDP+MTP CUDA graphs are rejected.
 - Owned experts occupy balanced contiguous ranges. Counts need not divide the
   group size. Ownership affects loading only; execution sees all expert IDs.
 - CUDA IPC handles and source allocations are process-specific and must stay

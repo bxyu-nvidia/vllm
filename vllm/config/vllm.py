@@ -1743,10 +1743,11 @@ class VllmConfig:
                     raise ValueError(
                         "DWDP CUDA timing diagnostics require eager execution"
                     )
-            if self.speculative_config is not None or self.lora_config is not None:
-                raise ValueError(
-                    "DWDP does not yet support speculative decoding or LoRA"
-                )
+            self.offload_config.dwdp.verify_speculative_config(
+                self.speculative_config, enforce_eager=self.model_config.enforce_eager
+            )
+            if self.lora_config is not None:
+                raise ValueError("DWDP does not yet support LoRA")
 
         if self.model_config is not None and self.model_config.enforce_eager:
             self.compilation_config.mode = CompilationMode.NONE

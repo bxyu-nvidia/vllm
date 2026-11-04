@@ -138,9 +138,27 @@ def get_model(
     loader = get_model_loader(load_config or vllm_config.load_config)
     if model_config is None:
         model_config = vllm_config.model_config
-    return loader.load_model(
-        vllm_config=vllm_config, model_config=model_config, prefix=prefix
+    from vllm.model_executor.offloader import get_offloader, set_offloader
+    from vllm.model_executor.offloader.dwdp import DWDPWeightOffloader
+
+    offloader = get_offloader()
+    spec = vllm_config.speculative_config
+    replicate_draft = (
+        isinstance(offloader, DWDPWeightOffloader)
+        and spec is not None
+        and model_config is spec.draft_model_config
     )
+    # Draft iterations do not follow the target's layer schedule. Keep their
+    # weights local and exclude them from target IPC registration and staging.
+    if replicate_draft:
+        set_offloader(None)
+    try:
+        return loader.load_model(
+            vllm_config=vllm_config, model_config=model_config, prefix=prefix
+        )
+    finally:
+        if replicate_draft:
+            set_offloader(offloader)
 
 
 __all__ = [
