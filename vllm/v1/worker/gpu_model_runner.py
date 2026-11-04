@@ -6350,21 +6350,34 @@ class GPUModelRunner(
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
-        if current_platform.is_rocm():
-            # Drop captured graphs before distributed teardown. On ROCm, delayed
-            # graph destruction can surface HSA faults in the next engine startup.
+        dwdp = self.offload_config.dwdp is not None
+        if current_platform.is_rocm() or dwdp:
+            # Destroy graphs before releasing peer mappings or distributed state.
             CUDAGraphWrapper.clear_all_graphs()
             BreakableCUDAGraphWrapper.clear_all_graphs()
             self.encoder_cudagraph_manager = None
+        if dwdp and self.model is not None:
+            from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+            for module in self.model.modules():
+                if isinstance(module, TorchCompileWithNoGuardsWrapper):
+                    module.cleanup()
+            del module
+        get_offloader().shutdown()
+        if dwdp:
+            set_offloader(None)
         self.compilation_config.static_forward_context.clear()
+        self._moe_model = None
         self.model = None  # type: ignore[assignment]
         _ROPE_DICT.clear()
 
         reset_workspace_manager()
-        if current_platform.is_rocm() or current_platform.is_xpu():
+        if current_platform.is_rocm() or current_platform.is_xpu() or dwdp:
             gc.collect()
             torch.accelerator.empty_cache()
             torch.accelerator.synchronize()
+        if dwdp:
+            torch.cuda.ipc_collect()
 
     def _cleanup_profiling_kv_cache(self) -> None:
         torch.accelerator.synchronize()

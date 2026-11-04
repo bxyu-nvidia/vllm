@@ -91,6 +91,10 @@ class BaseOffloader(ABC):
         """
         return
 
+    def shutdown(self) -> None:  # noqa: B027
+        """Release peer mappings and owned storage after the last forward."""
+        pass
+
     def sync_prev_onload(self) -> None:  # noqa: B027
         """Sync previous onload operations. Override in subclasses."""
         pass
@@ -152,6 +156,11 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
     backend = offload_config.offload_backend
     uva = offload_config.uva
     prefetch = offload_config.prefetch
+
+    if offload_config.dwdp is not None:
+        from vllm.model_executor.offloader.dwdp import DWDPWeightOffloader
+
+        return DWDPWeightOffloader(offload_config.dwdp)
 
     if backend == "auto":
         if prefetch.offload_group_size > 0:

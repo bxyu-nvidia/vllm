@@ -134,6 +134,11 @@ class TrtLlmBf16ExpertsBase:
 class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular):
     """BF16 unquantized TRTLLM-Gen MoE kernels. Supports modular interface."""
 
+    def _routed_moe(self, **kwargs):
+        from flashinfer.fused_moe import trtllm_bf16_routed_moe
+
+        return trtllm_bf16_routed_moe(**kwargs)
+
     @staticmethod
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
@@ -201,12 +206,11 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
-        import flashinfer
         from flashinfer.fused_moe import WeightLayout
 
         topk_ids = topk_ids.to(dtype=torch.int32)
 
-        result = flashinfer.fused_moe.trtllm_bf16_routed_moe(
+        result = self._routed_moe(
             topk_ids=(topk_ids, topk_weights),
             hidden_states=hidden_states,
             gemm1_weights=view_as_block_major_k(w1),

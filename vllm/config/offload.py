@@ -9,7 +9,39 @@ from pydantic import Field, model_validator
 
 from vllm.config.utils import config
 
-OffloadBackend = Literal["auto", "uva", "prefetch"]
+OffloadBackend = Literal["auto", "uva", "prefetch", "dwdp"]
+
+
+@config
+class DWDPConfig:
+    """Peer expert storage for independent, same-host prefill workers."""
+
+    rank: int = Field(default=0, ge=0)
+    """Weight-sharing rank, independent of vLLM's DP/EP ranks."""
+    world_size: int = Field(default=4, ge=2)
+    """Number of independent workers sharing weights."""
+    host: str = "127.0.0.1"
+    """Address of rank zero's startup rendezvous server."""
+    port: int = Field(default=29590, ge=1, le=65535)
+    """Dedicated startup port; do not reuse the engine distributed port."""
+    timeout_seconds: int = Field(default=600, ge=1)
+    """Startup and coordinated shutdown timeout."""
+    slice_bytes: int = Field(default=0, ge=0)
+    """Maximum peer DMA request size; zero copies each shard in one request."""
+    prefetch: bool = True
+    """Overlap the next MoE layer's copies; disable for a synchronous baseline."""
+    collect_metrics: bool = False
+    """Record local CUDA timing events for prefetch, exposed waits and MoE compute."""
+    merge_free: bool = False
+    """Read resident experts directly with Prims instead of copying them to staging."""
+    allow_cuda_graph: bool = False
+    """Allow CUDA graphs and vLLM piecewise compilation."""
+
+    @model_validator(mode="after")
+    def validate_rank(self) -> "DWDPConfig":
+        if self.rank >= self.world_size:
+            raise ValueError("DWDP rank must be less than world_size")
+        return self
 
 
 @config
@@ -86,6 +118,7 @@ class OffloadConfig:
       (prefetch if offload_group_size > 0, uva if cpu_offload_gb > 0).
     - "uva": UVA (Unified Virtual Addressing) zero-copy offloading.
     - "prefetch": Async prefetch with group-based layer offloading.
+    - "dwdp": Fetch routed expert weights from independent peer workers.
     """
 
     uva: UVAOffloadConfig = Field(default_factory=UVAOffloadConfig)
@@ -94,9 +127,21 @@ class OffloadConfig:
     prefetch: PrefetchOffloadConfig = Field(default_factory=PrefetchOffloadConfig)
     """Parameters for prefetch offloading backend."""
 
+    dwdp: DWDPConfig | None = None
+    """Enable same-host peer expert storage with a separate startup group."""
+
     @model_validator(mode="after")
     def validate_offload_config(self) -> "OffloadConfig":
         """Validate offload configuration constraints."""
+        if self.dwdp is not None:
+            if (
+                self.offload_backend not in ("auto", "dwdp")
+                or self.uva.cpu_offload_gb > 0
+                or self.prefetch.offload_group_size > 0
+            ):
+                raise ValueError("DWDP cannot be combined with CPU weight offloading")
+        elif self.offload_backend == "dwdp":
+            raise ValueError("The dwdp offload backend requires dwdp configuration")
         if self.offload_backend == "prefetch" or self.prefetch.offload_group_size > 0:
             if self.prefetch.offload_num_in_group > self.prefetch.offload_group_size:
                 raise ValueError(

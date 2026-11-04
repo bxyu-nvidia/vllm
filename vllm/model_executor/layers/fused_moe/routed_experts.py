@@ -31,10 +31,13 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     resolve_quant_method,
 )
+from vllm.model_executor.offloader import get_offloader
+from vllm.model_executor.offloader.dwdp import DWDPWeightOffloader
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
+    from vllm.model_executor.offloader.dwdp import DWDPWeightManager
 
 
 logger = init_logger(__name__)
@@ -128,6 +131,8 @@ class RoutedExperts(PluggableLayer):
         self.global_num_experts = moe_config.num_experts
         self.local_num_experts = moe_config.num_local_experts
         self.params_dtype = params_dtype
+        self.dwdp_manager: DWDPWeightManager | None = None
+        self.dwdp_expert_range: tuple[int, int] | None = None
 
         # Register buffers for state_dict compatibility
         self.update_expert_map_info()
@@ -205,6 +210,12 @@ class RoutedExperts(PluggableLayer):
         }
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+
+        if isinstance(get_offloader(), DWDPWeightOffloader):
+            if self.dwdp_manager is None:
+                raise ValueError("DWDP supports only unquantized BF16 routed experts")
+            if self.expert_map_manager.num_fused_shared_experts:
+                raise ValueError("DWDP requires separate replicated shared experts")
 
         self.lora_base_layer_prefix = ""
 
@@ -316,6 +327,9 @@ class RoutedExperts(PluggableLayer):
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         """Map global expert ID to local expert ID."""
+        if self.dwdp_expert_range is not None:
+            start, end = self.dwdp_expert_range
+            return expert_id - start if start <= expert_id < end else -1
         return self.expert_map_manager.map_global_to_local(expert_id)
 
     #
@@ -688,6 +702,17 @@ class RoutedExperts(PluggableLayer):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
+        if self.dwdp_manager is not None and self.dwdp_manager.initialized:
+            raise RuntimeError("DWDP source weights are immutable after initialization")
+        if self.dwdp_manager is not None and loaded_weight.ndim == 3:
+            loaded = False
+            for global_id, weight in enumerate(loaded_weight.unbind()):
+                loaded |= bool(
+                    self.weight_loader(
+                        param, weight, weight_name, shard_id, global_id, True
+                    )
+                )
+            return loaded if return_success else None
         quant_config_name = self.quant_config and self.quant_config.get_name()
         if quant_config_name == "gpt_oss_mxfp4":
             # (FIXME) for gpt-oss all experts are combined

@@ -42,6 +42,7 @@ from vllm.config import (
     ConfigType,
     DeviceConfig,
     DiffusionConfig,
+    DWDPConfig,
     ECTransferConfig,
     EncoderCacheManagerConfig,
     EngramConfig,
@@ -587,6 +588,7 @@ class EngineArgs:
     disable_sliding_window: bool = ModelConfig.disable_sliding_window
     disable_cascade_attn: bool | None = None
     offload_backend: str = OffloadConfig.offload_backend
+    dwdp_config: DWDPConfig | None = None
     cpu_offload_gb: float = UVAOffloadConfig.cpu_offload_gb
     cpu_offload_params: set[str] = get_field(UVAOffloadConfig, "cpu_offload_params")
     offload_group_size: int = PrefetchOffloadConfig.offload_group_size
@@ -1433,6 +1435,7 @@ class EngineArgs:
         offload_group.add_argument(
             "--offload-backend", **offload_kwargs["offload_backend"]
         )
+        offload_group.add_argument("--dwdp-config", **offload_kwargs["dwdp"])
         offload_group.add_argument("--cpu-offload-gb", **uva_kwargs["cpu_offload_gb"])
         offload_group.add_argument(
             "--cpu-offload-params", **uva_kwargs["cpu_offload_params"]
@@ -2813,6 +2816,7 @@ class EngineArgs:
 
         offload_config = OffloadConfig(
             offload_backend=self.offload_backend,
+            dwdp=self.dwdp_config,
             uva=UVAOffloadConfig(
                 cpu_offload_gb=self.cpu_offload_gb,
                 cpu_offload_params=self.cpu_offload_params,
