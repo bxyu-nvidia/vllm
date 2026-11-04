@@ -127,6 +127,7 @@ MoEBackend = Literal[
     "deep_gemm_mega_moe",
     "cutlass",
     "flashinfer_trtllm",
+    "flashinfer_prims",
     "flashinfer_cutlass",
     "flashinfer_cutedsl",
     "flashinfer_moe_ep_cutedsl",
@@ -302,6 +303,7 @@ class KernelConfig:
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
+    - "flashinfer_prims": Use FlashInfer Prims-TS kernels (BF16, SM100 only)
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
     - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)
     - "flashinfer_moe_ep_cutedsl": Use FlashInfer's CuTeDSL MoE-EP

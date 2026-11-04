@@ -295,8 +295,17 @@ def test_explicit_aiter_backend_non_gated_activation_still_raises():
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="Only supported on NVIDIA platforms."
 )
+@pytest.mark.parametrize(
+    "backend_name,expected_backend",
+    [
+        ("flashinfer_trtllm", UnquantizedMoeBackend.FLASHINFER_TRTLLM),
+        ("flashinfer_prims", UnquantizedMoeBackend.FLASHINFER_PRIMS),
+    ],
+)
 def test_select_cuda_flashinfer_trtllm_backend(
     mock_is_supported_trtllm_monolithic,
+    backend_name,
+    expected_backend,
 ):
     """Test CUDA backend selection when FlashInfer TRTLLM is available and enabled."""
     with (
@@ -309,7 +318,7 @@ def test_select_cuda_flashinfer_trtllm_backend(
         patch.object(current_platform, "has_device_capability", return_value=True),
     ):
         moe_config = make_dummy_moe_config()
-        moe_config.moe_backend = "flashinfer_trtllm"
+        moe_config.moe_backend = backend_name
         # TRTLLM requires EP and does not support DP
         moe_config.moe_parallel_config.use_ep = True
         moe_config.moe_parallel_config.use_dp = False
@@ -318,7 +327,7 @@ def test_select_cuda_flashinfer_trtllm_backend(
             moe_config=moe_config
         )
 
-        assert selected_backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM
+        assert selected_backend == expected_backend
         assert experts_cls is not None
         assert experts_cls.__name__ == "TrtLlmBf16ExpertsMonolithic"
 

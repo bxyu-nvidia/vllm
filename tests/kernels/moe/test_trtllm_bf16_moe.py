@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the FlashInfer Prims-TS BF16 MoE backend
+"""Tests for the FlashInfer TRTLLM-Gen and Prims-TS BF16 MoE backends
 (`TrtLlmBf16ExpertsModular`).
 
 This mirrors the TRTLLM NvFP4 modular test shape: construct the modular
@@ -60,6 +60,7 @@ MNK_FACTORS = [
 ]
 
 
+@pytest.mark.parametrize("moe_backend", ["flashinfer_trtllm", "flashinfer_prims"])
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
 @pytest.mark.parametrize("e", [128])
 @pytest.mark.parametrize("topk", [8])
@@ -67,6 +68,7 @@ MNK_FACTORS = [
 @pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
 @torch.inference_mode()
 def test_trtllm_bf16_moe_modular_no_graph(
+    moe_backend: str,
     m: int,
     n: int,
     k: int,
@@ -107,6 +109,7 @@ def test_trtllm_bf16_moe_modular_no_graph(
             in_dtype=dtype,
             routing_method=RoutingMethodType.TopK,
             max_num_tokens=next_power_of_2(m),
+            moe_backend=moe_backend,
         )
 
         trtllm_w1, trtllm_w2 = convert_to_unquantized_kernel_format(
@@ -215,10 +218,11 @@ def test_trtllm_bf16_lora_accepts_checkpoint_shaped_weights(has_lora_delta):
     ],
 )
 @pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL])
+@pytest.mark.parametrize("moe_backend", ["flashinfer_trtllm", "flashinfer_prims"])
 @pytest.mark.parametrize("ep_rank", [None, 1])
 @torch.inference_mode()
 def test_prims_bf16_matches_trtllm_routing_and_output(
-    routing_method, activation, ep_rank, workspace_init
+    routing_method, activation, ep_rank, moe_backend, workspace_init
 ):
     """Preserve scaling, EP expert offsets, and capture with the new GEMMs."""
     from flashinfer.fused_moe import WeightLayout, trtllm_bf16_moe
@@ -245,6 +249,7 @@ def test_prims_bf16_matches_trtllm_routing_and_output(
             in_dtype=torch.bfloat16,
             routing_method=routing_method,
             max_num_tokens=16,
+            moe_backend=moe_backend,
         )
         x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / 10
         logits = torch.randn(m, e, device="cuda", dtype=torch.float32)

@@ -41,7 +41,7 @@ def view_as_block_major_k(weight: torch.Tensor) -> torch.Tensor:
 
 
 class TrtLlmBf16ExpertsBase:
-    """BF16 unquantized Prims-TS MoE kernels. Shared base for modular and
+    """BF16 unquantized TRTLLM-Gen or Prims-TS MoE kernels. Shared base for modular and
     monolithic interfaces.
     """
 
@@ -75,6 +75,7 @@ class TrtLlmBf16ExpertsBase:
         moe_config: FusedMoEConfig,
         quant_config: FusedMoEQuantConfig,
     ):
+        self._use_prims = moe_config.moe_backend == "flashinfer_prims"
         self.routing_method_type = moe_config.routing_method
         self.topk = moe_config.experts_per_token
         self.intermediate_size_per_partition = (
@@ -132,7 +133,7 @@ class TrtLlmBf16ExpertsBase:
 
 
 class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular):
-    """BF16 unquantized Prims-TS MoE kernels. Supports modular interface."""
+    """BF16 TRTLLM-Gen or Prims-TS kernels with the modular interface."""
 
     @staticmethod
     def _supports_parallel_config(
@@ -209,7 +210,12 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
 
         topk_ids = topk_ids.to(dtype=torch.int32)
 
-        result = flashinfer.fused_moe.prims_ts_bf16_routed_moe(
+        routed_moe = (
+            flashinfer.fused_moe.prims_ts_bf16_routed_moe
+            if self._use_prims
+            else flashinfer.fused_moe.trtllm_bf16_routed_moe
+        )
+        result = routed_moe(
             topk_ids=(topk_ids, topk_weights),
             hidden_states=hidden_states,
             gemm1_weights=view_as_block_major_k(w1),
@@ -232,7 +238,7 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
 
 
 class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonolithic):
-    """BF16 unquantized Prims-TS MoE kernels. Supports monolithic interface."""
+    """BF16 TRTLLM-Gen or Prims-TS kernels with the monolithic interface."""
 
     @staticmethod
     def _supports_parallel_config(
@@ -308,7 +314,7 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
             routing_replay_out=routing_replay_out,
             do_finalize=not defer,
         )
-        if self.routing_method_type in (
+        if self._use_prims and self.routing_method_type in (
             RoutingMethodType.DeepSeekV3,
             RoutingMethodType.Sigmoid,
         ):
@@ -354,7 +360,12 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
                 **moe_kwargs,
             )
         else:
-            flashinfer_output = flashinfer.fused_moe.prims_ts_bf16_moe(
+            fused_moe = (
+                flashinfer.fused_moe.prims_ts_bf16_moe
+                if self._use_prims
+                else flashinfer.fused_moe.trtllm_bf16_moe
+            )
+            flashinfer_output = fused_moe(
                 routing_logits=router_logits,
                 routing_bias=e_score_correction_bias,
                 **moe_kwargs,
