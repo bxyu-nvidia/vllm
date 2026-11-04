@@ -24,6 +24,98 @@ from vllm.model_executor.offloader.dwdp import (
 from vllm.model_executor.offloader.dwdp_health import PeerProcessMonitor
 
 
+@pytest.mark.parametrize("prims", [False, True])
+def test_empty_modular_moe_skips_kernel_and_keeps_output(prims):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.prims_bf16_moe import (
+        PrimsBf16Experts,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
+        TrtLlmBf16ExpertsModular,
+    )
+
+    cls = PrimsBf16Experts if prims else TrtLlmBf16ExpertsModular
+    experts = cls.__new__(cls)
+    experts._routed_moe = lambda **kwargs: pytest.fail("Empty input launched a kernel")
+    hidden = torch.empty(0, 128, dtype=torch.bfloat16)
+    output = torch.empty_like(hidden)
+    experts.apply(
+        output,
+        hidden,
+        None,
+        None,
+        torch.empty(0, 2),
+        torch.empty(0, 2, dtype=torch.int64),
+        MoEActivation.RELU2_NO_MUL,
+        4,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        False,
+    )
+    assert output.shape == hidden.shape
+    assert output.dtype == hidden.dtype
+
+
+def test_empty_monolithic_moe_skips_finalize_policy_and_kernel():
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
+        TrtLlmBf16ExpertsMonolithic,
+    )
+
+    experts = TrtLlmBf16ExpertsMonolithic.__new__(TrtLlmBf16ExpertsMonolithic)
+    experts.moe_config = SimpleNamespace(
+        should_defer_moe_finalize=lambda n: pytest.fail("Empty input reached finalize")
+    )
+    hidden = torch.empty(0, 128, dtype=torch.bfloat16)
+    result = experts.apply(
+        hidden,
+        None,
+        None,
+        torch.empty(0, 4),
+        MoEActivation.RELU2_NO_MUL,
+        4,
+        None,
+        None,
+        False,
+    )
+    assert result.shape == hidden.shape
+    assert result.dtype == hidden.dtype
+    assert result.device == hidden.device
+
+
+def test_prims_routed_dispatch_keeps_resident_and_staging_weights(monkeypatch):
+    from types import ModuleType
+    from unittest.mock import Mock
+
+    from vllm.model_executor.layers.fused_moe.experts import prims_bf16_moe
+
+    resident = (torch.ones(1, 1, 128, 128), torch.ones(1, 1, 128, 128))
+    experts = prims_bf16_moe.PrimsBf16Experts.__new__(prims_bf16_moe.PrimsBf16Experts)
+    experts._resident_weights = resident
+    experts._resident_expert_offset = 2
+    experts.moe_config = object()
+    monkeypatch.setattr(prims_bf16_moe, "fi_moe_largest_bucket", lambda cfg: 16960)
+    moe = ModuleType("flashinfer.fused_moe")
+    routed_moe = Mock(return_value=object())
+    monkeypatch.setattr(moe, "prims_ts_bf16_routed_moe", routed_moe, raising=False)
+    monkeypatch.setitem(sys.modules, "flashinfer", ModuleType("flashinfer"))
+    monkeypatch.setitem(sys.modules, "flashinfer.fused_moe", moe)
+    for _ in range(2):
+        w1, w2 = torch.empty(4, 1, 128, 128), torch.empty(4, 1, 128, 128)
+        result = experts._routed_moe(gemm1_weights=w1, gemm2_weights=w2)
+        args = routed_moe.call_args.kwargs
+        assert result is routed_moe.return_value
+        assert args["gemm1_weights"] is w1 and args["gemm2_weights"] is w2
+        assert args["resident_gemm1_weights"] is resident[0]
+        assert args["resident_gemm2_weights"] is resident[1]
+        assert args["resident_expert_offset"] == 2
+        assert args["tune_max_num_tokens"] == 16960
+
+
 def test_resident_views_outlive_weights_without_retaining_the_source_layer():
     """Cached packed views must not retain parameter weight-loader callbacks."""
     from vllm.model_executor.layers.fused_moe.experts.prims_bf16_moe import (
