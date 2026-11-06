@@ -961,6 +961,23 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
                 setattr(layer, name, torch.empty(0, dtype=torch.int32))
 
 
+@triton.jit(do_not_specialize=["row_size"])
+def _copy_kv_blocks_kernel(
+    blocks_ptr,
+    indices_ptr,
+    row_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    chunks_per_row = tl.cdiv(row_size, BLOCK_SIZE)
+    copy_idx = tl.program_id(0) // chunks_per_row
+    chunk_idx = tl.program_id(0) % chunks_per_row
+    src = tl.load(indices_ptr + 2 * copy_idx)
+    dst = tl.load(indices_ptr + 2 * copy_idx + 1)
+    offsets = chunk_idx.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    values = tl.load(blocks_ptr + src * row_size + offsets, offsets < row_size)
+    tl.store(blocks_ptr + dst * row_size + offsets, values, offsets < row_size)
+
+
 def copy_kv_cache_blocks_inplace(
     kv_caches: Iterable[torch.Tensor],
     num_blocks: int,
@@ -970,6 +987,15 @@ def copy_kv_cache_blocks_inplace(
         return
 
     indices_np = np.array(kv_cache_block_copies, dtype=np.int64)
+    src_ids, dst_ids = indices_np.T
+    # Direct copies must not overwrite another copy's source. The fallback
+    # snapshots all sources first, preserving chains, cycles and self-copies.
+    direct_copy = (
+        len(set(dst_ids)) == len(dst_ids)
+        and not set(src_ids).intersection(dst_ids)
+        and indices_np.min() >= 0
+        and indices_np.max() < num_blocks
+    )
     indices: torch.Tensor | None = None
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
@@ -1007,7 +1033,18 @@ def copy_kv_cache_blocks_inplace(
             # Fold virtual block splitting into the shape so that dim 0 counts
             # scheduler blocks; unflatten of dim 0 is always a view.
             blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
-        blocks[dst] = blocks[src]
+        if direct_copy and blocks.is_cuda and blocks.is_contiguous():
+            # Copy bits in wide words where possible, including packed mixed-dtype
+            # cache pages. Odd-sized pages use byte loads/stores with a tail mask.
+            rows = blocks.view(num_blocks, -1).view(torch.uint8)
+            if rows.shape[1] % 8 == 0 and rows.data_ptr() % 8 == 0:
+                rows = rows.view(torch.int64)
+            row_size = rows.shape[1]
+            if row_size:
+                grid = (len(kv_cache_block_copies) * triton.cdiv(row_size, 1024),)
+                _copy_kv_blocks_kernel[grid](rows, indices, row_size, BLOCK_SIZE=1024)
+        else:
+            blocks[dst] = blocks[src]
 
 
 def get_replayssm_block_copy_tensors(

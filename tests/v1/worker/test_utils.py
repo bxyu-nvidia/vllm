@@ -428,6 +428,45 @@ def test_hisparse_registration_chunks_end_between_host_blocks():
     )
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("page_bytes", [7, 8192, 8216])
+@pytest.mark.parametrize(
+    "pairs",
+    [
+        [(0, 2), (0, 3)],  # Repeated sources are safe for direct copying.
+        [(0, 1), (1, 2)],  # A chain must read the original source values.
+        [(0, 1), (1, 0)],  # A swap requires a snapshot.
+        [(0, 0), (1, 2)],
+        [],
+    ],
+)
+def test_copy_kv_cache_blocks_preserves_source_snapshot(device, page_bytes, pairs):
+    num_blocks = 4
+    # Arbitrary bytes also cover NaN payloads in float-backed cache pages.
+    cache = torch.randint(
+        0, 256, (num_blocks, page_bytes), dtype=torch.uint8, device=device
+    )
+    expected = cache.clone()
+    if pairs:
+        src, dst = zip(*pairs)
+        expected[list(dst)] = cache[list(src)]
+    copy_kv_cache_blocks_inplace(
+        [cache, cache],  # Duplicate aliases must not apply chained copies twice.
+        num_blocks,
+        [KVCacheBlockCopy(src, dst) for src, dst in pairs],
+    )
+    assert torch.equal(cache, expected)
+
+
 def test_copy_cpu_kv_cache_logical_blocks_ignores_storage_padding():
     backing = torch.full((10, 2, 3), -1, dtype=torch.float32)
     cache = backing[1:9]
