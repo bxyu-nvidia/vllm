@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field, model_validator
 
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.utils import config
 
 if TYPE_CHECKING:
@@ -39,18 +40,25 @@ class DWDPConfig:
     merge_free: bool = False
     """Read resident experts directly with Prims instead of copying them to staging."""
     allow_cuda_graph: bool = False
-    """Allow CUDA graphs and vLLM piecewise compilation."""
+    """Allow CUDA graph capture; compilation without graphs needs no opt-in."""
 
     def verify_speculative_config(
-        self, speculative_config: "SpeculativeConfig | None", *, enforce_eager: bool
+        self,
+        speculative_config: "SpeculativeConfig | None",
+        *,
+        enforce_eager: bool,
+        cudagraph_mode: CUDAGraphMode | None,
     ) -> None:
         """Validate target-only DWDP with a replicated MTP drafter."""
         if speculative_config is None:
             return
         if speculative_config.method != "mtp":
             raise ValueError("DWDP currently supports only MTP speculative decoding")
-        if not enforce_eager:
-            raise ValueError("DWDP with MTP requires --enforce-eager")
+        if not enforce_eager and cudagraph_mode != CUDAGraphMode.NONE:
+            raise ValueError(
+                "DWDP with MTP does not support CUDA graphs; use --enforce-eager "
+                'or --compilation-config \'{"mode":3,"cudagraph_mode":"NONE"}\''
+            )
 
     @model_validator(mode="after")
     def validate_rank(self) -> "DWDPConfig":

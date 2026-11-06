@@ -1722,11 +1722,15 @@ class VllmConfig:
                     "weight transfer are unsupported"
                 )
             if not self.model_config.enforce_eager:
-                if not self.offload_config.dwdp.allow_cuda_graph:
-                    raise ValueError(
-                        "DWDP requires --enforce-eager or allow_cuda_graph"
-                    )
                 graph_mode = self.compilation_config.cudagraph_mode
+                if (
+                    graph_mode != CUDAGraphMode.NONE
+                    and not self.offload_config.dwdp.allow_cuda_graph
+                ):
+                    raise ValueError(
+                        "DWDP requires cudagraph_mode=NONE, --enforce-eager "
+                        "or allow_cuda_graph"
+                    )
                 if self.compilation_config.mode not in (
                     None,
                     CompilationMode.NONE,
@@ -1744,7 +1748,9 @@ class VllmConfig:
                         "DWDP CUDA timing diagnostics require eager execution"
                     )
             self.offload_config.dwdp.verify_speculative_config(
-                self.speculative_config, enforce_eager=self.model_config.enforce_eager
+                self.speculative_config,
+                enforce_eager=self.model_config.enforce_eager,
+                cudagraph_mode=self.compilation_config.cudagraph_mode,
             )
             if self.lora_config is not None:
                 raise ValueError("DWDP does not yet support LoRA")

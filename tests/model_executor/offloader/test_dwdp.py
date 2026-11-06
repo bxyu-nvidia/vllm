@@ -15,6 +15,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from vllm.config import DeviceConfig, DWDPConfig, ModelConfig, OffloadConfig, VllmConfig
+from vllm.config.compilation import CompilationConfig, CompilationMode, CUDAGraphMode
 from vllm.config.weight_transfer import WeightTransferConfig
 from vllm.model_executor.offloader.dwdp import (
     DWDPWeightManager,
@@ -25,23 +26,39 @@ from vllm.model_executor.offloader.dwdp_health import PeerProcessMonitor
 
 
 @pytest.mark.parametrize(
-    "method,eager,error",
+    "method,eager,graph_mode,error",
     [
-        (None, False, None),
-        ("mtp", True, None),
-        ("mtp", False, "requires --enforce-eager"),
-        ("eagle", True, "only MTP"),
-        ("ngram", True, "only MTP"),
+        (None, False, CUDAGraphMode.NONE, None),
+        ("mtp", True, CUDAGraphMode.FULL, None),
+        ("mtp", False, CUDAGraphMode.NONE, None),
+        ("mtp", False, None, "does not support CUDA graphs"),
+        ("mtp", False, CUDAGraphMode.FULL, "does not support CUDA graphs"),
+        ("mtp", False, CUDAGraphMode.PIECEWISE, "does not support CUDA graphs"),
+        ("mtp", False, CUDAGraphMode.FULL_DECODE_ONLY, "does not support CUDA graphs"),
+        (
+            "mtp",
+            False,
+            CUDAGraphMode.FULL_AND_PIECEWISE,
+            "does not support CUDA graphs",
+        ),
+        ("eagle", True, CUDAGraphMode.NONE, "only MTP"),
+        ("eagle", False, CUDAGraphMode.NONE, "only MTP"),
+        ("ngram", True, CUDAGraphMode.NONE, "only MTP"),
     ],
 )
-def test_dwdp_speculative_policy(method, eager, error):
+@pytest.mark.parametrize("allow_cuda_graph", [False, True])
+def test_dwdp_speculative_policy(method, eager, graph_mode, error, allow_cuda_graph):
     spec = SimpleNamespace(method=method) if method is not None else None
-    config = DWDPConfig()
+    config = DWDPConfig(allow_cuda_graph=allow_cuda_graph)
     if error is not None:
         with pytest.raises(ValueError, match=error):
-            config.verify_speculative_config(spec, enforce_eager=eager)
+            config.verify_speculative_config(
+                spec, enforce_eager=eager, cudagraph_mode=graph_mode
+            )
     else:
-        config.verify_speculative_config(spec, enforce_eager=eager)
+        config.verify_speculative_config(
+            spec, enforce_eager=eager, cudagraph_mode=graph_mode
+        )
 
 
 @pytest.mark.parametrize("dwdp", [False, True])
@@ -255,15 +272,10 @@ def test_dwdp_config_rejects_cpu_offload_and_missing_rendezvous():
         DWDPConfig(rank=4, world_size=4)
 
 
-@pytest.mark.parametrize("feature", ["sleep", "weight_transfer"])
-def test_dwdp_rejects_features_that_can_invalidate_live_sources(
-    tmp_path, monkeypatch, feature
-):
+@pytest.fixture
+def tiny_model_path(tmp_path):
     from transformers import OPTConfig
 
-    from vllm.platforms import current_platform
-
-    monkeypatch.setattr(current_platform, "is_sleep_mode_available", lambda: True)
     OPTConfig(
         architectures=["OPTForCausalLM"],
         hidden_size=128,
@@ -272,8 +284,52 @@ def test_dwdp_rejects_features_that_can_invalidate_live_sources(
         ffn_dim=256,
         vocab_size=128,
     ).save_pretrained(tmp_path)
+    return str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "mode,graph_mode,allow_cuda_graph,error",
+    [
+        (3, "NONE", False, None),
+        (0, "NONE", False, None),
+        (3, "PIECEWISE", False, "requires cudagraph_mode=NONE"),
+        (3, "PIECEWISE", True, None),
+        (0, "PIECEWISE", True, "supports vLLM compilation"),
+        (1, "NONE", False, "supports vLLM compilation"),
+        (2, "NONE", False, "supports vLLM compilation"),
+    ],
+)
+def test_dwdp_compilation_policy(
+    tiny_model_path, mode, graph_mode, allow_cuda_graph, error
+):
+    """Compilation with graphs disabled needs no graph-capture opt-in."""
+    kwargs = dict(
+        model_config=ModelConfig(model=tiny_model_path, enforce_eager=False),
+        device_config=DeviceConfig(device="cpu"),
+        offload_config=OffloadConfig(
+            dwdp=DWDPConfig(allow_cuda_graph=allow_cuda_graph)
+        ),
+        compilation_config=CompilationConfig(mode=mode, cudagraph_mode=graph_mode),
+    )
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            VllmConfig(**kwargs)
+    else:
+        config = VllmConfig(**kwargs)
+        assert config.compilation_config.mode == CompilationMode(mode)
+        assert config.compilation_config.cudagraph_mode == CUDAGraphMode[graph_mode]
+        assert not config.model_config.enforce_eager
+
+
+@pytest.mark.parametrize("feature", ["sleep", "weight_transfer"])
+def test_dwdp_rejects_features_that_can_invalidate_live_sources(
+    tiny_model_path, monkeypatch, feature
+):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "is_sleep_mode_available", lambda: True)
     model = ModelConfig(
-        model=str(tmp_path), enforce_eager=True, enable_sleep_mode=feature == "sleep"
+        model=tiny_model_path, enforce_eager=True, enable_sleep_mode=feature == "sleep"
     )
     transfer = WeightTransferConfig() if feature == "weight_transfer" else None
     with pytest.raises(ValueError, match="immutable resident weights"):
