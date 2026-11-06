@@ -79,6 +79,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ):
         offloader = get_offloader()
         if isinstance(offloader, DWDPWeightOffloader):
+            if offloader.config.collect_expert_usage and self.is_monolithic:
+                raise ValueError(
+                    "DWDP expert usage diagnostics require externally routed experts; "
+                    "use the flashinfer_prims or triton MoE backend"
+                )
             if (
                 offloader.config.merge_free
                 and self.unquantized_backend != UnquantizedMoeBackend.FLASHINFER_PRIMS
@@ -350,6 +355,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
+        if layer.dwdp_manager is not None and layer.dwdp_manager.collect_expert_usage:
+            layer.dwdp_manager.record_expert_usage(layer.layer_name, topk_ids)
         weights = (
             layer.dwdp_manager.layer(layer.layer_name, x.shape[0])
             if layer.dwdp_manager is not None

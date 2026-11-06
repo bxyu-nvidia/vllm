@@ -102,6 +102,30 @@ snapshots without synchronization. Timing diagnostics require eager execution.
 These include eager dispatch gaps; they are
 not running averages or exported Prometheus metrics.
 
+Set `"collect_expert_usage":true` in `--dwdp-config` to log the number of distinct
+local and remote experts selected by each batch for each target MoE layer:
+
+```text
+DWDP expert usage rank=0 forward=12 layer=... tokens=16960 remote=380/384 local=128/128
+```
+
+The count is the union of valid routed expert IDs across tokens and top-k slots,
+not the number of token/expert assignments. `remote=380/384` means that only four
+remote experts could have been omitted from this layer's weight transfer.
+Ownership uses the DWDP rank's contiguous expert range, including uneven shards.
+Padding IDs outside `[0, num_experts)` are ignored. `tokens` is the number of
+rows in the routing tensor; `forward` is the manager's forward enqueue counter.
+Warmup/dummy forwards are included; this does not measure completed requests.
+
+Collection defaults to off and is independent of `collect_metrics`. It uses the
+existing routing decisions without changing them, but synchronizes routing to
+CPU and logs every layer, so **disable it for latency/throughput profiling**.
+It supports Prims/Triton externally routed MoE and compilation with CUDA graphs
+disabled; monolithic routing and `allow_cuda_graph=true` are rejected.
+`manager.metrics()["expert_usage"]` returns the latest snapshot for each layer
+(including forward counter, token count and used/available local/remote experts).
+It does not keep unbounded per-batch history or export Prometheus metrics.
+
 For an offline `LLM` engine, retrieve these diagnostics through the named worker
 RPC:
 

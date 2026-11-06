@@ -99,6 +99,7 @@ class DWDPWeightManager:
         collect_metrics: Enable CUDA timing events for local pipeline diagnostics.
         merge_free: Leave resident expert regions uncopied for split-weight kernels.
         allow_cuda_graph: Enable graph capture with the serial-copy fallback.
+        collect_expert_usage: Log routed expert counts; synchronizes routing to CPU.
 
     """
 
@@ -112,11 +113,15 @@ class DWDPWeightManager:
         collect_metrics: bool = False,
         merge_free: bool = False,
         allow_cuda_graph: bool = False,
+        *,
+        collect_expert_usage: bool = False,
     ) -> None:
         if world_size < 2 or not 0 <= rank < world_size:
             raise ValueError("DWDP requires world_size >= 2 and a valid rank")
         if slice_bytes < 0:
             raise ValueError("slice_bytes must be nonnegative")
+        if collect_expert_usage and allow_cuda_graph:
+            raise ValueError("DWDP expert usage diagnostics do not support CUDA graphs")
         self.rank = rank
         self.world_size = world_size
         self.device = torch.device(device)
@@ -125,6 +130,8 @@ class DWDPWeightManager:
         self.slice_bytes = slice_bytes
         self.prefetch = prefetch
         self.collect_metrics = collect_metrics
+        self.collect_expert_usage = collect_expert_usage
+        self._expert_usage: dict[str, dict[str, int]] = {}
         self.merge_free = merge_free
         self.allow_cuda_graph = allow_cuda_graph
         self._capture_id: int | None = None
@@ -505,6 +512,46 @@ class DWDPWeightManager:
             slot.has_consumer = True
             self._active = False
 
+    def record_expert_usage(self, name: str, topk_ids: torch.Tensor) -> None:
+        """Record one batch's routing before entering its layer context.
+
+        Diagnostic only: materializing unique IDs on CPU synchronizes routing.
+        Negative/out-of-range padding IDs are excluded. No routing is recomputed.
+        """
+        if not self.collect_expert_usage:
+            return
+        if topk_ids.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DWDP expert usage diagnostics do not support CUDA graphs"
+            )
+        index = self._indices[name]
+        layer = self.layers[index]
+        start, end = expert_range(layer.num_experts, self.rank, self.world_size)
+        ids = torch.unique(topk_ids.detach()).cpu().tolist()
+        used = [expert for expert in ids if 0 <= expert < layer.num_experts]
+        local_used = sum(start <= expert < end for expert in used)
+        usage = {
+            "forward_enqueue": self.forward_enqueues + (index == 0),
+            "tokens": topk_ids.shape[0],
+            "local_experts_used": local_used,
+            "local_experts_available": end - start,
+            "remote_experts_used": len(used) - local_used,
+            "remote_experts_available": layer.num_experts - (end - start),
+        }
+        self._expert_usage[name] = usage
+        logger.info(
+            "DWDP expert usage rank=%d forward=%d layer=%s tokens=%d "
+            "remote=%d/%d local=%d/%d",
+            self.rank,
+            usage["forward_enqueue"],
+            name,
+            usage["tokens"],
+            usage["remote_experts_used"],
+            usage["remote_experts_available"],
+            usage["local_experts_used"],
+            usage["local_experts_available"],
+        )
+
     def metrics(self) -> dict:
         """Return counters and the latest completed layer timings without waiting.
 
@@ -536,6 +583,7 @@ class DWDPWeightManager:
             "forward_enqueues": self.forward_enqueues,
             "token_enqueues": self.token_enqueues,
             "layers": timings,
+            "expert_usage": {name: dict(v) for name, v in self._expert_usage.items()},
         }
 
     def close(self) -> None:
@@ -564,6 +612,7 @@ class DWDPWeightManager:
         self._copy_plans.clear()
         self._capture_copy_plans.clear()
         self._timings.clear()
+        self._expert_usage.clear()
         self._closed = True
 
 
@@ -586,6 +635,7 @@ class DWDPWeightOffloader(BaseOffloader):
                 self.config.collect_metrics,
                 self.config.merge_free,
                 self.config.allow_cuda_graph,
+                collect_expert_usage=self.config.collect_expert_usage,
             )
         return self._manager
 
