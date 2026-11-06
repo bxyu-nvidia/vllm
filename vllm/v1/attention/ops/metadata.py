@@ -109,3 +109,52 @@ def _indexer_decode_metadata_kernel(
         start = tl.load(query_start_loc + token)
         end = tl.load(query_start_loc + token + 1)
         tl.store(per_req_lens + token, end - start)
+
+
+@triton.jit(do_not_specialize=["num_requests"])
+def _get_aligned_state_indices_kernel(
+    block_table_ptr,
+    seq_lens_ptr,
+    state_indices_ptr,
+    block_table_stride_0: tl.constexpr,
+    block_table_stride_1: tl.constexpr,
+    seq_lens_stride: tl.constexpr,
+    state_indices_stride_0: tl.constexpr,
+    state_indices_stride_1: tl.constexpr,
+    num_requests,
+    CACHE_BLOCK_SIZE: tl.constexpr,
+    NUM_STATE_SLOTS: tl.constexpr,
+    BLOCK_STATE_SLOTS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    launch_pdl: tl.constexpr,
+):
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    valid_row = rows < num_requests
+    seq_lens = tl.load(
+        seq_lens_ptr + rows * seq_lens_stride,
+        mask=valid_row,
+        other=1,
+    )
+    # Triton truncates signed division toward zero, unlike PyTorch floor
+    # division. Clamping makes both semantics equivalent for seq_lens <= 0.
+    first_state_slot = tl.maximum((seq_lens - 1) // CACHE_BLOCK_SIZE, 0)
+
+    state_slots = tl.arange(0, BLOCK_STATE_SLOTS)
+    valid_state_slot = state_slots < NUM_STATE_SLOTS
+    state_indices = tl.load(
+        block_table_ptr
+        + rows[:, None] * block_table_stride_0
+        + (first_state_slot[:, None] + state_slots[None, :]) * block_table_stride_1,
+        mask=valid_row[:, None] & valid_state_slot[None, :],
+    )
+    tl.store(
+        state_indices_ptr
+        + rows[:, None] * state_indices_stride_0
+        + state_slots[None, :] * state_indices_stride_1,
+        state_indices,
+        mask=valid_row[:, None] & valid_state_slot[None, :],
+    )
