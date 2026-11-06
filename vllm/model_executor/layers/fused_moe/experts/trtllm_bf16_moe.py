@@ -134,6 +134,11 @@ class TrtLlmBf16ExpertsBase:
 class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular):
     """BF16 unquantized TRTLLM-Gen MoE kernels. Supports modular interface."""
 
+    def _routed_moe(self, **kwargs):
+        from flashinfer.fused_moe import trtllm_bf16_routed_moe
+
+        return trtllm_bf16_routed_moe(**kwargs)
+
     @staticmethod
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
@@ -201,12 +206,14 @@ class TrtLlmBf16ExpertsModular(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsModular)
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
-        import flashinfer
+        if hidden_states.shape[0] == 0:
+            return
+
         from flashinfer.fused_moe import WeightLayout
 
         topk_ids = topk_ids.to(dtype=torch.int32)
 
-        result = flashinfer.fused_moe.trtllm_bf16_routed_moe(
+        result = self._routed_moe(
             topk_ids=(topk_ids, topk_weights),
             hidden_states=hidden_states,
             gemm1_weights=view_as_block_major_k(w1),
@@ -275,13 +282,14 @@ class TrtLlmBf16ExpertsMonolithic(TrtLlmBf16ExpertsBase, mk.FusedMoEExpertsMonol
         topk_group: int | None = None,
         routing_replay_out: torch.Tensor | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
-        import flashinfer
-
         assert activation in [MoEActivation.SILU, MoEActivation.RELU2_NO_MUL]
 
         num_tokens = hidden_states.shape[0]
-        # The runner divides by the token count on the host, so an idle rank's
-        # dummy 0-token forward has to keep the finalized (empty) form.
+        if num_tokens == 0:
+            return torch.empty_like(hidden_states)
+
+        import flashinfer
+
         defer = self.moe_config.should_defer_moe_finalize(num_tokens)
 
         flashinfer_output = flashinfer.fused_moe.trtllm_bf16_moe(

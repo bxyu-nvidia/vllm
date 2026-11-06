@@ -1695,6 +1695,66 @@ class VllmConfig:
                 "precision for chunked prefill triton kernels."
             )
 
+        if self.offload_config.dwdp is not None:
+            parallel = self.parallel_config
+            if (
+                parallel.tensor_parallel_size != 1
+                or parallel.pipeline_parallel_size != 1
+                or parallel.data_parallel_size != 1
+                or parallel.prefill_context_parallel_size != 1
+                or parallel.decode_context_parallel_size != 1
+                or parallel.enable_expert_parallel
+                or parallel.enable_eplb
+                or parallel.enable_dbo
+            ):
+                raise ValueError(
+                    "DWDP requires independent TP1/PP1/DP1/EP1 workers without "
+                    "context parallelism, DBO or EPLB"
+                )
+            if self.model_config is None:
+                raise ValueError("DWDP requires a model configuration")
+            if (
+                self.model_config.enable_sleep_mode
+                or self.weight_transfer_config is not None
+            ):
+                raise ValueError(
+                    "DWDP requires immutable resident weights; sleep mode and "
+                    "weight transfer are unsupported"
+                )
+            if not self.model_config.enforce_eager:
+                graph_mode = self.compilation_config.cudagraph_mode
+                if (
+                    graph_mode != CUDAGraphMode.NONE
+                    and not self.offload_config.dwdp.allow_cuda_graph
+                ):
+                    raise ValueError(
+                        "DWDP requires cudagraph_mode=NONE, --enforce-eager "
+                        "or allow_cuda_graph"
+                    )
+                if self.compilation_config.mode not in (
+                    None,
+                    CompilationMode.NONE,
+                    CompilationMode.VLLM_COMPILE,
+                ) or (
+                    self.compilation_config.mode == CompilationMode.NONE
+                    and graph_mode.requires_piecewise_compilation()
+                ):
+                    raise ValueError(
+                        "DWDP supports vLLM compilation "
+                        "or full graphs without compilation"
+                    )
+                if self.offload_config.dwdp.collect_metrics:
+                    raise ValueError(
+                        "DWDP CUDA timing diagnostics require eager execution"
+                    )
+            self.offload_config.dwdp.verify_speculative_config(
+                self.speculative_config,
+                enforce_eager=self.model_config.enforce_eager,
+                cudagraph_mode=self.compilation_config.cudagraph_mode,
+            )
+            if self.lora_config is not None:
+                raise ValueError("DWDP does not yet support LoRA")
+
         if self.model_config is not None and self.model_config.enforce_eager:
             self.compilation_config.mode = CompilationMode.NONE
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE

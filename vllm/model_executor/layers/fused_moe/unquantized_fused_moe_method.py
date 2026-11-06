@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -29,6 +30,8 @@ from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
 )
+from vllm.model_executor.offloader import get_offloader
+from vllm.model_executor.offloader.dwdp import DWDPWeightOffloader, expert_range
 from vllm.model_executor.utils import (
     is_weights_pre_processed,
     replace_parameter,
@@ -74,6 +77,36 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        offloader = get_offloader()
+        if isinstance(offloader, DWDPWeightOffloader):
+            if (
+                offloader.config.merge_free
+                and self.unquantized_backend != UnquantizedMoeBackend.FLASHINFER_PRIMS
+            ):
+                raise ValueError(
+                    "Merge-free DWDP requires the flashinfer_prims backend"
+                )
+            if (
+                params_dtype != torch.bfloat16
+                or self.moe.has_bias
+                or self.unquantized_backend
+                not in (
+                    UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+                    UnquantizedMoeBackend.FLASHINFER_PRIMS,
+                    UnquantizedMoeBackend.TRITON,
+                )
+            ):
+                raise ValueError(
+                    "DWDP currently requires BF16 experts without bias and the "
+                    "FlashInfer TRTLLM, Prims or Triton MoE backend"
+                )
+            layer.dwdp_manager = offloader.manager
+            start, end = expert_range(
+                num_experts, offloader.config.rank, offloader.config.world_size
+            )
+            layer.dwdp_expert_range = (start, end)
+            num_experts = end - start
+            self.supports_pre_processed_weights = False
         unpadded_intermediate = self.moe.intermediate_size_per_partition_unpadded
         assert unpadded_intermediate is not None
         if self.moe.is_act_and_mul:
@@ -218,6 +251,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
 
     def process_weights_after_loading(self, layer: "RoutedExperts") -> None:
+        if layer.dwdp_manager is not None and layer.dwdp_manager.initialized:
+            raise RuntimeError("DWDP source weights are immutable after initialization")
         super().process_weights_after_loading(layer)
 
         if is_weights_pre_processed():
@@ -255,6 +290,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 layer=layer,
                 w13=layer.w13_weight,
                 w2=layer.w2_weight,
+            )
+
+        if layer.dwdp_manager is not None:
+            layer.dwdp_manager.register_layer(
+                layer.layer_name,
+                layer.global_num_experts,
+                (layer.w13_weight.detach(), layer.w2_weight.detach()),
             )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
@@ -308,19 +350,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
-        return self.moe_kernel.apply(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            activation=layer.activation,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            global_num_experts=layer.global_num_experts,
-            expert_map=layer.expert_map,
-            shared_experts=shared_experts,
-            shared_experts_input=shared_experts_input,
+        weights = (
+            layer.dwdp_manager.layer(layer.layer_name, x.shape[0])
+            if layer.dwdp_manager is not None
+            else nullcontext((layer.w13_weight, layer.w2_weight))
         )
+        with weights as (w13, w2):
+            return self.moe_kernel.apply(
+                hidden_states=x,
+                w1=w13,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=layer.activation,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
 
     def forward_cuda(
         self,
@@ -349,18 +397,24 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         assert self.is_monolithic
         assert self.moe_kernel is not None
-        return self.moe_kernel.apply_monolithic(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            router_logits,
-            activation=layer.activation,
-            global_num_experts=layer.global_num_experts,
-            expert_map=layer.expert_map,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            num_expert_group=layer.num_expert_group,
-            topk_group=layer.topk_group,
-            e_score_correction_bias=layer.e_score_correction_bias,
-            routed_scaling_factor=layer.routed_scaling_factor,
-            routing_sink=layer.routing_sink,
+        weights = (
+            layer.dwdp_manager.layer(layer.layer_name, x.shape[0])
+            if layer.dwdp_manager is not None
+            else nullcontext((layer.w13_weight, layer.w2_weight))
         )
+        with weights as (w13, w2):
+            return self.moe_kernel.apply_monolithic(
+                x,
+                w13,
+                w2,
+                router_logits,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                num_expert_group=layer.num_expert_group,
+                topk_group=layer.topk_group,
+                e_score_correction_bias=layer.e_score_correction_bias,
+                routed_scaling_factor=layer.routed_scaling_factor,
+                routing_sink=layer.routing_sink,
+            )

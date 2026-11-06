@@ -36,6 +36,7 @@ logger = init_logger(__name__)
 
 class UnquantizedMoeBackend(Enum):
     FLASHINFER_TRTLLM = "FlashInfer TRTLLM"
+    FLASHINFER_PRIMS = "FlashInfer Prims"
     FLASHINFER_CUTLASS = "FlashInfer CUTLASS"
     AITER = "ROCm AITER"
     TRITON = "TRITON"
@@ -109,6 +110,12 @@ def _get_priority_backends(moe_config: FusedMoEConfig) -> list[UnquantizedMoeBac
 def backend_to_kernel_cls(
     backend: UnquantizedMoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
+    if backend == UnquantizedMoeBackend.FLASHINFER_PRIMS:
+        from vllm.model_executor.layers.fused_moe.experts.prims_bf16_moe import (
+            PrimsBf16Experts,
+        )
+
+        return [PrimsBf16Experts]
     if backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM:
         from vllm.model_executor.layers.fused_moe.experts.trtllm_bf16_moe import (
             TrtLlmBf16ExpertsModular,
@@ -183,6 +190,7 @@ def map_unquantized_backend(runner_backend: MoEBackend) -> UnquantizedMoeBackend
         "triton": UnquantizedMoeBackend.TRITON,
         "batched_triton": UnquantizedMoeBackend.BATCHED_TRITON,
         "flashinfer_trtllm": UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+        "flashinfer_prims": UnquantizedMoeBackend.FLASHINFER_PRIMS,
         "flashinfer_cutlass": UnquantizedMoeBackend.FLASHINFER_CUTLASS,
         "aiter": UnquantizedMoeBackend.AITER,
     }
@@ -387,7 +395,10 @@ def unquantized_round_up_hidden_size_and_intermediate_size(
     intermediate_size: int,
 ) -> tuple[int, int]:
     """Round up dimensions before allocation to satisfy the selected kernel."""
-    if backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM:
+    if backend in (
+        UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+        UnquantizedMoeBackend.FLASHINFER_PRIMS,
+    ):
         intermediate_size = round_up(intermediate_size, 128)
     elif backend == UnquantizedMoeBackend.AITER:
         intermediate_size = round_up(
@@ -467,7 +478,10 @@ def convert_to_unquantized_kernel_format(
             # Non-gated MoE: w13 is a single projection, no need to swap.
             w13_weight = swap_w13_to_w31(w13_weight)
 
-    elif unquantized_backend == UnquantizedMoeBackend.FLASHINFER_TRTLLM:
+    elif unquantized_backend in (
+        UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+        UnquantizedMoeBackend.FLASHINFER_PRIMS,
+    ):
         is_act_and_mul = moe_config.is_act_and_mul
         # Kernel requires intermediate_size_per_partition % 128 == 0 (BlockMajorK
         # weight layout uses block_k=128). Pad along the intermediate dim when

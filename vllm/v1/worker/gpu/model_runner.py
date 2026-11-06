@@ -2368,6 +2368,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         torch.accelerator.synchronize()
         if self.aux_output_connector is not None:
             self.aux_output_connector.close()
+        if self.vllm_config.offload_config.dwdp is not None:
+            from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
+            from vllm.compilation.cuda_graph import CUDAGraphWrapper
+            from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
+
+            CUDAGraphWrapper.clear_all_graphs()
+            BreakableCUDAGraphWrapper.clear_all_graphs()
+            if hasattr(self, "model"):
+                for module in self.model.modules():
+                    if isinstance(module, TorchCompileWithNoGuardsWrapper):
+                        module.cleanup()
+                del module
+        get_offloader().shutdown()
         set_offloader(None)
         self.cudagraph_manager = None
         self.fast_prefill = None
@@ -2398,6 +2411,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         gc.collect()
         torch.accelerator.empty_cache()
+        if self.vllm_config.offload_config.dwdp is not None:
+            torch.cuda.ipc_collect()
         logger.debug("Cleaned up model weights, KV caches, and workspace")
 
     ########### EPLB methods start ###########

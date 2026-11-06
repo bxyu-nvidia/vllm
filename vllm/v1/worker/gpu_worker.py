@@ -1177,6 +1177,16 @@ class Worker(WorkerBase):
         """Get encoder timing stats from model runner."""
         return self.model_runner.get_encoder_timing_stats()
 
+    def get_dwdp_metrics(self) -> dict | None:
+        """Return local weight transport diagnostics without peer synchronization."""
+        from vllm.model_executor.offloader import get_offloader
+        from vllm.model_executor.offloader.dwdp import DWDPWeightOffloader
+
+        offloader = get_offloader()
+        if isinstance(offloader, DWDPWeightOffloader):
+            return offloader.manager.metrics()
+        return None
+
     def annotate_profile(self, scheduler_output):
         # add trace annotation so that we can easily distinguish
         # context/generation request numbers in each iteration.
