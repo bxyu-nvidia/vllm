@@ -15,6 +15,15 @@ from vllm.triton_utils import tl, triton
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
+def chunk_scan_chunk_bucket(nchunks: int) -> int:
+    """Separate latency/throughput workloads without tuning every chunk count.
+
+    Cap at 128 chunks to bound warmup memory and the number of tuning searches.
+    Large prefills share the throughput configuration warmed at that size.
+    """
+    return min(128, 1 << (max(1, nchunks) - 1).bit_length())
+
+
 def _drop_racy_wgmma_configs(configs: list[triton.Config]) -> list[triton.Config]:
     """Drop the configs that Triton miscompiles on sm90.
 
@@ -165,9 +174,21 @@ def _drop_racy_wgmma_configs(configs: list[triton.Config]) -> list[triton.Config
             ),
         ]
     ),
-    key=["chunk_size", "hdim", "dstate", "IS_CAUSAL"],
+    key=[
+        "chunk_size",
+        "hdim",
+        "dstate",
+        "nheads",
+        "nheads_ngroups_ratio",
+        "nchunks_bucket",
+        "IS_CAUSAL",
+        "HAS_INITSTATES",
+        "HAS_D",
+        "D_HAS_HDIM",
+        "HAS_Z",
+    ],
 )
-@triton.jit
+@triton.jit(do_not_specialize=["nheads", "nchunks_bucket"])
 def _chunk_scan_fwd_kernel(
     # Pointers to matrices
     cb_ptr,
@@ -187,6 +208,9 @@ def _chunk_scan_fwd_kernel(
     hdim: tl.constexpr,
     dstate: tl.constexpr,
     nheads_ngroups_ratio: tl.constexpr,
+    # Tuning-only dimensions: do not compile a new binary for each bucket.
+    nheads: tl.int32,
+    nchunks_bucket: tl.int32,
     # Strides
     stride_cb_chunk: tl.int64,
     stride_cb_head: tl.int64,
@@ -505,6 +529,8 @@ def _chunk_scan_fwd(
         hdim=headdim,
         dstate=dstate,
         nheads_ngroups_ratio=nheads // ngroups,
+        nheads=nheads,
+        nchunks_bucket=chunk_scan_chunk_bucket(nchunks),
         stride_cb_chunk=cb.stride(0),
         stride_cb_head=cb.stride(1),
         stride_cb_csize_m=cb.stride(2),
