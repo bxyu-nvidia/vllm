@@ -18,6 +18,7 @@ from typing_extensions import runtime_checkable
 
 from vllm.config import CacheConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import _layout_from_name
+from vllm.triton_utils import triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d, np_to_pinned_tensor
@@ -1180,6 +1181,37 @@ def mamba_get_block_table_tensor(
         return block_table
     else:
         assert isinstance(kv_cache_spec, MambaSpec)
+        if block_table.is_cuda:
+            from vllm.v1.attention.ops.metadata import (
+                _get_aligned_state_indices_kernel,
+            )
+
+            num_requests = seq_lens.numel()
+            num_state_slots = 1 + kv_cache_spec.num_speculative_blocks
+            state_indices = torch.empty(
+                (num_requests, num_state_slots),
+                dtype=block_table.dtype,
+                device=block_table.device,
+            )
+            if num_requests:
+                _get_aligned_state_indices_kernel[(triton.cdiv(num_requests, 32),)](
+                    block_table,
+                    seq_lens,
+                    state_indices,
+                    block_table.stride(0),
+                    block_table.stride(1),
+                    seq_lens.stride(0),
+                    state_indices.stride(0),
+                    state_indices.stride(1),
+                    num_requests,
+                    CACHE_BLOCK_SIZE=kv_cache_spec.block_size,
+                    NUM_STATE_SLOTS=num_state_slots,
+                    BLOCK_STATE_SLOTS=triton.next_power_of_2(num_state_slots),
+                    BLOCK_ROWS=32,
+                    num_warps=1,
+                    launch_pdl=False,
+                )
+            return state_indices
         # NOTE: For 0-length requests in CUDA graph, use a start_index of 0
         # to handle the invalid block table.
         start_indices = (seq_lens - 1) // kv_cache_spec.block_size
