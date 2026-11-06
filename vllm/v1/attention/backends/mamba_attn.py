@@ -355,6 +355,22 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             common.num_decode_tokens,
         )
 
+        # Checkpoint destinations are group-local, but equal chunk boundaries
+        # can share these read-only tensors even when full metadata cannot.
+        cache = common_attn_metadata._mamba_chunk_metadata_cache
+        if cache is not None:
+            key = (
+                chunk_size,
+                tuple(num_computed_tokens_p_cpu.tolist()),
+                tuple(query_start_loc_p_cpu.tolist()),
+                tuple(checkpoint_offsets_p)
+                if checkpoint_offsets_p is not None
+                else None,
+                common_attn_metadata.query_start_loc.device,
+            )
+            if key in cache:
+                return cache[key]
+
         cu_chunk_seqlen, seq_idx, last_chunk_indices, ckpt_idxs = (
             self._compute_chunk_metadata(
                 chunk_size,
@@ -382,7 +398,10 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             if any(idx >= 0 for idx in ckpt_idxs)
             else None
         )
-        return cu_chunk_seqlen_p, seq_idx_p, last_chunk_indices_p, ckpt_idx_p
+        result = cu_chunk_seqlen_p, seq_idx_p, last_chunk_indices_p, ckpt_idx_p
+        if cache is not None:
+            cache[key] = result
+        return result
 
     def _compute_common_metadata(
         self,

@@ -37,6 +37,8 @@ class DWDPConfig:
     """Overlap the next MoE layer's copies; disable for a synchronous baseline."""
     collect_metrics: bool = False
     """Record local CUDA timing events for prefetch, exposed waits and MoE compute."""
+    collect_expert_usage: bool = False
+    """Log distinct local/remote experts per batch and layer; synchronizes GPU."""
     merge_free: bool = False
     """Read resident experts directly with Prims instead of copying them to staging."""
     allow_cuda_graph: bool = False
@@ -62,6 +64,8 @@ class DWDPConfig:
 
     @model_validator(mode="after")
     def validate_rank(self) -> "DWDPConfig":
+        if self.collect_expert_usage and self.allow_cuda_graph:
+            raise ValueError("DWDP expert usage diagnostics do not support CUDA graphs")
         if self.rank >= self.world_size:
             raise ValueError("DWDP rank must be less than world_size")
         return self

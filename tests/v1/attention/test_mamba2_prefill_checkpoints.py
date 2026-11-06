@@ -12,6 +12,7 @@ from tests.v1.attention.utils import (
     create_common_attn_metadata,
     create_vllm_config,
 )
+from vllm.v1.attention.backend import MambaChunkMetadataCache
 from vllm.v1.attention.backends.mamba2_attn import (
     Mamba2AttentionMetadataBuilder,
 )
@@ -262,30 +263,83 @@ def test_group_metadata_reuse_does_not_replace_separate_checkpoint_destinations(
         for i, builder in enumerate(builders)
     ]
     qsl = torch.tensor([0, 200], dtype=torch.int32)
-    meta = build_attn_metadata(
-        attn_groups=groups,
-        num_reqs=1,
-        num_tokens=200,
-        query_start_loc_gpu=qsl,
-        query_start_loc_cpu=qsl,
-        max_query_len=200,
-        seq_lens=torch.tensor([200]),
-        max_seq_len=200,
-        block_tables=[
-            torch.tensor([[10]], dtype=torch.int32),
-            torch.tensor([[20]], dtype=torch.int32),
-        ],
-        slot_mappings=torch.zeros((2, 200), dtype=torch.int64),
-        kv_cache_config=KVCacheConfig(
-            num_blocks=100,
-            kv_cache_tensors=[],
-            kv_cache_groups=[KVCacheGroupSpec([f"layer{i}"], spec) for i in range(2)],
-        ),
-        seq_lens_cpu_upper_bound=torch.tensor([200]),
-        is_prefilling=torch.tensor([True]),
-        mamba_checkpoint_block_ids={0: [71], 1: [91]},
-    )
+
+    def build_metadata():
+        return build_attn_metadata(
+            attn_groups=groups,
+            num_reqs=1,
+            num_tokens=200,
+            query_start_loc_gpu=qsl,
+            query_start_loc_cpu=qsl,
+            max_query_len=200,
+            seq_lens=torch.tensor([200]),
+            max_seq_len=200,
+            block_tables=[
+                torch.tensor([[10]], dtype=torch.int32),
+                torch.tensor([[20]], dtype=torch.int32),
+            ],
+            slot_mappings=torch.zeros((2, 200), dtype=torch.int64),
+            kv_cache_config=KVCacheConfig(
+                num_blocks=100,
+                kv_cache_tensors=[],
+                kv_cache_groups=[
+                    KVCacheGroupSpec([f"layer{i}"], spec) for i in range(2)
+                ],
+            ),
+            seq_lens_cpu_upper_bound=torch.tensor([200]),
+            is_prefilling=torch.tensor([True]),
+            mamba_checkpoint_block_ids={0: [71], 1: [91]},
+        )
+
+    meta = build_metadata()
     assert meta["layer0"].checkpoint_meta.state_indices.tolist() == [71]
     assert meta["layer1"].checkpoint_meta.state_indices.tolist() == [91]
     assert meta["layer0"].checkpoint_meta.offsets == [128]
     assert meta["layer1"].checkpoint_meta.offsets == [128]
+
+    for field in (
+        "cu_chunk_seqlen_p",
+        "seq_idx_p",
+        "last_chunk_indices_p",
+        "checkpoint_chunk_idx",
+    ):
+        assert getattr(meta["layer0"], field) is getattr(meta["layer1"], field)
+    next_meta = build_metadata()
+    assert next_meta["layer0"].cu_chunk_seqlen_p is not meta["layer0"].cu_chunk_seqlen_p
+    assert next_meta["layer1"].checkpoint_meta.state_indices.tolist() == [91]
+
+
+def test_chunk_metadata_cache_respects_context_and_checkpoint_offsets():
+    builder = _create_mamba2_builder()
+    cache: MambaChunkMetadataCache = {}
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[900, 100], query_lens=[900, 100]),
+        MAMBA_BLOCK_SIZE,
+        DEVICE,
+        arange_block_indices=True,
+    ).replace(
+        is_prefilling=torch.ones(2, dtype=torch.bool),
+        _mamba_chunk_metadata_cache=cache,
+    )
+    first = builder.build(0, common)
+    repeated = builder.build(0, common)
+    assert repeated.cu_chunk_seqlen_p is first.cu_chunk_seqlen_p
+
+    # Same query lengths, but a different prefix changes the chunk boundaries.
+    resumed = common.replace(
+        seq_lens=torch.tensor([1000, 100]),
+        seq_lens_cpu_upper_bound=torch.tensor([1000, 100]),
+    )
+    actual = builder.build(0, resumed)
+    reference = builder.build(0, resumed.replace(_mamba_chunk_metadata_cache=None))
+    assert actual.cu_chunk_seqlen_p is not first.cu_chunk_seqlen_p
+    torch.testing.assert_close(actual.cu_chunk_seqlen_p, reference.cu_chunk_seqlen_p)
+    torch.testing.assert_close(
+        actual.checkpoint_chunk_idx, reference.checkpoint_chunk_idx
+    )
+
+    # A group without checkpoints cannot inherit another group's chunk indices.
+    no_checkpoints = _create_mamba2_builder(num_prefill_checkpoint_blocks=0)
+    plain = no_checkpoints.build(0, common)
+    assert plain.checkpoint_chunk_idx is None
+    assert first.checkpoint_chunk_idx is not None

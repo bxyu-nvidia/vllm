@@ -383,6 +383,13 @@ class AttentionMetadata:
 T = TypeVar("T", bound=AttentionMetadata)
 
 
+# CPU chunk boundaries key immutable device tensors shared within one batch.
+MambaChunkMetadataCache = dict[
+    tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, ...] | None, torch.device],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
+]
+
+
 @dataclass
 class CommonAttentionMetadata:
     """Per-batch attention metadata, shared across layers and backends.
@@ -474,6 +481,7 @@ class CommonAttentionMetadata:
 
     _num_computed_tokens_cache: torch.Tensor | None = None
     _token_to_req_indices_cache: torch.Tensor | None = None
+    _mamba_chunk_metadata_cache: MambaChunkMetadataCache | None = None
 
     def batch_size(self) -> int:
         return self.seq_lens.shape[0]

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 import weakref
+from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -580,3 +581,129 @@ def test_sharded_loading_and_moe_outputs_match_replicated_weights(
         nprocs=2,
         join=True,
     )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "ids,local_used,remote_used",
+    [
+        ([[0, 0, 2], [7, 4, 5]], 2, 3),
+        ([[2, 3, 4], [4, 3, 2]], 3, 0),
+        ([[0, 1, 5], [6, 7, 7]], 0, 5),
+        ([[-1, 8, 9]], 0, 0),
+        ([], 0, 0),
+    ],
+)
+def test_expert_usage_counts_union_with_uneven_ownership(
+    device, ids, local_used, remote_used
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    manager = DWDPWeightManager(1, 3, torch.device("cuda:0"), collect_expert_usage=True)
+    # Counting routing needs ownership metadata but no IPC allocations.
+    manager.layers = [SimpleNamespace(name="layer0", num_experts=8)]
+    manager._indices = {"layer0": 0}
+    manager.forward_enqueues = 6
+    topk_ids = torch.tensor(ids, dtype=torch.int64, device=device).reshape(-1, 3)
+    original_ids = topk_ids.clone()
+    manager.record_expert_usage("layer0", topk_ids)
+    usage = manager.metrics()["expert_usage"]["layer0"]
+    assert usage == {
+        "forward_enqueue": 7,
+        "tokens": len(ids),
+        "local_experts_used": local_used,
+        "local_experts_available": 3,
+        "remote_experts_used": remote_used,
+        "remote_experts_available": 5,
+    }
+    torch.testing.assert_close(topk_ids, original_ids)
+    # RPC consumers cannot mutate the retained snapshot, and the next batch
+    # replaces rather than unions with the previous batch's expert set.
+    usage["remote_experts_used"] = 100
+    assert (
+        manager.metrics()["expert_usage"]["layer0"]["remote_experts_used"]
+        == remote_used
+    )
+    manager.forward_enqueues = 7
+    manager.record_expert_usage("layer0", topk_ids[:0])
+    latest = manager.metrics()["expert_usage"]["layer0"]
+    assert latest["forward_enqueue"] == 8
+    assert latest["remote_experts_used"] == latest["local_experts_used"] == 0
+
+
+def test_expert_usage_disabled_does_not_inspect_routing(monkeypatch):
+    manager = DWDPWeightManager(0, 4, torch.device("cuda:0"))
+    monkeypatch.setattr(torch, "unique", lambda *_: pytest.fail("Collected routing"))
+    manager.record_expert_usage("unregistered", None)
+    assert manager.metrics()["expert_usage"] == {}
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_expert_usage_observes_existing_routing_before_weight_wait(enabled):
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    calls = []
+    ids = torch.tensor([[0, 2], [2, 3]])
+    routing_weights = torch.ones_like(ids, dtype=torch.float32)
+    x = torch.ones(2, 4)
+    w1, w2 = object(), object()
+
+    def record(name, topk_ids):
+        assert name == "experts" and topk_ids is ids
+        calls.append("count")
+
+    def weights(name, tokens):
+        assert name == "experts" and tokens == 2
+        calls.append("weights")
+        return nullcontext((w1, w2))
+
+    def apply(**kwargs):
+        assert kwargs["topk_ids"] is ids
+        assert kwargs["topk_weights"] is routing_weights
+        assert kwargs["w1"] is w1 and kwargs["w2"] is w2
+        calls.append("compute")
+        return x
+
+    layer = SimpleNamespace(
+        dwdp_manager=SimpleNamespace(
+            collect_expert_usage=enabled, record_expert_usage=record, layer=weights
+        ),
+        layer_name="experts",
+        activation=None,
+        apply_router_weight_on_input=False,
+        global_num_experts=4,
+        expert_map=None,
+    )
+    method = SimpleNamespace(moe_kernel=SimpleNamespace(apply=apply))
+    result = UnquantizedFusedMoEMethod.forward_native(
+        method, layer, x, routing_weights, ids, None, None
+    )
+    assert result is x
+    assert calls == (["count"] if enabled else []) + ["weights", "compute"]
+
+
+def test_expert_usage_rejects_graph_capture_configuration():
+    with pytest.raises(ValueError, match="expert usage.*CUDA graphs"):
+        DWDPConfig(collect_expert_usage=True, allow_cuda_graph=True)
+    with pytest.raises(ValueError, match="expert usage.*CUDA graphs"):
+        DWDPWeightManager(
+            0,
+            4,
+            torch.device("cuda:0"),
+            collect_expert_usage=True,
+            allow_cuda_graph=True,
+        )
+
+
+def test_expert_usage_rejects_hidden_monolithic_routing(monkeypatch):
+    from vllm.model_executor.layers.fused_moe import unquantized_fused_moe_method as mod
+    from vllm.model_executor.offloader.dwdp import DWDPWeightOffloader
+
+    offloader = DWDPWeightOffloader(DWDPConfig(collect_expert_usage=True))
+    monkeypatch.setattr(mod, "get_offloader", lambda: offloader)
+    with pytest.raises(ValueError, match="externally routed experts"):
+        mod.UnquantizedFusedMoEMethod.create_weights(
+            SimpleNamespace(is_monolithic=True), None, 8, 4, 4, torch.bfloat16
+        )

@@ -22,6 +22,7 @@ from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
+    MambaChunkMetadataCache,
 )
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
 from vllm.v1.hisparse.binding import (
@@ -500,6 +501,7 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     token_to_req_indices: torch.Tensor | None = None
+    mamba_chunk_metadata_cache: MambaChunkMetadataCache = {}
     # Mamba groups with the same spec and builder differ only in their state
     # indices, so later groups re-gather those from the first group's metadata.
     # Also at capture, so FULL graphs share the batch-level buffers.
@@ -552,6 +554,7 @@ def build_attn_metadata(
             req_idx=req_idx,
             mamba_checkpoint_block_ids=(mamba_checkpoint_block_ids or {}).get(i),
             _token_to_req_indices_cache=token_to_req_indices,
+            _mamba_chunk_metadata_cache=mamba_chunk_metadata_cache,
             **common_attn_metadata_extra_kwargs,
         )
 

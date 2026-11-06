@@ -545,7 +545,17 @@ def test_allocate_compressed_mla_cache(
 
 
 @pytest.mark.parametrize("layout", list(KVCacheLayout))
-def test_copy_kv_cache_blocks_shared_storage(layout: KVCacheLayout):
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"),
+        ),
+    ],
+)
+def test_copy_kv_cache_blocks_shared_storage(layout: KVCacheLayout, device: str):
     num_blocks = 4
     num_layers = 2
     spec = FullAttentionSpec(
@@ -554,7 +564,9 @@ def test_copy_kv_cache_blocks_shared_storage(layout: KVCacheLayout):
         head_size=2,
         dtype=torch.float32,
     )
-    raw = torch.zeros(num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8)
+    raw = torch.zeros(
+        num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8, device=device
+    )
     caches = dense_kv_cache_views(raw, spec, num_blocks, num_layers, layout)
 
     for layer_idx, cache in enumerate(caches):
@@ -596,7 +608,17 @@ def test_fixed_block_stride_propagates_outward_in_lhbnc():
     assert strides[0] == strides[2] * spec.num_heads
 
 
-def test_copy_kv_cache_blocks_separate_head_groups():
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"),
+        ),
+    ],
+)
+def test_copy_kv_cache_blocks_separate_head_groups(device: str):
     # LHBNC stores each head group separately, so a block's bytes are scattered
     # across L*H regions.
     layout = KVCacheLayout.LHBNC
@@ -610,7 +632,9 @@ def test_copy_kv_cache_blocks_separate_head_groups():
         num_head_slots=2,
         state_content_bytes=2 * 2 * 4,
     )
-    raw = torch.zeros(num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8)
+    raw = torch.zeros(
+        num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8, device=device
+    )
     caches = dense_kv_cache_views(raw, spec, num_blocks, num_layers, layout)
 
     for layer_idx, cache in enumerate(caches):
@@ -641,8 +665,18 @@ def test_copy_kv_cache_blocks_separate_head_groups():
         (KVCacheLayout.BLHNC, 1),
     ],
 )
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA"),
+        ),
+    ],
+)
 def test_copy_kv_cache_blocks_with_virtual_block_splitting(
-    layout: KVCacheLayout, num_layers: int
+    layout: KVCacheLayout, num_layers: int, device: str
 ):
     num_blocks = 4
     physical_per_logical = 2
@@ -652,7 +686,9 @@ def test_copy_kv_cache_blocks_with_virtual_block_splitting(
         head_size=2,
         dtype=torch.float32,
     )
-    raw = torch.zeros(num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8)
+    raw = torch.zeros(
+        num_blocks * num_layers * spec.page_size_bytes, dtype=torch.int8, device=device
+    )
     caches = dense_kv_cache_views(
         raw,
         spec,
