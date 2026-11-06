@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vllm_metrics::{
-    CacheHitSourceLabels, EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric,
-    LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
+    CacheHitSourceLabels, CudagraphModeLabels, EngineLabels, EnginePositionLabels, F64Gauge,
+    Family, HistogramMetric, LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
     MooncakeOperationHistogramFamily, MooncakeOperationLabels, PREFILL_DELAY_REASONS,
     PREFILL_QUEUE_STOP_REASONS, PREFILL_REQUEST_OUTCOMES, PREFILL_UNDERFILL_REASONS,
     PrefillOutcomeLabels, PrefillStopLabels, RequestMetrics, SchedulerLogStatsAccumulator,
@@ -104,6 +104,12 @@ struct SchedulerStatsHandles {
     nixl_num_failed_transfers: U64Counter,
     nixl_num_failed_notifications: U64Counter,
     nixl_num_kv_expired_reqs: U64Counter,
+
+    // CUDA graph runtime counters, decoded from `cudagraph_stats`. Kept as
+    // `Family` because `runtime_mode` is a dynamic per-step label.
+    cudagraph_steps: Family<CudagraphModeLabels, U64Counter>,
+    cudagraph_unpadded_tokens: Family<CudagraphModeLabels, U64Counter>,
+    cudagraph_padded_tokens: Family<CudagraphModeLabels, U64Counter>,
 
     // Non-Prometheus interval accumulator for periodic text-log helpers.
     log_stats: SchedulerLogStatsAccumulator,
@@ -307,6 +313,9 @@ fn resolve_scheduler_stats_handles(
             .nixl_num_failed_notifications
             .get_or_create_owned(&labels),
         nixl_num_kv_expired_reqs: metrics.nixl_num_kv_expired_reqs.get_or_create_owned(&labels),
+        cudagraph_steps: metrics.cudagraph_steps.clone(),
+        cudagraph_unpadded_tokens: metrics.cudagraph_unpadded_tokens.clone(),
+        cudagraph_padded_tokens: metrics.cudagraph_padded_tokens.clone(),
         labels,
     }
 }
@@ -473,6 +482,23 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
             cudagraph_stats.num_paddings,
             &cudagraph_stats.runtime_mode,
         );
+
+        // `num_paddings` is always `num_padded_tokens - num_unpadded_tokens`
+        // on the engine side, so it is derivable and not exported separately.
+        let labels = CudagraphModeLabels {
+            model_name: handles.labels.model_name.clone(),
+            engine: handles.labels.engine,
+            runtime_mode: cudagraph_stats.runtime_mode.clone(),
+        };
+        handles.cudagraph_steps.get_or_create(&labels).inc();
+        handles
+            .cudagraph_unpadded_tokens
+            .get_or_create(&labels)
+            .inc_by(cudagraph_stats.num_unpadded_tokens);
+        handles
+            .cudagraph_padded_tokens
+            .get_or_create(&labels)
+            .inc_by(cudagraph_stats.num_padded_tokens);
     }
 
     // Sampled KV-cache residency histograms.
@@ -611,12 +637,13 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use expect_test::expect;
+    use itertools::Itertools as _;
     use vllm_metrics::Metrics;
 
     use crate::metrics::LoraInfoExporter;
     use crate::protocol::stats::{
-        KvConnectorStats, MooncakeOperation, MooncakeRecord, MooncakeStats, MooncakeStatus,
-        MultiConnectorStats, NixlStats, SchedulerStats,
+        CudagraphStats, KvConnectorStats, MooncakeOperation, MooncakeRecord, MooncakeStats,
+        MooncakeStatus, MultiConnectorStats, NixlStats, SchedulerStats,
     };
 
     fn names(values: &[&str]) -> BTreeSet<String> {
@@ -736,6 +763,58 @@ mod tests {
             rendered
                 .contains("vllm:nixl_xfer_time_seconds_count{model_name=\"model\",engine=\"0\"} 2")
         );
+    }
+
+    /// Records CUDA graph samples into per-runtime-mode counters and the
+    /// text-log accumulator; payloads without `cudagraph_stats` add nothing.
+    #[test]
+    fn cudagraph_stats_are_recorded_into_runtime_mode_counters() {
+        let metrics = Metrics::new();
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 0);
+        let sample = |unpadded: u64, padded: u64, mode: &str| SchedulerStats {
+            cudagraph_stats: Some(CudagraphStats {
+                num_unpadded_tokens: unpadded,
+                num_padded_tokens: padded,
+                num_paddings: padded - unpadded,
+                runtime_mode: mode.to_string(),
+            }),
+            ..Default::default()
+        };
+
+        // Nothing is exported until the engine sends CUDA graph stats.
+        super::record_scheduler_stats_with_handles(&handles, &SchedulerStats::default());
+        assert!(!metrics.render().unwrap().contains("vllm:cudagraph_steps_total{"));
+
+        for stats in [
+            sample(5, 8, "FULL"),
+            sample(7, 8, "FULL"),
+            sample(300, 300, "NONE"),
+        ] {
+            // Exercise the DTO encoding used by Python's stats transport.
+            let wire = rmp_serde::to_vec_named(&stats).unwrap();
+            let decoded: SchedulerStats = rmp_serde::from_slice(&wire).unwrap();
+            super::record_scheduler_stats_with_handles(&handles, &decoded);
+        }
+
+        let rendered = metrics.render().unwrap();
+        let lines = rendered
+            .lines()
+            .filter(|line| line.starts_with("vllm:cudagraph_"))
+            .sorted()
+            .join("\n");
+        expect![[r#"
+            vllm:cudagraph_padded_tokens_total{model_name="model",engine="0",runtime_mode="FULL"} 16
+            vllm:cudagraph_padded_tokens_total{model_name="model",engine="0",runtime_mode="NONE"} 300
+            vllm:cudagraph_steps_total{model_name="model",engine="0",runtime_mode="FULL"} 2
+            vllm:cudagraph_steps_total{model_name="model",engine="0",runtime_mode="NONE"} 1
+            vllm:cudagraph_unpadded_tokens_total{model_name="model",engine="0",runtime_mode="FULL"} 12
+            vllm:cudagraph_unpadded_tokens_total{model_name="model",engine="0",runtime_mode="NONE"} 300"#]]
+        .assert_eq(&lines);
+        assert!(rendered.contains("# TYPE vllm:cudagraph_steps counter"));
+
+        let interval = handles.log_stats.drain();
+        assert_eq!(interval.cudagraph_counts.len(), 3);
+        assert_eq!(interval.cudagraph_counts.values().sum::<u64>(), 3);
     }
 }
 
