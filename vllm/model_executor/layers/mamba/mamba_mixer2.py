@@ -42,6 +42,7 @@ from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_outpu
     selective_state_update_replayssm_output_only,
 )
 from vllm.model_executor.layers.mamba.ops.ssd_checkpoint import store_prefill_checkpoint
+from vllm.model_executor.layers.mamba.ops.ssd_chunk_scan import chunk_scan_chunk_bucket
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
@@ -618,102 +619,111 @@ class MambaMixer2(MambaBase, PluggableLayer):
         return output
 
     def _warmup_ssd_kernels(self, projected_states: torch.Tensor) -> None:
-        """Run a minimal SSD forward pass to trigger Triton autotuning
-        while GPU memory is still plentiful (before SSM cache allocation).
-        """
-        if self._ssd_kernels_warmed_up:
-            return
-        self._ssd_kernels_warmed_up = True
-        logger.info_once("Warming up Mamba2 SSD Triton kernels...")
-
-        device = projected_states.device
-        dtype = projected_states.dtype
-
-        nheads = self.num_heads // self.tp_size
-        ngroups = self.n_groups // self.tp_size
-        headdim = self.head_dim
-        dstate = self.ssm_state_size
-
-        if self.model_config is None:
+        """Tune scan workloads before SSM cache allocation consumes free memory."""
+        if self._ssd_kernels_warmed_up or self.model_config is None:
             return
         chunk_size = self.model_config.get_mamba_chunk_size()
+        scheduler = get_current_vllm_config().scheduler_config
+        # Each sequence can contribute one partial chunk. Never exceed the
+        # token count itself, including when there are many one-token requests.
+        max_tokens = scheduler.max_num_batched_tokens
+        max_chunks = min(
+            max_tokens,
+            (max_tokens + chunk_size - 1) // chunk_size + scheduler.max_num_seqs - 1,
+        )
+        max_bucket = chunk_scan_chunk_bucket(max_chunks)
+        logger.info_once(
+            "Warming up Mamba2 SSD Triton kernels (chunk buckets 1..%d)...", max_bucket
+        )
+        succeeded = True
+        nchunks = 1
+        while nchunks <= max_bucket:
+            for use_initial_states in (False, True):
+                try:
+                    self._warmup_ssd_kernel_shape(
+                        projected_states, nchunks, use_initial_states
+                    )
+                except Exception:
+                    succeeded = False
+                    logger.warning(
+                        "Mamba2 SSD kernel warmup failed for layer %s "
+                        "(chunks=%d, initial_states=%s). First inference may "
+                        "experience latency spike or OOM due to autotuner.",
+                        self.prefix,
+                        nchunks,
+                        use_initial_states,
+                        exc_info=True,
+                    )
+            nchunks *= 2
+        self._ssd_kernels_warmed_up = succeeded
+        torch.accelerator.empty_cache()
 
-        # Triton's autotuner includes tensor dtypes in its cache key,
-        # so state_dtype must match what real inference uses.
+    def _warmup_ssd_kernel_shape(
+        self,
+        projected_states: torch.Tensor,
+        nchunks: int,
+        use_initial_states: bool,
+    ) -> None:
+        """Warm one scan bucket with the inference state dtype and packed layout."""
+        assert self.model_config is not None
+        device, dtype = projected_states.device, projected_states.dtype
+        nheads = self.num_heads // self.tp_size
+        ngroups = self.n_groups // self.tp_size
+        headdim, dstate = self.head_dim, self.ssm_state_size
+        chunk_size = self.model_config.get_mamba_chunk_size()
+        seqlen = nchunks * chunk_size
         ssm_state_dtype = self.get_state_dtype()[1]
 
-        # SSD kernel autotune keys depend on dtype and head dimensions,
-        # not on sequence length or batch size, so a single shape suffices.
-        seqlen = chunk_size
-        batch = 1
-        nchunks = seqlen // chunk_size  # = 1
-
-        x = torch.randn(seqlen, nheads, headdim, device=device, dtype=dtype)
-        dt = torch.randn(seqlen, nheads, device=device, dtype=dtype)
-        B = torch.randn(seqlen, ngroups, dstate, device=device, dtype=dtype)
-        C = torch.randn(seqlen, ngroups, dstate, device=device, dtype=dtype)
-        cu_seqlens = torch.tensor([0, seqlen], device=device, dtype=torch.int32)
-        cu_chunk_seqlens = torch.tensor(
-            [i * chunk_size for i in range(nchunks + 1)],
+        # Match the views produced by splitting the convolution output.
+        packed = torch.randn(
+            seqlen,
+            nheads * headdim + 2 * ngroups * dstate,
             device=device,
-            dtype=torch.int32,
+            dtype=dtype,
+        )
+        x, B, C = packed.split(
+            [nheads * headdim, ngroups * dstate, ngroups * dstate], dim=-1
+        )
+        x = x.view(seqlen, nheads, headdim)
+        B = B.view(seqlen, ngroups, dstate)
+        C = C.view(seqlen, ngroups, dstate)
+        dt = torch.randn(seqlen, nheads, device=device, dtype=dtype)
+        cu_seqlens = torch.tensor([0, seqlen], device=device, dtype=torch.int32)
+        cu_chunk_seqlens = torch.arange(
+            0, seqlen + 1, chunk_size, device=device, dtype=torch.int32
         )
         last_chunk_indices = torch.tensor(
             [nchunks - 1], device=device, dtype=torch.int32
         )
         seq_idx = torch.zeros(nchunks, device=device, dtype=torch.int32)
         out = torch.empty(seqlen, nheads, headdim, device=device, dtype=dtype)
-
-        # Two kernels (_state_passing_fwd, _chunk_scan_fwd) use
-        # HAS_INITSTATES as a constexpr, producing separate compiled
-        # binaries. Warm up both code paths so neither triggers
-        # JIT compilation during inference.
-        for use_initial_states in (False, True):
-            initial_states = (
-                torch.randn(
-                    batch,
-                    nheads,
-                    headdim,
-                    dstate,
-                    device=device,
-                    dtype=ssm_state_dtype,
-                )
-                if use_initial_states
-                else None
+        initial_states = (
+            torch.randn(
+                1, nheads, headdim, dstate, device=device, dtype=ssm_state_dtype
             )
-            try:
-                mamba_chunk_scan_combined_varlen(
-                    x=x,
-                    dt=dt,
-                    A=self.A,
-                    B=B,
-                    C=C,
-                    chunk_size=chunk_size,
-                    cu_seqlens=cu_seqlens,
-                    cu_chunk_seqlens=cu_chunk_seqlens,
-                    last_chunk_indices=last_chunk_indices,
-                    seq_idx=seq_idx,
-                    out=out,
-                    D=self.D,
-                    z=None,
-                    dt_bias=self.dt_bias,
-                    initial_states=initial_states,
-                    dt_softplus=True,
-                    dt_limit=(0.0, float("inf")),
-                    state_dtype=ssm_state_dtype,
-                )
-            except Exception:
-                logger.warning(
-                    "Mamba2 SSD kernel warmup failed for layer %s "
-                    "(initial_states=%s). First inference may experience "
-                    "latency spike or OOM due to autotuner.",
-                    self.prefix,
-                    use_initial_states,
-                    exc_info=True,
-                )
-
-        logger.debug("Mamba2 SSD kernel warmup completed for layer %s", self.prefix)
-        torch.accelerator.empty_cache()
+            if use_initial_states
+            else None
+        )
+        mamba_chunk_scan_combined_varlen(
+            x=x,
+            dt=dt,
+            A=self.A,
+            B=B,
+            C=C,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            seq_idx=seq_idx,
+            out=out,
+            D=self.D,
+            z=None,
+            dt_bias=self.dt_bias,
+            initial_states=initial_states,
+            dt_softplus=True,
+            dt_limit=(0.0, float("inf")),
+            state_dtype=ssm_state_dtype,
+        )
 
     def conv_ssm_forward(
         self,
