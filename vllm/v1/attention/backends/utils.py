@@ -1073,7 +1073,7 @@ def compute_causal_conv1d_metadata(
     nums_dict: dict[int, dict[str, Any]] = {}
     batch_ptr = None
     token_chunk_offset_ptr = None
-    for BLOCK_M in [8]:  # cover all BLOCK_M values
+    for BLOCK_M in [8, 16]:  # cover all BLOCK_M values
         nums = -(-seqlens // BLOCK_M)
         nums_dict[BLOCK_M] = {}
         nums_dict[BLOCK_M]["nums"] = nums
@@ -1089,19 +1089,12 @@ def compute_causal_conv1d_metadata(
         offsetlist = torch.tensor(offsetlist, dtype=torch.int32, pin_memory=PIN_MEMORY)
         nums_dict[BLOCK_M]["offsetlist"] = offsetlist
 
-        if batch_ptr is None:
-            # Update default value after class definition
-            batch_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
-            )
-            token_chunk_offset_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
-            )
-        else:
-            if batch_ptr.nelement() < MAX_NUM_PROGRAMS:
-                batch_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
-                assert token_chunk_offset_ptr is not None
-                token_chunk_offset_ptr.resize_(MAX_NUM_PROGRAMS).fill_(PAD_SLOT_ID)
+        batch_ptr = torch.full(
+            (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
+        )
+        token_chunk_offset_ptr = torch.full(
+            (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
+        )
 
         assert batch_ptr is not None
         batch_ptr[0:mlist_len].copy_(mlist, non_blocking=True)

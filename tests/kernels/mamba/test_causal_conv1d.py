@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import itertools
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -242,10 +244,10 @@ def test_causal_conv1d_update_with_batch_gather(
     assert torch.allclose(out[:batch_size], out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("itype", [torch.bfloat16])
-@pytest.mark.parametrize("silu_activation", [True])
-@pytest.mark.parametrize("has_bias", [True])
-@pytest.mark.parametrize("width", [4])
+@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("silu_activation", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("width", [2, 3, 4])
 @pytest.mark.parametrize("seqlen", [8, 249, 4096])
 @pytest.mark.parametrize("dim", [64, 4096])
 @pytest.mark.parametrize("with_padding", [True, False])
@@ -358,3 +360,88 @@ def test_causal_conv1d_varlen(
     )
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
+
+
+@pytest.mark.skipif(current_platform.is_cpu(), reason="Requires Triton metadata")
+@pytest.mark.parametrize("block_size", [8, 16, 128])
+@pytest.mark.parametrize("num_computed", [0, 37])
+@pytest.mark.parametrize("dim_first", [False, True])
+def test_causal_conv1d_prefill_preserves_aligned_cache(
+    block_size, num_computed, dim_first
+):
+    """Token tiles preserve every prefix-cache window, including short tails."""
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+
+    set_random_seed(0)
+    lengths = [1, 2, 13, 16, 17, 31, 64, 128, 249]
+    dim, width = 80, 4
+    cu_cpu = torch.tensor([0] + list(itertools.accumulate(lengths)))
+    cu = cu_cpu.to(device=DEVICE, dtype=torch.int32)
+    x = torch.randn(sum(lengths), dim + 16, device=DEVICE, dtype=torch.bfloat16)
+    x = x[:, :dim].T
+    weight = torch.randn(dim, width, device=DEVICE, dtype=x.dtype)
+    bias = torch.randn(dim, device=DEVICE, dtype=x.dtype)
+    offset = num_computed % block_size
+    last = [(offset + n + block_size - 1) // block_size for n in lengths]
+    pages = max(last) + 1
+    indices = torch.arange(
+        1, len(lengths) * pages + 1, device=DEVICE, dtype=torch.int32
+    ).view(len(lengths), pages)
+    shape = (indices.numel() + 1, dim, width - 1)
+    if dim_first:
+        cache = torch.randn(shape, device=DEVICE, dtype=x.dtype)
+    else:
+        cache = torch.randn(
+            shape[0], shape[2], shape[1], device=DEVICE, dtype=x.dtype
+        ).transpose(1, 2)
+    original = cache.clone()
+    has_initial = torch.tensor([i % 2 == 0 for i in range(len(lengths))], device=DEVICE)
+    nums, batch, chunks = compute_causal_conv1d_metadata(cu_cpu, device=x.device)
+    metadata = SimpleNamespace(
+        nums_dict=nums, batch_ptr=batch, token_chunk_offset_ptr=chunks
+    )
+    out = causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states=cache,
+        query_start_loc=cu,
+        cache_indices=indices,
+        has_initial_state=has_initial,
+        activation="silu",
+        block_idx_first_scheduled_token=torch.ones_like(cu[:-1]),
+        block_idx_last_scheduled_token=torch.tensor(last, device=DEVICE),
+        initial_state_idx=torch.zeros_like(cu[:-1]),
+        num_computed_tokens=torch.full_like(cu[:-1], num_computed),
+        block_size_to_align=block_size,
+        metadata=metadata,
+    )
+    for i, n in enumerate(lengths):
+        start, end = cu_cpu[i].item(), cu_cpu[i + 1].item()
+        init = (
+            original[indices[i, 0]]
+            if has_initial[i]
+            else torch.zeros_like(original[indices[i, 0]])
+        )
+        expected, _ = causal_conv1d_ref(
+            x[:, start:end].unsqueeze(0),
+            weight,
+            bias,
+            initial_states=init.unsqueeze(0),
+            activation="silu",
+        )
+        torch.testing.assert_close(out[:, start:end], expected[0], atol=0.05, rtol=0.01)
+        history = torch.cat([init, x[:, start:end]], dim=1)
+        for page in range(1, last[i] + 1):
+            boundary = n if page == last[i] else page * block_size - offset
+            torch.testing.assert_close(
+                cache[indices[i, page]],
+                history[:, boundary : boundary + width - 1],
+                atol=0,
+                rtol=0,
+            )
+    torch.testing.assert_close(
+        cache[indices[:, 0]], original[indices[:, 0]], atol=0, rtol=0
+    )
