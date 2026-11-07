@@ -53,6 +53,21 @@ vllm serve Qwen/Qwen3.5-35B-A3B --quantization mxfp4 \
 | `mxfp8` | fp8_e4m3 data, e8m0 per-1x32-block scale | fp8_e4m3 data, e8m0 per-1x32-block scale | Requires SM 100+ (Blackwell or newer) for w8a8, other GPUs use a w8a16 fallback |
 | `mxfp4` | fp4_e2m1 data, e8m0 per-1x32-block scale ([OCP MX specs](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)) | - linear: fp4_e2m1 data, e8m0 per-1x32-block scale in some backends, or BF16. <br> - MOE: fp4_e2m1 data, e8m0 per-1x32-block scale. | Linear MXFP4 backend is auto-selected per platform, not enforcing activation dtype. Some use BF16 activation. Use `--linear-backend` to pin one (e.g. `--linear-backend flashinfer`). |
 
+`nvfp4_per_token` quantizes MoE weights to NVFP4 with group-16 FP8 block
+scales and FP32 per-expert scales. Both expert GEMMs use dynamic per-token
+activation scales. Dense layers remain unquantized. On Blackwell SM100 GPUs,
+select `--moe-backend flashinfer_prims` or `--moe-backend flashinfer_trtllm`:
+
+```bash
+vllm serve <model> --quantization nvfp4_per_token --moe-backend flashinfer_prims
+```
+
+Prims also supports merge-free DWDP with this scheme. Each TP1/DP1 worker
+loads its owned experts; packed weights and block scales use DWDP prefetch,
+while immutable per-expert scale vectors are gathered once at initialization.
+Use `--dwdp-config '{"world_size":4,"merge_free":true}'` and, for compiled
+execution with MTP, `--compilation-config '{"mode":3,"cudagraph_mode":"NONE"}'`.
+
 ## Advanced Configuration
 
 For fine-grained control, use a `quantization_config` dictionary.

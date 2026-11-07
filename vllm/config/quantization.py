@@ -217,7 +217,7 @@ _ONLINE_SHORTHANDS: dict[str, QuantizationConfigArgs] = {
         moe=QuantSpec(weight=kInt8StaticChannelSym),
     ),
     # Online NVFP4 on MoE with per-token dynamic activation scales (Blackwell +
-    # FlashInfer TRTLLM only); linear stays unquantized (no `linear` field).
+    # FlashInfer TRTLLM or Prims); linear stays unquantized (no `linear` field).
     "nvfp4_per_token": QuantizationConfigArgs(
         moe=QuantSpec(weight=kNvfp4Static),
     ),

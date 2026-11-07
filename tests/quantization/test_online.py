@@ -234,6 +234,7 @@ def test_online_nvfp4_reuses_kernel_when_weights_are_reprocessed(
     )
 
     layer = Mock()
+    layer.dwdp_manager = None
     converted_weights = [
         tuple(torch.full((2,), value + index) for index in range(8))
         for value in (1.0, 2.0, 0.5)
@@ -698,6 +699,9 @@ def test_nvfp4_per_token_backend_contract() -> None:
     from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (
         FlashInferExperts,
     )
+    from vllm.model_executor.layers.fused_moe.experts.prims_nvfp4_moe import (
+        PrimsNvFp4Experts,
+    )
     from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
         TrtLlmNvFp4ExpertsModular,
         TrtLlmNvFp4ExpertsMonolithic,
@@ -708,6 +712,7 @@ def test_nvfp4_per_token_backend_contract() -> None:
     )
 
     scheme = (kNvfp4Static, kNvfp4DynamicToken)
+    assert PrimsNvFp4Experts._supports_quant_scheme(*scheme)
     assert TrtLlmNvFp4ExpertsMonolithic._supports_quant_scheme(*scheme)
     assert TrtLlmNvFp4ExpertsModular._supports_quant_scheme(*scheme)
     assert FlashInferCuteDSLExperts._supports_quant_scheme(*scheme)

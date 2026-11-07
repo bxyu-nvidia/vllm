@@ -213,7 +213,10 @@ class RoutedExperts(PluggableLayer):
 
         if isinstance(get_offloader(), DWDPWeightOffloader):
             if self.dwdp_manager is None:
-                raise ValueError("DWDP supports only unquantized BF16 routed experts")
+                raise ValueError(
+                    "DWDP requires a routed expert method with sharded weight support"
+                )
+            self.dwdp_manager.declare_layer(self.layer_name)
             if self.expert_map_manager.num_fused_shared_experts:
                 raise ValueError("DWDP requires separate replicated shared experts")
 

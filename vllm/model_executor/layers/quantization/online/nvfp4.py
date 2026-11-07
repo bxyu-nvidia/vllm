@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import torch
 from torch.nn import Module
 
 from vllm._custom_ops import scaled_fp4_quant
-from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe import RoutedExperts, SharedExperts
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     make_nvfp4_moe_kernel,
     make_nvfp4_moe_quant_config,
@@ -86,8 +91,8 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
     """Online NVFP4 MoE quantization with per-token activation scales.
 
     Quantizes fp16/bf16 expert weights to NVFP4 at load time; the FlashInfer
-    TRTLLM kernel computes per-token activation scales at runtime. Blackwell
-    (SM100) only.
+    Prims and TRTLLM kernels compute per-token activation scales at runtime.
+    Blackwell (SM100) only.
     """
 
     activation_quant_key = kNvfp4DynamicToken
@@ -108,11 +113,100 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
             activation_key=self.activation_quant_key,
         )
 
+    def create_weights(
+        self,
+        layer: RoutedExperts,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from vllm.model_executor.offloader import get_offloader
+        from vllm.model_executor.offloader.dwdp import DWDPWeightOffloader, expert_range
+
+        offloader = get_offloader()
+        if isinstance(offloader, DWDPWeightOffloader):
+            if (
+                self.nvfp4_backend != NvFp4MoeBackend.FLASHINFER_PRIMS
+                or self.moe.has_bias
+                or not offloader.config.merge_free
+            ):
+                raise ValueError(
+                    "Online NVFP4 DWDP requires merge-free flashinfer_prims "
+                    "experts without bias"
+                )
+            layer.dwdp_manager = offloader.manager
+            layer.dwdp_expert_range = expert_range(
+                num_experts,
+                offloader.config.rank,
+                offloader.config.world_size,
+            )
+            start, end = layer.dwdp_expert_range
+            num_experts = end - start
+            self.supports_pre_processed_weights = False
+        super().create_weights(
+            layer,
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    @contextmanager
+    def _dwdp_weights(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        if layer.dwdp_manager is None:
+            yield layer.w13_weight, layer.w2_weight
+            return
+        with layer.dwdp_manager.layer(layer.layer_name, x.shape[0]) as weights:
+            w13, w2, s13, s2 = weights[:4]
+            quant = self.moe_quant_config
+            assert quant is not None
+            old_scales = quant.w1_scale, quant.w2_scale
+            quant._w1.scale, quant._w2.scale = s13, s2
+            try:
+                yield w13, w2
+            finally:
+                quant._w1.scale, quant._w2.scale = old_scales
+
+    def apply(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor | UnfinalizedMoEOutput:
+        assert not self.is_monolithic
+        assert self.moe_kernel is not None
+        with self._dwdp_weights(layer, x) as (w13, w2):
+            return self.moe_kernel.apply(
+                x,
+                w13,
+                w2,
+                topk_weights,
+                topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                shared_experts=shared_experts,
+                shared_experts_input=shared_experts_input,
+            )
+
     @property
     def per_token_activation(self) -> bool:
         return self.activation_quant_key == kNvfp4DynamicToken
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        if layer.dwdp_manager is not None and layer.dwdp_manager.initialized:
+            raise RuntimeError("Cannot reload immutable DWDP expert weights")
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
@@ -179,6 +273,34 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
         replace_parameter(layer, "w2_weight_scale", w2_scale)
         replace_parameter(layer, "w2_weight_scale_2", w2_scale_2)
         replace_parameter(layer, "w2_input_scale", a2_scale)
+
+        if layer.dwdp_manager is not None:
+            metadata_names = (
+                "w13_weight_scale_2",
+                "w2_weight_scale_2",
+                "w13_input_scale",
+                "w2_input_scale",
+            )
+            projections = (
+                w13.detach(),
+                w2.detach(),
+                w13_scale.detach(),
+                w2_scale.detach(),
+                *(getattr(layer, name).detach().view(-1, 1) for name in metadata_names),
+            )
+            replicated = layer.dwdp_manager.register_layer(
+                layer.layer_name,
+                layer.global_num_experts,
+                projections,
+                replicated_indices=range(4, 8),
+            )
+            for index, name in enumerate(metadata_names, 4):
+                # Profiling starts only after manager initialization. Unit input
+                # scales also make the precomputed kernel transforms well-defined.
+                replicated[index].fill_(1.0)
+                replace_parameter(layer, name, replicated[index].view(-1))
+            w13_scale_2 = layer.w13_weight_scale_2
+            w2_scale_2 = layer.w2_weight_scale_2
 
         if self.moe_kernel is None:
             self.moe_quant_config = self.get_fused_moe_quant_config(layer)
