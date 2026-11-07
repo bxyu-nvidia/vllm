@@ -384,8 +384,12 @@ def _ipc_worker(
             for p in range(2)
         )
         references.append(weights)
+        manager.declare_layer(str(layer))
+    # Online quantization can finish layers in a different order on each rank.
+    order = range(5) if rank == 0 else reversed(range(5))
+    for layer in order:
         manager.register_layer(
-            str(layer), experts, [w[start:end].clone() for w in weights]
+            str(layer), experts, [w[start:end].clone() for w in references[layer]]
         )
     manager.initialize(store)
     snapshots = []
@@ -469,7 +473,7 @@ def test_ipc_prefetch_preserves_weights_with_idle_and_unequal_workers(
     )
 
 
-def _moe_worker(rank, path, backend, merge_free):
+def _moe_worker(rank, path, backend, merge_free, nvfp4=False, gated=False):
     from tests.kernels.moe.utils import make_dummy_moe_config
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -486,22 +490,51 @@ def _moe_worker(rank, path, backend, merge_free):
     offloader = DWDPWeightOffloader(
         DWDPConfig(rank=rank, world_size=2, merge_free=merge_free)
     )
-    num_experts = 8 if backend == "flashinfer_prims" else 7
+    quant_config = None
+    if nvfp4:
+        from vllm.config.quantization import resolve_quantization_config
+        from vllm.model_executor.layers.quantization.online.base import (
+            OnlineQuantizationConfig,
+        )
+
+        quant_config = OnlineQuantizationConfig(
+            resolve_quantization_config("nvfp4_per_token", None)
+        )
+    num_experts = 8 if backend == "flashinfer_prims" and not nvfp4 else 7
+    hidden = 512 if nvfp4 else 128
+    intermediate = 512 if nvfp4 else 256
     sharded: list[RoutedExperts] = []
     baselines: list[RoutedExperts] = []
     with set_current_vllm_config(VllmConfig()), torch.device(device):
         for layer_id in range(4):
             torch.manual_seed(42 + layer_id)
-            full_w13 = torch.randn(num_experts, 256, 128, dtype=torch.bfloat16) * 0.01
-            full_w2 = torch.randn(num_experts, 128, 256, dtype=torch.bfloat16) * 0.01
+            full_w13 = (
+                torch.randn(
+                    num_experts,
+                    intermediate * (2 if gated else 1),
+                    hidden,
+                    dtype=torch.bfloat16,
+                )
+                * 0.01
+            )
+            full_w2 = (
+                torch.randn(num_experts, hidden, intermediate, dtype=torch.bfloat16)
+                * 0.01
+            )
+            if nvfp4:
+                factors = torch.arange(1, num_experts + 1).view(-1, 1, 1)
+                full_w13.mul_(factors)
+                full_w2.mul_(factors.flip(0))
             for use_dwdp, layers in [(False, baselines), (True, sharded)]:
                 set_offloader(offloader if use_dwdp else None)
                 config = make_dummy_moe_config(
                     num_experts=num_experts,
-                    hidden_dim=128,
-                    intermediate_size=256,
+                    hidden_dim=hidden,
+                    intermediate_size=intermediate,
                     experts_per_token=2,
-                    activation=MoEActivation.RELU2_NO_MUL,
+                    activation=MoEActivation.SILU
+                    if gated
+                    else MoEActivation.RELU2_NO_MUL,
                 )
                 config.moe_backend = backend
                 mapping = ExpertMapManager(
@@ -518,23 +551,25 @@ def _moe_worker(rank, path, backend, merge_free):
                     str(layer_id),
                     torch.bfloat16,
                     config,
-                    None,
+                    quant_config,
                     mapping,
-                    ckpt_gate_proj_name="up_proj",
-                    ckpt_up_proj_name=None,
+                    ckpt_gate_proj_name="gate_proj" if gated else "up_proj",
+                    ckpt_up_proj_name="up_proj" if gated else None,
                 )
-                for weight, name, shard in [
-                    (full_w13, "w13_weight", "w1"),
-                    (full_w2, "w2_weight", "w2"),
-                ]:
+                projections = [(full_w13[:, :intermediate], "w13_weight", "w1")]
+                if gated:
+                    projections.append((full_w13[:, intermediate:], "w13_weight", "w3"))
+                projections.append((full_w2, "w2_weight", "w2"))
+                for weight, name, shard in projections:
                     param = getattr(layer, name)
+                    loader = param.weight_loader if nvfp4 else layer.weight_loader
                     if use_dwdp:
                         # Exercise direct fused checkpoint loading as well as
                         # per-expert loading through the same public loader.
-                        layer.weight_loader(param, weight, name, shard, 0, True)
+                        loader(param, weight, name, shard, 0, True)
                     else:
                         for expert, value in enumerate(weight.unbind()):
-                            layer.weight_loader(param, value, name, shard, expert, True)
+                            loader(param, value, name, shard, expert, True)
                 if use_dwdp:
                     start, end = expert_range(num_experts, rank, 2)
                     assert layer.w13_weight.shape[0] == end - start
@@ -545,8 +580,29 @@ def _moe_worker(rank, path, backend, merge_free):
         store = dist.FileStore(path, 2)
         store.set_timeout(timedelta(seconds=90))
         offloader.manager.initialize(store)
+        if nvfp4:
+            start, end = expert_range(num_experts, rank, 2)
+            for actual, baseline in zip(sharded, baselines):
+                for name in (
+                    "w13_weight",
+                    "w2_weight",
+                    "w13_weight_scale",
+                    "w2_weight_scale",
+                ):
+                    torch.testing.assert_close(
+                        getattr(actual, name).view(torch.uint8),
+                        getattr(baseline, name)[start:end]
+                        .contiguous()
+                        .view(torch.uint8),
+                        rtol=0,
+                        atol=0,
+                    )
+                for name in ("w13_weight_scale_2", "w2_weight_scale_2"):
+                    torch.testing.assert_close(
+                        getattr(actual, name), getattr(baseline, name), rtol=0, atol=0
+                    )
         for tokens in [1, 17, 65, 1]:
-            x = torch.randn(tokens, 128, dtype=torch.bfloat16)
+            x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
             ids = (torch.arange(tokens * 2).view(tokens, 2) % num_experts).int()
             scores = torch.full((tokens, 2), 0.5, dtype=torch.float32)
             for actual, baseline in zip(sharded, baselines):
@@ -577,6 +633,21 @@ def test_sharded_loading_and_moe_outputs_match_replicated_weights(
     mp.spawn(
         _moe_worker,
         args=(str(tmp_path / "moe-store"), backend, merge_free),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("gated", [False, True])
+def test_nvfp4_merge_free_loading_and_outputs_match_replicated_weights(tmp_path, gated):
+    """Packed weights, block scales and global scales survive two-buffer reuse."""
+    if not torch.cuda.is_available() or torch.accelerator.device_count() < 2:
+        pytest.skip("Requires two CUDA GPUs")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("NVFP4 Prims requires SM100")
+    mp.spawn(
+        _moe_worker,
+        args=(str(tmp_path / "nvfp4-store"), "flashinfer_prims", True, True, gated),
         nprocs=2,
         join=True,
     )

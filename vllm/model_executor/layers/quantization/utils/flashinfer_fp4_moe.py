@@ -365,6 +365,7 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         NvFp4MoeBackend.VLLM_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        NvFp4MoeBackend.FLASHINFER_PRIMS,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
         NvFp4MoeBackend.FLASHINFER_B12X,
     ]
@@ -378,6 +379,7 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         in [
             NvFp4MoeBackend.FLASHINFER_CUTLASS,
             NvFp4MoeBackend.FLASHINFER_TRTLLM,
+            NvFp4MoeBackend.FLASHINFER_PRIMS,
             NvFp4MoeBackend.FLASHINFER_B12X,
         ]
     ):
@@ -397,7 +399,7 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         a13_scale = a13_scale.max(dim=1).values.to(torch.float32)
 
     # Shuffle weights and scales for FI TRTLLM NVFP4 MoE kernels.
-    if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
+    if backend in (NvFp4MoeBackend.FLASHINFER_TRTLLM, NvFp4MoeBackend.FLASHINFER_PRIMS):
         w13, w13_scale, w2, w2_scale, padded_hidden = align_fp4_moe_hidden_dim_for_fi(
             w13,
             w13_scale,

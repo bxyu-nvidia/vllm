@@ -58,6 +58,7 @@ class _Layer:
     name: str
     num_experts: int
     weights: tuple[torch.Tensor, ...]
+    replicated: dict[int, torch.Tensor]
 
 
 @dataclass
@@ -132,6 +133,7 @@ class DWDPWeightManager:
         self._timings: list[_Timings] = []
         self.layers: list[_Layer] = []
         self._indices: dict[str, int] = {}
+        self._declared_layers: dict[str, int] = {}
         self._peers: list[list[tuple[torch.Tensor, ...]]] = []
         self._slots: list[_Slot] = []
         self._store: torch.distributed.Store | None = None
@@ -152,10 +154,25 @@ class DWDPWeightManager:
         self.forward_enqueues = 0
         self.token_enqueues = 0
 
+    def declare_layer(self, name: str) -> None:
+        """Record execution order before asynchronous checkpoint processing."""
+        if self._store is not None or self._closed or name in self._declared_layers:
+            raise ValueError("DWDP layers must be declared once before initialization")
+        self._declared_layers[name] = len(self._declared_layers)
+
     def register_layer(
-        self, name: str, num_experts: int, weights: Sequence[torch.Tensor]
-    ) -> None:
-        """Retain already packed local expert tensors without cloning them."""
+        self,
+        name: str,
+        num_experts: int,
+        weights: Sequence[torch.Tensor],
+        replicated_indices: Sequence[int] = (),
+    ) -> dict[int, torch.Tensor]:
+        """Retain packed local tensors and optionally replicate scalar metadata.
+
+        ``replicated_indices`` identifies expert-major scalar vectors gathered
+        once during initialization. Returned buffers are filled before profiling
+        or inference; other tensors remain sharded throughout execution.
+        """
         if self._store is not None or self._closed:
             raise RuntimeError("Cannot register weights after DWDP initialization")
         if name in self._indices or not weights:
@@ -173,9 +190,24 @@ class DWDPWeightManager:
                 raise ValueError(
                     "DWDP weights must be contiguous, detached local CUDA expert shards"
                 )
+        if any(
+            not 0 <= index < len(weights) or weights[index].shape[1:] != (1,)
+            for index in replicated_indices
+        ):
+            raise ValueError("DWDP replicated metadata must be expert-major scalars")
         self._indices[name] = len(self.layers)
-        self.layers.append(_Layer(name, num_experts, tuple(weights)))
+        replicated = {
+            index: torch.empty(
+                (num_experts, *weights[index].shape[1:]),
+                device=self.device,
+                dtype=weights[index].dtype,
+            )
+            for index in replicated_indices
+        }
+        self.layers.append(_Layer(name, num_experts, tuple(weights), replicated))
         self.resident_bytes += sum(w.nbytes for w in weights)
+        self.resident_bytes += sum(w.nbytes for w in replicated.values())
+        return replicated
 
     def initialize(self, store: torch.distributed.Store) -> None:
         """Exchange IPC mappings once, before profiling, warmup or inference.
@@ -188,6 +220,13 @@ class DWDPWeightManager:
             raise RuntimeError("DWDP initialization requires uninitialized layers")
         from vllm._custom_ops import swap_blocks_batch
 
+        if self._declared_layers:
+            if set(self._declared_layers) != set(self._indices):
+                raise ValueError("DWDP declared layers must all register their weights")
+            self.layers.sort(key=lambda layer: self._declared_layers[layer.name])
+            self._indices = {
+                layer.name: index for index, layer in enumerate(self.layers)
+            }
         self._copy = swap_blocks_batch
         self._store = store
         with torch.accelerator.device_index(self.device.index):
@@ -211,7 +250,10 @@ class DWDPWeightManager:
                     (
                         layer.name,
                         layer.num_experts,
-                        [(tuple(w.shape[1:]), str(w.dtype)) for w in layer.weights],
+                        [
+                            (tuple(w.shape[1:]), str(w.dtype), i in layer.replicated)
+                            for i, w in enumerate(layer.weights)
+                        ],
                     )
                     for layer in self.layers
                 ],
@@ -274,6 +316,17 @@ class DWDPWeightManager:
                 for layer_peers, peer_weights in zip(self._peers, weights):
                     layer_peers.append(peer_weights)
 
+            # Immutable per-expert metadata is replicated once. Packed weights
+            # and block scales continue to use merge-free per-layer prefetch.
+            for index, layer in enumerate(self.layers):
+                for projection, dest in layer.replicated.items():
+                    for rank in range(self.world_size):
+                        start, end = expert_range(
+                            layer.num_experts, rank, self.world_size
+                        )
+                        dest[start:end].copy_(self._peers[index][rank][projection])
+            torch.cuda.current_stream(self.device).synchronize()
+
             counts = {len(layer.weights) for layer in self.layers}
             if len(counts) != 1:
                 raise ValueError("DWDP layers must have the same number of projections")
@@ -281,7 +334,9 @@ class DWDPWeightManager:
             for projection in range(len(self.layers[0].weights)):
                 capacities.append(
                     max(
-                        layer.weights[projection][0].numel()
+                        0
+                        if projection in layer.replicated
+                        else layer.weights[projection][0].numel()
                         * layer.num_experts
                         * layer.weights[projection].element_size()
                         for layer in self.layers
@@ -308,6 +363,8 @@ class DWDPWeightManager:
                 plan = []
                 remote_size = local_size = 0
                 for projection, dest in enumerate(destinations):
+                    if projection in layer.replicated:
+                        continue
                     pulls = []
                     for offset in range(self.world_size):
                         rank = (self.rank + offset) % self.world_size
@@ -367,10 +424,12 @@ class DWDPWeightManager:
         layer = self.layers[index]
         slot = self._slots[index % 2]
         return tuple(
-            storage[: w[0].nbytes * layer.num_experts]
+            layer.replicated[projection]
+            if projection in layer.replicated
+            else storage[: w[0].nbytes * layer.num_experts]
             .view(w.dtype)
             .view(layer.num_experts, *w.shape[1:])
-            for storage, w in zip(slot.storage, layer.weights)
+            for projection, (storage, w) in enumerate(zip(slot.storage, layer.weights))
         )
 
     def _captured_copy(self, index: int) -> None:
@@ -559,6 +618,7 @@ class DWDPWeightManager:
             self._store.wait([f"closed/{r}" for r in range(self.world_size)])
             torch.cuda.ipc_collect()
         self.layers.clear()
+        self._declared_layers.clear()
         self._weight_views.clear()
         self._slots.clear()
         self._copy_plans.clear()

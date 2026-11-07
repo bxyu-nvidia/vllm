@@ -321,6 +321,11 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
+    def _routed_moe(self, **kwargs):
+        from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+
+        return trtllm_fp4_block_scale_routed_moe(**kwargs)
+
     def _invoke_kernel(
         self,
         output: torch.Tensor | None,
@@ -334,8 +339,6 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         a1q_scale: torch.Tensor | None,
     ) -> UnfinalizedMoEOutput | None:
         """Finalize into ``output``, or stop after GEMM2 when it is None."""
-        import flashinfer
-
         assert self.quant_config.w1_scale is not None
         assert self.quant_config.w2_scale is not None
 
@@ -350,7 +353,7 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
         output1_scale_gate_scalar = self.quant_config.g1_alphas
 
         # Invoke kernel.
-        flashinfer_output = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
+        flashinfer_output = self._routed_moe(
             topk_ids=(topk_ids, topk_weights),
             routing_bias=None,
             hidden_states=hidden_states,

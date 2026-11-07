@@ -43,6 +43,7 @@ logger = init_logger(__name__)
 class NvFp4MoeBackend(Enum):
     B12X = "B12X"
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
+    FLASHINFER_PRIMS = "FLASHINFER_PRIMS"
     FLASHINFER_CUTLASS = "FLASHINFER_CUTLASS"
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
     FLASHINFER_CUTEDSL_BATCHED = "FLASHINFER_CUTEDSL_BATCHED"
@@ -56,6 +57,7 @@ class NvFp4MoeBackend(Enum):
 
 FLASHINFER_NVFP4_MOE_BACKENDS = [
     NvFp4MoeBackend.FLASHINFER_TRTLLM,
+    NvFp4MoeBackend.FLASHINFER_PRIMS,
     NvFp4MoeBackend.FLASHINFER_CUTLASS,
     NvFp4MoeBackend.FLASHINFER_CUTEDSL,
     NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
@@ -78,6 +80,13 @@ def backend_to_kernel_cls(
         from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
 
         return [B12xExperts]
+
+    elif backend == NvFp4MoeBackend.FLASHINFER_PRIMS:
+        from vllm.model_executor.layers.fused_moe.experts.prims_nvfp4_moe import (
+            PrimsNvFp4Experts,
+        )
+
+        return [PrimsNvFp4Experts]
 
     elif backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
         from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
@@ -166,6 +175,7 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
         "b12x": NvFp4MoeBackend.B12X,
         "cutlass": NvFp4MoeBackend.VLLM_CUTLASS,
         "flashinfer_trtllm": NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        "flashinfer_prims": NvFp4MoeBackend.FLASHINFER_PRIMS,
         "flashinfer_cutlass": NvFp4MoeBackend.FLASHINFER_CUTLASS,
         "flashinfer_cutedsl": NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         "flashinfer_moe_ep_cutedsl": NvFp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL,
@@ -215,6 +225,7 @@ def select_nvfp4_moe_backend(
     NVFP4_BACKENDS_WITH_CLAMP = {
         NvFp4MoeBackend.B12X,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        NvFp4MoeBackend.FLASHINFER_PRIMS,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         NvFp4MoeBackend.FLASHINFER_MOE_EP_CUTEDSL,
@@ -598,6 +609,7 @@ def make_nvfp4_moe_quant_config(
             backend
             not in (
                 NvFp4MoeBackend.FLASHINFER_TRTLLM,
+                NvFp4MoeBackend.FLASHINFER_PRIMS,
                 NvFp4MoeBackend.FLASHINFER_CUTEDSL,
             )
         ),
@@ -633,6 +645,7 @@ def make_nvfp4_moe_kernel(
         backend
         in (
             NvFp4MoeBackend.FLASHINFER_TRTLLM,
+            NvFp4MoeBackend.FLASHINFER_PRIMS,
             NvFp4MoeBackend.FLASHINFER_CUTEDSL,
         )
         and per_token_activation
