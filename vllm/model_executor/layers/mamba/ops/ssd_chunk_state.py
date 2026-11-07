@@ -228,8 +228,9 @@ def _chunk_state_fwd_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    pid_c = tl.program_id(axis=1).to(tl.int64)
-    pid_h = tl.program_id(axis=2)
+    # Neighboring heads reuse the same group of B/C vectors.
+    pid_c = tl.program_id(axis=2).to(tl.int64)
+    pid_h = tl.program_id(axis=1)
     num_pid_n = tl.cdiv(dstate, BLOCK_SIZE_N)
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
@@ -372,8 +373,8 @@ def _chunk_state_fwd(
     grid = lambda META: (
         triton.cdiv(headdim, META["BLOCK_SIZE_M"])
         * triton.cdiv(dstate, META["BLOCK_SIZE_N"]),
-        nchunks,
         nheads,
+        nchunks,
     )
     with torch.accelerator.device_index(x.device.index):
         _chunk_state_fwd_kernel[grid](
