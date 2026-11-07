@@ -250,6 +250,16 @@ pub struct LoraInfoLabels {
     pub waiting_lora_adapters: LoraAdapterNames,
 }
 
+/// Labels for CUDA graph step/token counters. `runtime_mode` is dynamic (the
+/// engine's `CUDAGraphMode` name, e.g. `FULL`, `PIECEWISE` or `NONE`) but has
+/// low cardinality; the per-graph-size breakdown is only kept in the text log.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct CudagraphModeLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub runtime_mode: String,
+}
+
 /// CUDA graph sample key used for periodic text-log aggregation.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CudagraphLogKey {
@@ -389,6 +399,11 @@ pub struct SchedulerMetrics {
     pub nixl_num_failed_transfers: Family<EngineLabels, U64Counter>,
     pub nixl_num_failed_notifications: Family<EngineLabels, U64Counter>,
     pub nixl_num_kv_expired_reqs: Family<EngineLabels, U64Counter>,
+
+    // CUDA graph runtime counters, only populated with `--cudagraph-metrics`.
+    pub cudagraph_steps: Family<CudagraphModeLabels, U64Counter>,
+    pub cudagraph_unpadded_tokens: Family<CudagraphModeLabels, U64Counter>,
+    pub cudagraph_padded_tokens: Family<CudagraphModeLabels, U64Counter>,
 
     /// Non-Prometheus interval accumulators for periodic text-log helpers.
     pub log_stats: Family<EngineLabels, SchedulerLogStatsAccumulator>,
@@ -703,6 +718,30 @@ impl SchedulerMetrics {
             nixl_num_kv_expired_reqs.clone(),
         );
 
+        // CUDA graph runtime counters. Only `--cudagraph-metrics` engines send
+        // the underlying stats, so these families stay empty otherwise.
+        let cudagraph_steps = Family::default();
+        registry.register(
+            "vllm:cudagraph_steps",
+            "Number of model execution steps by CUDA graph runtime mode.",
+            cudagraph_steps.clone(),
+        );
+
+        let cudagraph_unpadded_tokens = Family::default();
+        registry.register(
+            "vllm:cudagraph_unpadded_tokens",
+            "Number of real (unpadded) tokens executed, by CUDA graph runtime mode.",
+            cudagraph_unpadded_tokens.clone(),
+        );
+
+        let cudagraph_padded_tokens = Family::default();
+        registry.register(
+            "vllm:cudagraph_padded_tokens",
+            "Number of tokens executed after padding up to the CUDA graph batch size, \
+             by CUDA graph runtime mode.",
+            cudagraph_padded_tokens.clone(),
+        );
+
         Self {
             prefill_batching,
             prefill_delays,
@@ -741,6 +780,9 @@ impl SchedulerMetrics {
             nixl_num_failed_transfers,
             nixl_num_failed_notifications,
             nixl_num_kv_expired_reqs,
+            cudagraph_steps,
+            cudagraph_unpadded_tokens,
+            cudagraph_padded_tokens,
             log_stats: Family::default(),
         }
     }

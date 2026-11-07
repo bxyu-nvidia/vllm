@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::time::{Duration, Instant};
 
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info};
 use vllm_metrics::{
-    EngineLabels, F64Gauge, METRICS, PromptTokenSourceLabels, SchedulerLogStatsAccumulator,
-    SchedulerLogStatsInterval, U64Counter, U64Gauge, WaitingReasonLabels,
+    CudagraphLogKey, EngineLabels, F64Gauge, METRICS, PromptTokenSourceLabels,
+    SchedulerLogStatsAccumulator, SchedulerLogStatsInterval, U64Counter, U64Gauge,
+    WaitingReasonLabels,
 };
 
 const LOG_STATS_INTERVAL: Duration = Duration::from_secs(10);
@@ -302,7 +304,13 @@ async fn run_stats_logger(model_name: String, engine_indices: Vec<u32>) {
             log_stats_line!("{msg}");
         }
 
-        // TODO: Decide on best way to surface CUDAGraph interval samples.
+        // CUDA graph samples (only sent with `--cudagraph-metrics`), merged
+        // across engines and reset every interval by the drain above.
+        if !raw_log_stats.cudagraph_counts.is_empty() {
+            msg.clear();
+            format_cudagraph_table(&mut msg, &raw_log_stats.cudagraph_counts);
+            log_stats_line!("{msg}");
+        }
 
         if let Some(mfu_stats) = mfu_log_stats {
             log_stats_line!(
@@ -482,6 +490,62 @@ fn format_position_rates(output: &mut String, rates: &[f64]) {
     }
 }
 
+/// Append CUDA graph samples as the Markdown table printed by Python's
+/// `CUDAGraphLogging.generate_metric_table`, most frequent rows first.
+///
+/// The Python "CUDAGraph Config Settings" preamble (mode and capture sizes) is
+/// omitted because the frontend does not receive the compilation config.
+fn format_cudagraph_table(output: &mut String, counts: &BTreeMap<CudagraphLogKey, u64>) {
+    const COLUMN_HEADERS: [&str; 5] = [
+        "Unpadded Tokens",
+        "Padded Tokens",
+        "Num Paddings",
+        "Runtime Mode",
+        "Count",
+    ];
+
+    // Stable sort, so equal counts keep the deterministic key order.
+    let mut samples: Vec<_> = counts.iter().collect();
+    samples.sort_by(|(_, a), (_, b)| b.cmp(a));
+    let rows: Vec<[String; 5]> = samples
+        .into_iter()
+        .map(|(key, count)| {
+            [
+                key.num_unpadded_tokens.to_string(),
+                key.num_padded_tokens.to_string(),
+                key.num_paddings.to_string(),
+                key.runtime_mode.clone(),
+                count.to_string(),
+            ]
+        })
+        .collect();
+
+    let widths: [usize; 5] = std::array::from_fn(|column| {
+        rows.iter()
+            .map(|row| row[column].len())
+            .fold(COLUMN_HEADERS[column].len(), usize::max)
+    });
+
+    let write_row = |output: &mut String, cells: [&str; 5]| {
+        output.push('|');
+        for (cell, width) in cells.into_iter().zip(widths) {
+            write!(output, " {cell:<width$} |").unwrap();
+        }
+    };
+
+    output.push_str("**CUDAGraph Stats:**\n\n");
+    write_row(output, COLUMN_HEADERS);
+    output.push_str("\n|");
+    for width in widths {
+        output.push_str(&"-".repeat(width + 2));
+        output.push('|');
+    }
+    for row in &rows {
+        output.push('\n');
+        write_row(output, std::array::from_fn(|column| row[column].as_str()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +615,55 @@ mod tests {
         format_position_rates(&mut output, &[1.0, 0.5, 0.25]);
 
         assert_eq!(output, "1.000, 0.500, 0.250");
+    }
+
+    fn cudagraph_key(unpadded: u64, padded: u64, runtime_mode: &str) -> CudagraphLogKey {
+        CudagraphLogKey {
+            num_unpadded_tokens: unpadded,
+            num_padded_tokens: padded,
+            num_paddings: padded - unpadded,
+            runtime_mode: runtime_mode.to_string(),
+        }
+    }
+
+    #[test]
+    fn format_cudagraph_table_matches_python_layout() {
+        let counts = BTreeMap::from([
+            (cudagraph_key(5, 8, "FULL"), 3),
+            (cudagraph_key(7, 8, "FULL"), 12),
+            (cudagraph_key(1000, 1000, "NONE"), 3),
+        ]);
+        let mut output = String::new();
+
+        format_cudagraph_table(&mut output, &counts);
+
+        expect_test::expect![[r#"
+            **CUDAGraph Stats:**
+
+            | Unpadded Tokens | Padded Tokens | Num Paddings | Runtime Mode | Count |
+            |-----------------|---------------|--------------|--------------|-------|
+            | 7               | 8             | 1            | FULL         | 12    |
+            | 5               | 8             | 3            | FULL         | 3     |
+            | 1000            | 1000          | 0            | NONE         | 3     |"#]]
+        .assert_eq(&output);
+    }
+
+    #[test]
+    fn drain_scheduler_log_stats_merges_engines_and_resets() {
+        let engines = resolve_engine_metrics("cudagraph-log-test-model", &[0, 1]);
+        engines[0].log_stats.observe_cudagraph(5, 8, 3, "FULL");
+        engines[1].log_stats.observe_cudagraph(5, 8, 3, "FULL");
+        engines[1].log_stats.observe_cudagraph(20, 24, 4, "PIECEWISE");
+
+        let interval = drain_scheduler_log_stats(&engines);
+
+        assert_eq!(
+            interval.cudagraph_counts,
+            BTreeMap::from([
+                (cudagraph_key(5, 8, "FULL"), 2),
+                (cudagraph_key(20, 24, "PIECEWISE"), 1),
+            ])
+        );
+        assert!(drain_scheduler_log_stats(&engines).cudagraph_counts.is_empty());
     }
 }
