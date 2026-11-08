@@ -168,4 +168,4 @@ def test_chunk_scan_dispatch_passes_workload_to_autotuner(
     assert launched["nchunks_bucket"] == expected
     assert launched["nheads"] == 2
     # Bucketing changes tuning only: the launch still processes every real chunk.
-    assert launched["grid"] == (1, 2, chunks)
+    assert launched["grid"] == (1, chunks, 2)
