@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Newest-state lookup is adapted from FutureMLS-Lab/vllm (Apache-2.0):
+# https://github.com/FutureMLS-Lab/vllm/commit/3cfd432cd83a54a5e538cad7b090e56c27a870f9
+# Original: vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py
 #
 # The transfer-thread scaffolding (KVTransferThread, KVCacheStoreSendingThread,
 # KVCacheStoreRecvingThread) is adapted from vllm-project/vllm-ascend
@@ -1394,6 +1397,9 @@ class MooncakeStoreWorker:
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
             extra_config.get("save_decode_cache", False)
         )
+        self.lookup_newest_state = extra_config.get("lookup_newest_state", False)
+        if not isinstance(self.lookup_newest_state, bool):
+            raise ValueError("lookup_newest_state must be a bool")
         self.load_async = extra_config.get("load_async", True)
         # Mirrors MooncakeStoreConnector._capacity_only.
         self._capacity_only = (
@@ -2114,6 +2120,7 @@ class MooncakeStoreWorker:
         candidate_meta: list[tuple[int, bytes]] = []
         fine_grained = self.coord.enable_partial_hash_hits
         lookup_masks = None if fine_grained else self.coord.lookup_mask(token_len)
+        deferred: dict[int, int] = {}
         for g_idx, db in enumerate(self.token_dbs):
             if not self._kv_cache_groups[g_idx].kv_cache_spec.prefix_cacheable:
                 continue
@@ -2121,6 +2128,9 @@ class MooncakeStoreWorker:
             key_prefixes = self._lookup_key_prefixes[g_idx]
             if fine_grained:
                 max_units = min(len(block_hashes), token_len // self.hash_block_size)
+                if self.lookup_newest_state and g_idx in self.coord.mamba_group_ids:
+                    deferred[g_idx] = max_units
+                    continue
                 unit_ids: range | list[int] = range(max_units)
                 group_hashes: Sequence[BlockHash] = block_hashes
             else:
@@ -2148,43 +2158,32 @@ class MooncakeStoreWorker:
                     )
                 candidate_meta.append((g_idx, bytes(h)))
 
-        if not candidate_keys:
+        if not candidate_keys and not deferred:
             return MooncakeLookupResult(0)
 
-        lookup_start = time.perf_counter()
-        try:
-            res = self.store.batch_is_exist(candidate_keys)
-            self._record_kv_connector_operation(
-                "lookup_exists",
-                time.perf_counter() - lookup_start,
-                len(candidate_keys),
-            )
-        except Exception as e:
-            self._record_kv_connector_operation(
-                "lookup_exists",
-                time.perf_counter() - lookup_start,
-                len(candidate_keys),
-                status="error",
-                num_failed_keys=len(candidate_keys),
-            )
-            logger.error("Remote connection failed in lookup: %s", e)
+        exists_set: set[tuple[int, bytes]] = set()
+        if not self._probe_exists(candidate_keys, candidate_meta, exists_set):
             return MooncakeLookupResult(0)
-
-        # A (group, hash) is "present" only when every namespace that will be
-        # loaded has it (per-group count: sharded groups need every rank's
-        # shard, replicated groups one namespace per unique KV head).
-        exists_set = set()
-        pos = 0
-        for g_idx, hash_bytes in candidate_meta:
-            count = len(self._lookup_key_prefixes[g_idx])
-            if all(res[pos + j] == 1 for j in range(count)):
-                exists_set.add((g_idx, hash_bytes))
-            pos += count
 
         cached_block_pool = ExternalCachedBlockPool(
             self.hash_block_size,
             exists_set,
         )
+        if deferred:
+            hit_length = self._newest_state_hit(
+                num_tokens,
+                token_len,
+                block_hashes,
+                deferred,
+                exists_set,
+                cached_block_pool,
+            )
+            if hit_length is None:
+                return MooncakeLookupResult(0)
+            return MooncakeLookupResult(
+                hit_length,
+                self._tail_key_boundaries(block_hashes, hit_length, cached_block_pool),
+            )
         _, hit_length = self.coord.find_longest_cache_hit(
             block_hashes,
             token_len,
@@ -2207,6 +2206,118 @@ class MooncakeStoreWorker:
                 cached_block_pool,
             ),
         )
+
+    def _probe_exists(
+        self,
+        keys: list[str],
+        meta: list[tuple[int, bytes]],
+        exists_set: set[tuple[int, bytes]],
+    ) -> bool:
+        """Add to ``exists_set`` each ``meta`` entry whose keys all exist.
+
+        A (group, hash) is "present" only when every namespace that will be
+        loaded has it (per-group count: sharded groups need every rank's
+        shard, replicated groups one namespace per unique KV head). False when
+        the store call fails.
+        """
+        if not keys:
+            return True
+        lookup_start = time.perf_counter()
+        try:
+            res = self.store.batch_is_exist(keys)
+            if len(res) != len(keys):
+                raise ValueError("Mooncake existence response has the wrong length")
+            self._record_kv_connector_operation(
+                "lookup_exists",
+                time.perf_counter() - lookup_start,
+                len(keys),
+            )
+        except Exception as e:
+            self._record_kv_connector_operation(
+                "lookup_exists",
+                time.perf_counter() - lookup_start,
+                len(keys),
+                status="error",
+                num_failed_keys=len(keys),
+            )
+            logger.error("Remote connection failed in lookup: %s", e)
+            return False
+        pos = 0
+        for g_idx, hash_bytes in meta:
+            count = len(self._lookup_key_prefixes[g_idx])
+            if all(res[pos + j] == 1 for j in range(count)):
+                exists_set.add((g_idx, hash_bytes))
+            pos += count
+        return True
+
+    def _newest_state_hit(
+        self,
+        num_tokens: int,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        deferred: dict[int, int],
+        exists_set: set[tuple[int, bytes]],
+        cached_block_pool: ExternalCachedBlockPool,
+    ) -> int | None:
+        """``lookup_newest_state``: the official hit (``token_len``, then below
+        the request end when it covers every token), with the state groups'
+        keys probed from the deepest unit down and the other groups' keys
+        already in ``exists_set``.
+
+        A hit ends on a unit where every state group has a key, and with every
+        state assumed present the hit is at least as long. State units are
+        probed below that bound in batches (8 units, then twice as many each
+        time); the first batch that gives a hit gives the official hit, since
+        every deeper unit has been probed. Only the probed keys get a lease.
+        None when the store call fails.
+        """
+        hbs = self.hash_block_size
+        every_state = set(exists_set)
+        for g_idx, max_units in deferred.items():
+            every_state.update(
+                (g_idx, bytes(block_hashes[u])) for u in range(max_units)
+            )
+        optimistic = ExternalCachedBlockPool(hbs, every_state)
+        # State units at and above `probed` have been probed; the next batch
+        # probes `step` units below it.
+        probed = max(deferred.values())
+        step = 8
+
+        def deepest(max_length: int) -> int | None:
+            nonlocal probed, step
+            _, bound = self.coord.find_longest_cache_hit(
+                block_hashes, max_length, optimistic
+            )
+            if bound <= 0:
+                return 0
+            probed = min(probed, bound // hbs)
+            while True:
+                _, hit = self.coord.find_longest_cache_hit(
+                    block_hashes, max_length, cached_block_pool
+                )
+                if hit > 0 or probed == 0:
+                    return hit
+                lo = max(0, probed - step)
+                keys: list[str] = []
+                meta: list[tuple[int, bytes]] = []
+                for g_idx, max_units in deferred.items():
+                    for u in range(lo, min(probed, max_units)):
+                        h = block_hashes[u]
+                        hash_hex = h.hex()
+                        for key_prefix in self._lookup_key_prefixes[g_idx]:
+                            keys.append(PoolKey.build_key_string(key_prefix, hash_hex))
+                        meta.append((g_idx, bytes(h)))
+                if not self._probe_exists(keys, meta, exists_set):
+                    return None
+                probed, step = lo, step * 2
+
+        hit_length = deepest(token_len)
+        if hit_length is None or hit_length < num_tokens:
+            return hit_length
+        usable_length = self.coord.align_lookup_length(num_tokens - 1)
+        if usable_length <= 0:
+            return 0
+        return deepest(usable_length)
 
     def _tail_key_boundaries(
         self,
