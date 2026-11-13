@@ -525,6 +525,8 @@ def test_padded_moe_reload_releases_each_layer(
         torch.nn.Module.__init__(layer)
         layer.moe_config = config
         layer.quant_config = None
+        layer.dwdp_manager = None
+        layer.dwdp_expert_range = None
         layer.quant_method = method
         layer.expert_map_manager = SimpleNamespace(map_global_to_local=lambda i: i)
         layer._loaded_expert_biases = set()
@@ -1255,3 +1257,39 @@ def test_online_quantize_reload(
         mul_perp = llm.generate_prompt_perplexity(["3 4 = 12"], mask=["3 4 ="])[0]
         add_perp = llm.generate_prompt_perplexity(["3 4 = 7"], mask=["3 4 ="])[0]
         assert add_perp < mul_perp
+
+
+def test_fp8_kv_refit_updates_scales_in_place_and_retains_unspecified_scales(
+    default_vllm_config,
+):
+    from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+
+    layer = _ReloadableAttentionLayer()
+    layer.kv_cache_dtype = "fp8_e4m3"
+    layer.quant_method = BaseKVCacheMethod(None)
+    for name in ("_k_scale", "_v_scale", "_q_scale", "_prob_scale"):
+        layer.register_buffer(name, torch.tensor(1.0))
+    layer._k_scale_cpu = torch.tensor(1.0)
+    layer._v_scale_cpu = torch.tensor(1.0)
+    layer.quant_method.create_weights(layer)
+    record_metadata_for_reloading(layer)
+    layer.quant_method.process_weights_after_loading(layer)
+    pointers = (layer._k_scale.data_ptr(), layer._v_scale.data_ptr())
+    config = SimpleNamespace(dtype=torch.float32)
+    for k, v in ((2.0, 3.0), (4.0, 5.0)):
+        initialize_layerwise_reload(layer)
+        layer.k_scale.weight_loader(layer.k_scale, torch.tensor(k))
+        layer.v_scale.weight_loader(layer.v_scale, torch.tensor(v))
+        finalize_layerwise_reload(layer, config)
+        assert layer._k_scale.item() == k
+        assert layer._v_scale.item() == v
+        assert layer._k_scale_float == k
+        assert layer._v_scale_float == v
+        assert (layer._k_scale.data_ptr(), layer._v_scale.data_ptr()) == pointers
+        # BF16 trainers generally export no calibrated KV scales. Keep the
+        # current checkpoint scales when that refit does not supply new ones.
+        initialize_layerwise_reload(layer)
+        finalize_layerwise_reload(layer, config)
+        assert layer._k_scale.item() == k
+        assert layer._v_scale.item() == v
+        assert (layer._k_scale.data_ptr(), layer._v_scale.data_ptr()) == pointers
