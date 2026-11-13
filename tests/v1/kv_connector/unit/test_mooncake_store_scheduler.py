@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -56,6 +56,7 @@ def _make_bare_scheduler(
     scheduler._store_group_ids = (0,)
     scheduler._store_group_id_by_kv_cache_group_id = {0: 0, 1: 1}
     scheduler.load_specs = {}
+    scheduler._deferred_lookups = {}
     scheduler._unfinished_request_ids = {"req-0"}
     scheduler._unfinished_requests = {}
     scheduler._request_trackers = {}
@@ -988,6 +989,151 @@ def test_full_external_hit_with_full_local_hit_skips_load():
     assert need_to_allocate == 0
     assert load_async is False
     assert "req-0" not in scheduler.load_specs
+
+
+@pytest.mark.parametrize("hit_tokens", [0, 16, 32])
+def test_deferred_lookup_reuses_no_load_result(hit_tokens):
+    """Retries still check local hits without repeating a completed store query."""
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens)
+    request = SimpleNamespace(
+        request_id="req-0", num_tokens=64, block_hashes=[b"h0", b"h1"]
+    )
+
+    for local_tokens in [32, 48, 32]:
+        assert scheduler.get_num_new_matched_tokens(request, local_tokens) == (0, False)
+    assert scheduler.client.num_tokens == [64]
+    assert not scheduler.load_specs
+
+
+@pytest.mark.parametrize("change", ["length", "hash"])
+def test_deferred_lookup_invalidates_changed_input(change):
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(0)
+    request = SimpleNamespace(
+        request_id="req-0", num_tokens=64, block_hashes=[b"h0", b"h1"]
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    if change == "length":
+        request.num_tokens += 1
+    else:
+        request.block_hashes[0] = b"different-prefix"
+    scheduler.client._hit_tokens = 16
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+    assert len(scheduler.client.num_tokens) == 2
+
+
+def test_deferred_lookup_rechecks_miss_after_local_eviction():
+    """A local eviction can make a newly published remote prefix valuable."""
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(0)
+    request = SimpleNamespace(request_id="req-0", num_tokens=64, block_hashes=[])
+    assert scheduler.get_num_new_matched_tokens(request, 32) == (0, False)
+    scheduler.client._hit_tokens = 32
+
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (16, True)
+    assert scheduler.client.num_tokens == [64, 64]
+
+
+def test_deferred_lookup_rechecks_remote_hit_after_local_eviction():
+    """An old positive result must not authorize a load after local hits shrink."""
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(32)
+    request = SimpleNamespace(request_id="req-0", num_tokens=64, block_hashes=[])
+    assert scheduler.get_num_new_matched_tokens(request, 32) == (0, False)
+    scheduler.client._hit_tokens = 0  # The remote keys were also evicted.
+
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (0, False)
+    assert scheduler.client.num_tokens == [64, 64]
+    assert not scheduler.load_specs
+
+
+@pytest.mark.parametrize("cleanup", ["admit", "finish", "preempt", "reset"])
+def test_deferred_lookup_cleared_on_lifecycle_transition(cleanup):
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = MagicMock()
+    scheduler.client.lookup.return_value = MooncakeLookupResult(0)
+    request = SimpleNamespace(request_id="req-0", num_tokens=64, block_hashes=[])
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+
+    if cleanup == "admit":
+        scheduler.update_state_after_alloc(request, KVCacheBlocks(([],)), 0)
+    elif cleanup == "reset":
+        scheduler.reset_store()
+    else:
+        output = _make_scheduler_output(scheduled_spec_tokens=None)
+        output.scheduled_cached_reqs.req_ids = []
+        if cleanup == "finish":
+            output.finished_req_ids = {request.request_id}
+        else:
+            output.preempted_req_ids = {request.request_id}
+        scheduler.build_connector_meta(output)
+
+    scheduler.client.lookup.return_value = MooncakeLookupResult(16)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (16, True)
+    assert scheduler.client.lookup.call_count == 2
+
+
+def test_deferred_lookup_waits_for_async_completion():
+    scheduler = _make_bare_scheduler()
+    scheduler.lookup_async = True
+    scheduler.client = MagicMock()
+    scheduler.client.lookup.side_effect = [None, MooncakeLookupResult(0)]
+    request = SimpleNamespace(request_id="req-0", num_tokens=64, block_hashes=[])
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (None, False)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler.client.lookup.call_count == 2
+
+
+def test_mamba_alignment_retry_does_not_repeat_store_lookup(monkeypatch):
+    """Exercise real scheduler deferrals and the Mooncake admission callbacks."""
+    from tests.v1.core.utils import create_requests, create_scheduler
+
+    core = create_scheduler(
+        max_num_batched_tokens=96,
+        max_model_len=1024,
+        block_size=64,
+        enable_prefix_caching=True,
+        use_kv_connector=True,
+        enable_prefill_batching_metrics=True,
+    )
+    core.need_mamba_block_aligned_split = True
+    store = _make_bare_scheduler(hash_block_size=64)
+    store._block_size = 64
+    store.load_async = True
+    store.client = MagicMock()
+    store.client.lookup.return_value = MooncakeLookupResult(0)
+    monkeypatch.setattr(
+        core.connector, "get_num_new_matched_tokens", store.get_num_new_matched_tokens
+    )
+    monkeypatch.setattr(
+        core.connector, "update_state_after_alloc", store.update_state_after_alloc
+    )
+    (first,) = create_requests(1, num_tokens=64, block_size=64, req_ids=["first"])
+    deferred = create_requests(
+        2, num_tokens=200, block_size=64, req_ids=["long0", "long1"]
+    )
+    for request in [first, *deferred]:
+        core.add_request(request)
+
+    assert core.schedule().num_scheduled_tokens == {"first": 64}
+    assert core.make_stats().prefill_batching_stats.blocked_requests == {
+        "mamba_alignment": 2
+    }
+    assert core.schedule().num_scheduled_tokens == {"long0": 64}
+    assert core.schedule().num_scheduled_tokens == {"long0": 64}
+    assert [call.args[0] for call in store.client.lookup.call_args_list] == [
+        "first",
+        "long0",
+        "long1",
+    ]
 
 
 def test_partial_hash_hit_block_aligned_local_loads_partial_tail():
