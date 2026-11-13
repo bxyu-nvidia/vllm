@@ -18,12 +18,16 @@ use std::sync::Arc;
 
 use futures::{StreamExt as _, pin_mut};
 use vllm_engine_core_client::protocol::sampling_mask::SamplingMask;
+use vllm_engine_core_client::protocol::tensor::WireNdArray;
 
 use crate::{Error, FinishReason, Result, TextOutputStream};
 
 /// Final decoded text plus terminal stream metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectedTextOutput {
+    /// Expert-route chunks, before terminal stop-string truncation.
+    pub routed_experts: Vec<WireNdArray>,
+    pub dropped_tokens: usize,
     pub text: String,
     pub prompt_token_ids: Arc<[u32]>,
     pub prompt_logprobs: Option<DecodedPromptLogprobs>,
@@ -84,6 +88,8 @@ impl<T: TextOutputStream> T {
                             }
                         } else {
                             collected = Some(CollectedTextOutput {
+                                routed_experts: Vec::new(),
+                                dropped_tokens: 0,
                                 text: decoded.text,
                                 prompt_token_ids: Arc::clone(&prompt_token_ids),
                                 prompt_logprobs: prompt_logprobs.take(),
@@ -99,6 +105,8 @@ impl<T: TextOutputStream> T {
 
                         if let Some(finished) = finished {
                             let mut collected = collected.unwrap();
+                            collected.routed_experts = finished.routed_experts;
+                            collected.dropped_tokens = finished.dropped_tokens;
                             collected.finish_reason = finished.finish_reason;
                             collected.usage = finished.usage;
                             collected.kv_transfer_params =
@@ -172,6 +180,8 @@ mod tests {
                     }),
                 },
                 finished: Some(Box::new(Finished {
+                    routed_experts: Vec::new(),
+                    dropped_tokens: 0,
                     usage: vllm_llm::TokenUsage {
                         prompt_token_count: 2,
                         output_token_count: 2,
@@ -295,6 +305,8 @@ mod tests {
                     }),
                 },
                 finished: Some(Box::new(Finished {
+                    routed_experts: Vec::new(),
+                    dropped_tokens: 0,
                     usage: vllm_llm::TokenUsage {
                         prompt_token_count: 2,
                         output_token_count: 5,

@@ -414,6 +414,8 @@ mod tests {
             decoded: DecodedText::unattributed(delta),
             sampled: vllm_text::SampledDelta::default(),
             finished: Some(Box::new(vllm_text::output::Finished {
+                routed_experts: Vec::new(),
+                dropped_tokens: 0,
                 usage: vllm_llm::TokenUsage::default(),
                 finish_reason: crate::FinishReason::Stop(None),
                 kv_transfer_params: None,

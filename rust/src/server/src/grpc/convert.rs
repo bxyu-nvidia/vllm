@@ -938,6 +938,8 @@ mod tests {
 
     fn finished(reason: FinishReason) -> Finished {
         Finished {
+            routed_experts: Vec::new(),
+            dropped_tokens: 0,
             usage: vllm_llm::TokenUsage {
                 prompt_token_count: 0,
                 output_token_count: 0,

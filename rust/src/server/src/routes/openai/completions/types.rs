@@ -196,6 +196,10 @@ pub struct CompletionRequest {
     /// Include token IDs alongside generated text
     pub return_token_ids: Option<bool>,
 
+    /// First prompt position whose expert routes should be returned.
+    #[serde(default)]
+    pub routed_experts_prompt_start: u32,
+
     /// Salt for prefix cache isolation in multi-user environments
     #[validate(length(min = 1))]
     pub cache_salt: Option<String>,
@@ -255,6 +259,8 @@ pub(super) struct CompletionChoice {
     pub prompt_logprobs: Option<PromptLogprobs>,
     pub token_ids: Option<Vec<u32>>,
     pub prompt_token_ids: Option<Vec<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_experts: Option<String>,
 }
 
 /// Mirrors the Python vLLM `CompletionStreamResponse` class.

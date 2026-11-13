@@ -254,6 +254,8 @@ impl pb::inference_server::Inference for InferenceServiceImpl {
         );
 
         let finish_info = vllm_text::Finished {
+            routed_experts: Vec::new(),
+            dropped_tokens: 0,
             usage: collected.usage,
             finish_reason: collected.finish_reason,
             kv_transfer_params: collected.kv_transfer_params.map(Box::new),

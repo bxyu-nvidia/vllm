@@ -8419,3 +8419,5 @@ async fn profile_routes_are_hidden_when_profiling_is_disabled() {
 
     engine_task.abort_and_join().await;
 }
+
+mod nemo_rl;
