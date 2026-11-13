@@ -473,12 +473,17 @@ def test_ipc_prefetch_preserves_weights_with_idle_and_unequal_workers(
     )
 
 
-def _moe_worker(rank, path, backend, merge_free, nvfp4=False, gated=False):
+def _moe_worker(rank, path, backend, merge_free, nvfp4=False, gated=False, refit=False):
     from tests.kernels.moe.utils import make_dummy_moe_config
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.model_loader.reload.layerwise import (
+        finalize_layerwise_reload,
+        initialize_layerwise_reload,
+        record_metadata_for_reloading,
+    )
     from vllm.model_executor.offloader import set_offloader
     from vllm.model_executor.offloader.dwdp import DWDPWeightOffloader
     from vllm.v1.worker.workspace import init_workspace_manager
@@ -556,6 +561,7 @@ def _moe_worker(rank, path, backend, merge_free, nvfp4=False, gated=False):
                     ckpt_gate_proj_name="gate_proj" if gated else "up_proj",
                     ckpt_up_proj_name="up_proj" if gated else None,
                 )
+                record_metadata_for_reloading(layer)
                 projections = [(full_w13[:, :intermediate], "w13_weight", "w1")]
                 if gated:
                     projections.append((full_w13[:, intermediate:], "w13_weight", "w3"))
@@ -609,6 +615,91 @@ def _moe_worker(rank, path, backend, merge_free, nvfp4=False, gated=False):
                 expected = baseline.forward_modular(x.clone(), scores, ids)
                 result = actual.forward_modular(x.clone(), scores, ids)
                 torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        if refit:
+            pointers = [
+                {name: param.data_ptr() for name, param in layer.named_parameters()}
+                for layer in baselines + sharded
+            ]
+            graph = None
+            if nvfp4:
+                # The replicated graph exercises the same stable-address reload
+                # contract used by decode. DWDP prefill stays eager in this test.
+                graph_x = torch.randn(17, hidden, dtype=torch.bfloat16)
+                graph_ids = (torch.arange(34).view(17, 2) % num_experts).int()
+                graph_scores = torch.full((17, 2), 0.5)
+                for layer in baselines:
+                    layer.forward_modular(graph_x, graph_scores, graph_ids)
+                torch.accelerator.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    graph_outputs = [
+                        layer.forward_modular(graph_x, graph_scores, graph_ids)
+                        for layer in baselines
+                    ]
+            for epoch in (1, 2):
+                with offloader.manager.refit():
+                    for layer_id, (actual, baseline) in enumerate(
+                        zip(sharded, baselines)
+                    ):
+                        torch.manual_seed(100 * epoch + layer_id)
+                        up = (
+                            torch.randn(
+                                num_experts,
+                                intermediate * (2 if gated else 1),
+                                hidden,
+                                dtype=torch.bfloat16,
+                            )
+                            * 0.03
+                        )
+                        down = (
+                            torch.randn(
+                                num_experts, hidden, intermediate, dtype=torch.bfloat16
+                            )
+                            * 0.02
+                        )
+                        for layer in (baseline, actual):
+                            initialize_layerwise_reload(layer)
+                            projections = [(up[:, :intermediate], "w13_weight", "w1")]
+                            if gated:
+                                projections.append(
+                                    (up[:, intermediate:], "w13_weight", "w3")
+                                )
+                            projections.append((down, "w2_weight", "w2"))
+                            for weight, name, shard in projections:
+                                param = getattr(layer, name)
+                                for expert, value in enumerate(weight.unbind()):
+                                    param.weight_loader(
+                                        param, value, name, shard, expert, True
+                                    )
+                            finalize_layerwise_reload(
+                                layer, SimpleNamespace(dtype=torch.bfloat16)
+                            )
+                for layer, before in zip(baselines + sharded, pointers):
+                    if nvfp4:
+                        layer.quant_method.finalize_weight_reload(layer)
+                    assert {
+                        name: param.data_ptr()
+                        for name, param in layer.named_parameters()
+                    } == before
+                for actual, baseline in zip(sharded, baselines):
+                    expected = baseline.forward_modular(x.clone(), scores, ids)
+                    result = actual.forward_modular(x.clone(), scores, ids)
+                    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                    if nvfp4:
+                        torch.testing.assert_close(
+                            actual.w13_weight_scale_2, baseline.w13_weight_scale_2
+                        )
+                        torch.testing.assert_close(
+                            actual.g1_scale_c, baseline.g1_scale_c
+                        )
+                if graph is not None:
+                    graph.replay()
+                    torch.accelerator.synchronize()
+                    for output, baseline in zip(graph_outputs, baselines):
+                        expected = baseline.forward_modular(
+                            graph_x, graph_scores, graph_ids
+                        )
+                        torch.testing.assert_close(output, expected, rtol=0, atol=0)
         if merge_free:
             assert offloader.manager.local_copy_bytes == 0
         with pytest.raises(RuntimeError, match="immutable"):
@@ -648,6 +739,106 @@ def test_nvfp4_merge_free_loading_and_outputs_match_replicated_weights(tmp_path,
     mp.spawn(
         _moe_worker,
         args=(str(tmp_path / "nvfp4-store"), "flashinfer_prims", True, True, gated),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.fixture
+def refit_manager(monkeypatch):
+    # Exercise real tensor updates without requiring a CUDA device or IPC imports.
+    manager = DWDPWeightManager(0, 2, torch.device("cuda", 0))
+    manager.device = torch.device("cpu")
+    local = (torch.ones(2, 3), torch.ones(2, 1))
+    replicated = manager.register_layer("moe", 4, local, replicated_indices=(1,))
+    remote = (torch.full((2, 3), 2.0), torch.full((2, 1), 3.0))
+    manager._peers = [[local, remote]]
+    phases = []
+    manager._store = SimpleNamespace(
+        set=lambda key, value: phases.append(key), wait=lambda keys: None
+    )
+    manager._initialized = True
+    manager._slots = [SimpleNamespace(layer=0, has_consumer=True, ready_capture_id=7)]
+    manager._timings = [SimpleNamespace(recorded=True)]
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    return manager, replicated[1], remote, phases
+
+
+def test_refit_preserves_ipc_addresses_and_refreshes_metadata_across_epochs(
+    refit_manager,
+):
+    manager, replicated, remote, phases = refit_manager
+    resident = manager.local_weights("moe")
+    pointers = [tensor.data_ptr() for tensor in (*resident, replicated)]
+    for epoch in (1, 2):
+        with manager.refit():
+            with pytest.raises(RuntimeError), manager.layer("moe"):
+                pass
+            weights = (
+                torch.full((2, 3), float(epoch + 10)),
+                torch.full((2, 1), float(epoch)),
+            )
+            manager.register_layer("moe", 4, weights, replicated_indices=(1,))
+            remote[1].fill_(epoch + 20)
+        torch.testing.assert_close(resident[0], weights[0])
+        torch.testing.assert_close(replicated[:2], weights[1])
+        torch.testing.assert_close(replicated[2:], remote[1])
+        assert [
+            tensor.data_ptr() for tensor in (*manager.local_weights("moe"), replicated)
+        ] == pointers
+        assert manager._slots[0].layer == -1
+        assert not manager._slots[0].has_consumer
+        assert manager._slots[0].ready_capture_id is None
+        assert not manager._timings[0].recorded
+        assert not manager.refitting
+    assert phases == [
+        f"refit/{epoch}/{phase}/0"
+        for epoch in (1, 2)
+        for phase in ("drained", "written", "replicated")
+    ]
+    with pytest.raises(RuntimeError, match="Cannot register"):
+        manager.register_layer("moe", 4, resident, replicated_indices=(1,))
+
+
+@pytest.mark.parametrize("failure", ["missing", "layout", "duplicate", "interrupted"])
+def test_incomplete_refit_poisoning_prevents_reuse(refit_manager, failure):
+    manager, _, _, _ = refit_manager
+    weights = (torch.full((2, 3), 4.0), torch.full((2, 1), 5.0))
+    with pytest.raises((RuntimeError, ValueError)), manager.refit():
+        if failure == "layout":
+            manager.register_layer("moe", 4, (weights[0], torch.zeros(3, 1)), (1,))
+        elif failure == "duplicate":
+            manager.register_layer("moe", 4, weights, (1,))
+            manager.register_layer("moe", 4, weights, (1,))
+        elif failure == "interrupted":
+            raise RuntimeError("receiver failed")
+    assert manager._failed
+    assert not manager.refitting
+    if failure == "layout":
+        # Validate all projections before copying any new values into live storage.
+        torch.testing.assert_close(manager.local_weights("moe")[0], torch.ones(2, 3))
+    with pytest.raises(RuntimeError, match="healthy"), manager.refit():
+        pass
+
+
+@pytest.mark.parametrize("nvfp4,gated", [(False, False), (True, False), (True, True)])
+def test_moe_refit_matches_reloaded_replicated_weights(tmp_path, nvfp4, gated):
+    """Multiple updates refresh peer shards/scales and captured replicated outputs."""
+    if not torch.cuda.is_available() or torch.accelerator.device_count() < 2:
+        pytest.skip("Requires two CUDA GPUs")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Prims requires SM100")
+    mp.spawn(
+        _moe_worker,
+        args=(
+            str(tmp_path / "refit-store"),
+            "flashinfer_prims",
+            True,
+            nvfp4,
+            gated,
+            True,
+        ),
         nprocs=2,
         join=True,
     )

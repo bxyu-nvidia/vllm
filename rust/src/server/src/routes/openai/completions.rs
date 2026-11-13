@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 mod convert;
+mod routed_experts;
 mod types;
 mod validate;
 
@@ -153,12 +154,20 @@ async fn collect_completion(
         include_prompt_logprobs,
         return_token_ids,
         return_tokens_as_token_ids,
+        routed_experts_prompt_start,
     }: ResponseOptions,
 ) -> Result<CompletionResponse, ApiError> {
     let collected = stream
         .collect_output()
         .await
         .map_err(|error| server_error!("completion stream failed: {}", error.to_report_string()))?;
+    let routed_experts = routed_experts::encode(
+        &collected.routed_experts,
+        collected.dropped_tokens,
+        collected.prompt_token_ids.len(),
+        collected.token_ids.len(),
+        routed_experts_prompt_start as usize,
+    )?;
     let finish_reason = collected.finish_reason.clone();
     let stop_reason = finish_reason.as_stop_reason().map(stop_reason_to_json);
 
@@ -223,6 +232,7 @@ async fn collect_completion(
             prompt_logprobs,
             token_ids: return_token_ids.then(|| collected.token_ids.clone()),
             prompt_token_ids: return_token_ids.then(|| collected.prompt_token_ids.to_vec()),
+            routed_experts,
         }],
         usage: Some(usage),
         system_fingerprint: None,
@@ -253,6 +263,7 @@ async fn completion_chunk_stream(
         include_prompt_logprobs: _,
         return_token_ids,
         return_tokens_as_token_ids,
+        routed_experts_prompt_start: _,
     }: ResponseOptions,
     mut y: TryYielder<CompletionSseChunk, ApiError>,
 ) -> Result<(), ApiError> {
@@ -691,6 +702,8 @@ mod tests {
                     }],
                 }),
                 Some(Finished {
+                    routed_experts: Vec::new(),
+                    dropped_tokens: 0,
                     usage: vllm_llm::TokenUsage {
                         prompt_token_count: 5,
                         output_token_count: 2,
@@ -806,6 +819,8 @@ mod tests {
                 vec![7, 8],
                 None,
                 Some(Finished {
+                    routed_experts: Vec::new(),
+                    dropped_tokens: 0,
                     usage: vllm_llm::TokenUsage {
                         prompt_token_count: 2,
                         output_token_count: 2,
@@ -870,6 +885,8 @@ mod tests {
                 vec![3],
                 None,
                 Some(Finished {
+                    routed_experts: Vec::new(),
+                    dropped_tokens: 0,
                     usage: vllm_llm::TokenUsage {
                         prompt_token_count: 2,
                         output_token_count: 1,
@@ -923,6 +940,8 @@ mod tests {
                 vec![3],
                 None,
                 Some(Finished {
+                    routed_experts: Vec::new(),
+                    dropped_tokens: 0,
                     usage: vllm_llm::TokenUsage {
                         prompt_token_count: 1,
                         output_token_count: 1,
@@ -979,6 +998,8 @@ mod tests {
                 vec![3],
                 None,
                 Some(Finished {
+                    routed_experts: Vec::new(),
+                    dropped_tokens: 0,
                     usage: vllm_llm::TokenUsage {
                         prompt_token_count: 2,
                         output_token_count: 1,
@@ -1052,6 +1073,8 @@ mod tests {
                 vec![3],
                 None,
                 Some(Finished {
+                    routed_experts: Vec::new(),
+                    dropped_tokens: 0,
                     usage: vllm_llm::TokenUsage {
                         prompt_token_count: 1,
                         output_token_count: 1,
@@ -1127,6 +1150,8 @@ mod tests {
                 vec![3],
                 None,
                 Some(Finished {
+                    routed_experts: Vec::new(),
+                    dropped_tokens: 0,
                     usage: vllm_llm::TokenUsage {
                         prompt_token_count: 2,
                         output_token_count: 1,

@@ -104,6 +104,9 @@ pub struct SamplingParams {
     pub prompt_logprob_token_ids: Option<Vec<Vec<i32>>>,
     /// First causal prompt row to score; `None` scores from the first row.
     pub prompt_logprob_start: Option<u32>,
+    /// First prompt position whose expert routes should be returned.
+    #[serde(default)]
+    pub routed_experts_prompt_start: u32,
     /// Minimum probability threshold for token sampling. `None` means no
     /// explicit user override.
     pub min_p: Option<f32>,
@@ -172,6 +175,7 @@ impl Default for SamplingParams {
             prompt_logprobs: None,
             prompt_logprob_token_ids: None,
             prompt_logprob_start: None,
+            routed_experts_prompt_start: 0,
             min_p: None,
             frequency_penalty: None,
             presence_penalty: None,

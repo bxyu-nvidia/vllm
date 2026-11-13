@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
@@ -158,3 +159,73 @@ def test_align_trtllm_fp4_moe_intermediate_pads_gate_and_up_separately():
     torch.testing.assert_close(out_w2_scale[:, :, : intermediate // 16], w2_scale)
     assert torch.count_nonzero(out_w2[:, :, intermediate // 2 :]) == 0
     assert torch.count_nonzero(out_w2_scale[:, :, intermediate // 16 :]) == 0
+
+
+@pytest.mark.parametrize("dwdp", [False, True])
+def test_nvfp4_reload_refreshes_scales_without_moving_captured_storage(dwdp):
+    from vllm.model_executor.layers.fused_moe.experts.prims_nvfp4_moe import (
+        PrimsNvFp4Experts,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+        TrtLlmNvFp4ExpertsBase,
+    )
+    from vllm.model_executor.layers.quantization.online.nvfp4 import (
+        Nvfp4OnlineMoEMethod,
+    )
+
+    cls = PrimsNvFp4Experts if dwdp else TrtLlmNvFp4ExpertsBase
+    experts = cls.__new__(cls)
+    experts.quant_config = SimpleNamespace(
+        g1_alphas=torch.tensor([2.0, 4.0]),
+        g2_alphas=torch.ones(2),
+        a2_gscale=torch.tensor([3.0, 5.0]),
+        _w1=SimpleNamespace(scale=None),
+        _w2=SimpleNamespace(scale=None),
+    )
+    method = object.__new__(Nvfp4OnlineMoEMethod)
+    method.moe_quant_config = experts.quant_config
+    method.moe_kernel = SimpleNamespace(fused_experts=experts)
+    experts.moe_config = SimpleNamespace(is_act_and_mul=True)
+    experts.is_situ = False
+    experts._gemm1_clamp_limit_unfolded = torch.tensor([8.0, 16.0])
+    experts._gemm1_beta_unfolded = torch.tensor([4.0, 12.0])
+    experts.gemm1_clamp_limit = torch.empty(2)
+    experts.gemm1_beta = torch.empty(2)
+    experts.gemm1_alpha = torch.ones(2)
+    layer = torch.nn.Module()
+    for name in ("g1_scale_c", "gemm1_clamp_limit", "gemm1_beta", "gemm1_alpha"):
+        layer.register_parameter(
+            name, torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+        )
+    layer.dwdp_manager = SimpleNamespace(merge_free=True) if dwdp else None
+    for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"):
+        layer.register_parameter(
+            name, torch.nn.Parameter(torch.ones(2, 2), requires_grad=False)
+        )
+    pointers = {name: param.data_ptr() for name, param in layer.named_parameters()}
+    for factor in (1.0, 2.0):
+        layer.w13_weight_scale_2 = torch.tensor([2.0, 4.0]) * factor
+        layer.w2_weight_scale_2 = torch.tensor([7.0, 9.0]) * factor
+        method.finalize_weight_reload(layer)
+        assert experts.quant_config._w1.scale is layer.w13_weight_scale
+        assert experts.quant_config._w2.scale is layer.w2_weight_scale
+        torch.testing.assert_close(
+            experts.quant_config.g2_alphas, layer.w2_weight_scale_2
+        )
+        torch.testing.assert_close(layer.g1_scale_c, torch.tensor([6.0, 20.0]) * factor)
+        torch.testing.assert_close(
+            layer.gemm1_clamp_limit, torch.tensor([4.0, 4.0]) / factor
+        )
+        torch.testing.assert_close(layer.gemm1_beta, torch.tensor([2.0, 3.0]) / factor)
+        assert experts.g1_scale_c is layer.g1_scale_c
+        assert experts.gemm1_clamp_limit is layer.gemm1_clamp_limit
+        assert {
+            name: param.data_ptr() for name, param in layer.named_parameters()
+        } == pointers
+        if dwdp:
+            assert isinstance(experts, PrimsNvFp4Experts)
+            assert experts._resident_weights is not None
+            assert experts._dwdp_scales_ready
+            assert (
+                experts._resident_weights[0].data_ptr() == layer.w13_weight.data_ptr()
+            )

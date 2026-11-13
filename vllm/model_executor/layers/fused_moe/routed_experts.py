@@ -705,7 +705,11 @@ class RoutedExperts(PluggableLayer):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
-        if self.dwdp_manager is not None and self.dwdp_manager.initialized:
+        if (
+            self.dwdp_manager is not None
+            and self.dwdp_manager.initialized
+            and not self.dwdp_manager.refitting
+        ):
             raise RuntimeError("DWDP source weights are immutable after initialization")
         if self.dwdp_manager is not None and loaded_weight.ndim == 3:
             loaded = False
