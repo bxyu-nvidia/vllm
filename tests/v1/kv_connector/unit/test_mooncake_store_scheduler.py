@@ -53,6 +53,7 @@ def _make_bare_scheduler(
     scheduler.save_decode_cache = save_decode_cache
     scheduler.enable_kv_events = False
     scheduler.lookup_async = False
+    scheduler._prefill_lookup_metrics = False
     scheduler.enable_lookup = True
     scheduler._block_size = 16
     scheduler._hash_block_size = hash_block_size
@@ -307,6 +308,7 @@ def _make_qsa_hybrid_cache_config():
 def test_scheduler_projects_nonprefix_groups_and_mamba_ids():
     vllm_config = SimpleNamespace(
         speculative_config=None,
+        observability_config=SimpleNamespace(enable_prefill_batching_metrics=False),
         kv_transfer_config=SimpleNamespace(
             kv_role="kv_both", kv_connector_extra_config={}
         ),
@@ -939,6 +941,8 @@ class _StubLookupClient:
         num_tokens: int,
         block_hashes: list[bytes],
         non_block: bool = False,
+        *,
+        record_timing: bool = False,
     ) -> MooncakeLookupResult:
         self.num_tokens.append(num_tokens)
         return MooncakeLookupResult(self._hit_tokens)
