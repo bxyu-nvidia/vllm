@@ -625,7 +625,11 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def _lookup_external_prefix(
-        self, request: Request, num_local_tokens: int
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        *,
+        num_local_tokens: int,
     ) -> tuple[int | None, bool]:
         """Time lookup through scheduler-observed completion, including polling."""
         assert self.connector is not None
@@ -635,9 +639,13 @@ class Scheduler(SchedulerInterface):
             or request.num_output_tokens > 0
             or request.skip_reading_prefix_cache
         ):
-            return self.connector.get_num_new_matched_tokens(request, num_local_tokens)
+            return self.connector.get_num_new_matched_tokens_with_local_hit(
+                request, num_computed_tokens, num_local_tokens=num_local_tokens
+            )
         started = time.monotonic_ns()
-        result = self.connector.get_num_new_matched_tokens(request, num_local_tokens)
+        result = self.connector.get_num_new_matched_tokens_with_local_hit(
+            request, num_computed_tokens, num_local_tokens=num_local_tokens
+        )
         request_id = request.request_id
         if result[0] is None:
             self._prefill_lookup_started_ns.setdefault(request_id, started)
@@ -1199,7 +1207,9 @@ class Scheduler(SchedulerInterface):
                             num_new_local_computed_tokens - partial_tail
                         )
                         ext_tokens, load_kv_async = self._lookup_external_prefix(
-                            request, block_aligned_local
+                            request,
+                            block_aligned_local,
+                            num_local_tokens=num_new_local_computed_tokens,
                         )
                         if request.skip_reading_prefix_cache:
                             ext_tokens, load_kv_async = 0, False

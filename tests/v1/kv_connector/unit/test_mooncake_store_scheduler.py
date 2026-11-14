@@ -7,6 +7,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import (
+    MooncakeStoreConnector,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.coordinator import (
     MooncakeStoreCoordinator,
 )
@@ -23,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler impor
     MooncakeStoreScheduler,
     _partial_tail_non_mamba_puts,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -1134,6 +1139,160 @@ def test_mamba_alignment_retry_does_not_repeat_store_lookup(monkeypatch):
         "long0",
         "long1",
     ]
+
+
+@pytest.mark.parametrize("hit_tokens", [0, 16, 20, 24])
+def test_deferred_lookup_reuses_full_local_partial_hit(hit_tokens):
+    """A remote hit covered by a local partial block never becomes a load."""
+    store = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    store.load_async = True
+    store.client = _StubLookupClient(hit_tokens)
+    request = SimpleNamespace(
+        request_id="req-0", num_tokens=64, block_hashes=[b"h0", b"h1"]
+    )
+
+    for local_tokens in [24, 28, 24]:
+        assert store.get_num_new_matched_tokens(
+            request, 16, num_local_tokens=local_tokens
+        ) == (0, False)
+    assert store.client.num_tokens == [64]
+    assert not store.load_specs
+
+
+@pytest.mark.parametrize("remote_after_eviction", [0, 24])
+def test_deferred_lookup_refreshes_when_only_partial_local_hit_shrinks(
+    remote_after_eviction,
+):
+    """Losing a sub-block checkpoint must refresh even if the rounded hit holds."""
+    store = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    store.load_async = True
+    store.client = _StubLookupClient(24)
+    request = SimpleNamespace(request_id="req-0", num_tokens=64, block_hashes=[])
+    assert store.get_num_new_matched_tokens(request, 16, num_local_tokens=24) == (
+        0,
+        False,
+    )
+    store.client._hit_tokens = remote_after_eviction
+
+    result = store.get_num_new_matched_tokens(request, 16, num_local_tokens=20)
+    assert store.client.num_tokens == [64, 64]
+    if remote_after_eviction:
+        assert result == (8, True)
+        # The replacement still loads from the aligned boundary, not token 20.
+        spec = store.load_specs[request.request_id]
+        assert (spec.vllm_cached_tokens, spec.kvpool_cached_tokens) == (16, 24)
+    else:
+        assert result == (0, False)
+        assert not store.load_specs
+
+
+def test_partial_local_no_load_clears_previous_remote_plan():
+    store = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    store.load_async = True
+    store.client = _StubLookupClient(28)
+    request = SimpleNamespace(request_id="req-0", num_tokens=64, block_hashes=[])
+    assert store.get_num_new_matched_tokens(request, 16, num_local_tokens=24) == (
+        12,
+        True,
+    )
+    assert store.load_specs[request.request_id].vllm_cached_tokens == 16
+    store.client._hit_tokens = 24
+
+    for _ in range(2):
+        assert store.get_num_new_matched_tokens(request, 16, num_local_tokens=24) == (
+            0,
+            False,
+        )
+        assert not store.load_specs
+    assert store.client.num_tokens == [64, 64]
+
+
+def test_multi_connector_partial_hit_reuse_preserves_other_connectors():
+    store = _make_bare_scheduler(hash_block_size=4, enable_partial_hash_hits=True)
+    store.load_async = True
+    store.client = _StubLookupClient(24)
+    connector = object.__new__(MooncakeStoreConnector)
+    connector.connector_scheduler = store
+    fallback = MagicMock(spec=KVConnectorBase_V1)
+    fallback.get_num_new_matched_tokens.return_value = (16, True)
+    fallback.get_num_new_matched_tokens_with_local_hit.side_effect = (
+        lambda *args,
+        **kwargs: KVConnectorBase_V1.get_num_new_matched_tokens_with_local_hit(
+            fallback, *args, **kwargs
+        )
+    )
+    multi = object.__new__(MultiConnector)
+    multi._connectors = [connector, fallback]
+    multi._requests_to_connector = {}
+    request = SimpleNamespace(request_id="req-0", num_tokens=64, block_hashes=[])
+
+    for _ in range(2):
+        assert multi.get_num_new_matched_tokens_with_local_hit(
+            request, 16, num_local_tokens=24
+        ) == (16, True)
+    assert multi._requests_to_connector[request.request_id] == 1
+    assert store.client.num_tokens == [64]
+    assert not store.load_specs
+    fallback.get_num_new_matched_tokens.assert_called_with(request, 16)
+
+
+@pytest.mark.parametrize("metrics_enabled", [False, True])
+def test_mamba_alignment_retry_keeps_partial_local_no_load_decision(
+    monkeypatch,
+    metrics_enabled,
+):
+    """Core passes the full hit on every admission retry, including metrics mode."""
+    from tests.v1.core.utils import create_requests, create_scheduler
+
+    core = create_scheduler(
+        max_num_batched_tokens=96,
+        max_model_len=1024,
+        block_size=64,
+        enable_prefix_caching=True,
+        use_kv_connector=True,
+        enable_prefill_batching_metrics=metrics_enabled,
+    )
+    core.need_mamba_block_aligned_split = True
+    store = _make_bare_scheduler(hash_block_size=16, enable_partial_hash_hits=True)
+    store._block_size = 64
+    store.load_async = True
+    store.client = MagicMock()
+    store.client.lookup.side_effect = lambda req_id, *args, **kwargs: (
+        MooncakeLookupResult(80 if req_id == "partial" else 0)
+    )
+    connector = object.__new__(MooncakeStoreConnector)
+    connector.connector_scheduler = store
+    monkeypatch.setattr(
+        core.connector,
+        "get_num_new_matched_tokens_with_local_hit",
+        connector.get_num_new_matched_tokens_with_local_hit,
+    )
+    monkeypatch.setattr(
+        core.connector, "update_state_after_alloc", store.update_state_after_alloc
+    )
+    original_local_hit = core._get_local_prefix_cache_hit
+
+    def local_hit(request):
+        if request.request_id == "partial":
+            # This request is never allocated: only 32 tokens remain, but it
+            # needs 48 to reach the next legal Mamba boundary (128 - 80).
+            return core.kv_cache_manager.empty_kv_cache_blocks, 80, 0, False
+        return original_local_hit(request)
+
+    monkeypatch.setattr(core, "_get_local_prefix_cache_hit", local_hit)
+    first, partial = create_requests(
+        2, num_tokens=256, block_size=64, req_ids=["first", "partial"]
+    )
+    core.add_request(first)
+    core.add_request(partial)
+
+    for _ in range(3):
+        assert core.schedule().num_scheduled_tokens == {"first": 64}
+    assert [call.args[0] for call in store.client.lookup.call_args_list] == [
+        "first",
+        "partial",
+    ]
+    assert not store.load_specs
 
 
 def test_partial_hash_hit_block_aligned_local_loads_partial_tail():

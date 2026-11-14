@@ -223,6 +223,18 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             request, num_computed_tokens
         )
 
+    def get_num_new_matched_tokens_with_local_hit(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        *,
+        num_local_tokens: int,
+    ) -> tuple[int | None, bool]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_num_new_matched_tokens(
+            request, num_computed_tokens, num_local_tokens=num_local_tokens
+        )
+
     def update_state_after_alloc(
         self,
         request: Request,

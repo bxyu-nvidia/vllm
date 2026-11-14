@@ -532,6 +532,23 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def get_num_new_matched_tokens_with_local_hit(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        *,
+        num_local_tokens: int,
+    ) -> tuple[int | None, bool]:
+        """Look up external KV with the full local hit available for comparison.
+
+        ``num_computed_tokens`` is the block-aligned start of a possible load.
+        ``num_local_tokens`` includes a partial local block that the scheduler
+        keeps unless the remote hit is strictly longer. Connectors can use it
+        to retain no-load decisions across admission retries. The default
+        preserves the existing aligned lookup contract.
+        """
+        return self.get_num_new_matched_tokens(request, num_computed_tokens)
+
     def get_external_cache_hit_sources(
         self,
         request: "Request",

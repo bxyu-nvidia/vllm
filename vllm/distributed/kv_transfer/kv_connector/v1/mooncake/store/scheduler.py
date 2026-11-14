@@ -205,6 +205,8 @@ class MooncakeStoreScheduler:
         self,
         request: Request,
         num_computed_tokens: int,
+        *,
+        num_local_tokens: int | None = None,
     ) -> tuple[int | None, bool]:
         """Check for external KV cache hit.
 
@@ -213,6 +215,9 @@ class MooncakeStoreScheduler:
         """
         if not self.enable_lookup:
             return 0, False
+        if num_local_tokens is None:
+            num_local_tokens = num_computed_tokens
+        assert num_local_tokens >= num_computed_tokens
 
         # Fine-grained hits may land on a hash boundary inside a block; without
         # partial hits, prefixes shorter than one physical block are skipped.
@@ -229,7 +234,7 @@ class MooncakeStoreScheduler:
             if (
                 num_tokens == request.num_tokens
                 and block_hashes == tuple(request.block_hashes)
-                and local_tokens <= num_computed_tokens
+                and local_tokens <= num_local_tokens
             ):
                 # Admission may have failed on Mamba alignment or token budget.
                 # Reuse only the no-load decision while local coverage holds.
@@ -249,7 +254,7 @@ class MooncakeStoreScheduler:
             return None, False
         num_external_hit_tokens = lookup_result.hit_length
 
-        if num_external_hit_tokens < num_computed_tokens:
+        if num_external_hit_tokens <= num_local_tokens:
             need_to_allocate = 0
         else:
             need_to_allocate = num_external_hit_tokens - num_computed_tokens
@@ -262,12 +267,16 @@ class MooncakeStoreScheduler:
             need_to_allocate,
         )
 
-        if need_to_allocate <= 0:
+        if need_to_allocate == 0:
+            # Core keeps a partial local block unless the remote hit exceeds
+            # the full local hit. Cache that no-load decision, but invalidate
+            # it if even the sub-block portion of the local hit shrinks.
             self._deferred_lookups[request.request_id] = (
                 request.num_tokens,
                 tuple(request.block_hashes),
-                num_computed_tokens,
+                num_local_tokens,
             )
+            self.load_specs.pop(request.request_id, None)
             return 0, False
 
         self.load_specs[request.request_id] = LoadSpec(

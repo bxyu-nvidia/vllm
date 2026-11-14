@@ -431,16 +431,34 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         connector = self._connectors[self._requests_to_connector[request.request_id]]
         return connector.get_loaded_kv_cache_group_ids(request)
 
+    def get_num_new_matched_tokens_with_local_hit(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        *,
+        num_local_tokens: int,
+    ) -> tuple[int | None, bool]:
+        return self.get_num_new_matched_tokens(
+            request, num_computed_tokens, num_local_tokens=num_local_tokens
+        )
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
         num_computed_tokens: int,
+        *,
+        num_local_tokens: int | None = None,
     ) -> tuple[int | None, bool]:
         to_return = (0, False)
         for i, c in enumerate(self._connectors):
-            toks, load_async = c.get_num_new_matched_tokens(
-                request, num_computed_tokens
-            )
+            if num_local_tokens is None:
+                toks, load_async = c.get_num_new_matched_tokens(
+                    request, num_computed_tokens
+                )
+            else:
+                toks, load_async = c.get_num_new_matched_tokens_with_local_hit(
+                    request, num_computed_tokens, num_local_tokens=num_local_tokens
+                )
             # If there is a connector still looking up the matches,
             # we return None to indicate that we are not done yet.
             if toks is None:
