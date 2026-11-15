@@ -366,6 +366,11 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub enable_scale_out: bool,
 
+    /// Preserve required_prefix_token_ids across chat turns (text-only).
+    #[arg(long, default_missing_value = "true", num_args = 0..=1)]
+    #[serde(default)]
+    pub enable_prefix_token_alignment: bool,
+
     /// Send an SSE keep-alive comment line every this many seconds when a
     /// streaming response is idle (queued, prefill, or between tokens), to
     /// prevent reverse proxies/tunnels with read timeouts from closing the
@@ -637,6 +642,7 @@ impl SharedRuntimeArgs {
             enable_prompt_tokens_details: self.enable_prompt_tokens_details,
             enable_request_id_headers: self.enable_request_id_headers,
             enable_scale_out: self.enable_scale_out,
+            enable_prefix_token_alignment: self.enable_prefix_token_alignment,
             sse_keep_alive_interval: (self.sse_keep_alive_interval > 0)
                 .then(|| Duration::from_secs(self.sse_keep_alive_interval)),
         }

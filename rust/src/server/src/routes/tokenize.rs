@@ -111,9 +111,12 @@ async fn tokenize_chat(
     let text_request = state
         .chat
         .request_processor()
-        .prepare_for_tokenization(req.into_chat_request(request_id.to_string())?)
+        .prepare_for_tokenization(
+            req.into_chat_request(request_id.to_string())?,
+            state.chat.text().request_processor(),
+        )
         .await
-        .map_err(|e| server_error!("tokenize failed: {}", e.to_report_string()))?;
+        .map_err(|e| crate::error::chat_submit_error("tokenize failed", e))?;
     let tokens = state
         .chat
         .text()

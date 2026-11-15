@@ -55,6 +55,7 @@ mod event;
 pub mod multimodal;
 mod output;
 mod parser;
+mod prefix_alignment;
 mod reasoning;
 mod renderer;
 mod request;
@@ -81,6 +82,7 @@ pub struct ChatRequestProcessor {
     reasoning_parser: ParserSelection,
     /// Server-side floor for tool-call structural tags.
     tool_strict_level: ToolStrictLevel,
+    enable_prefix_token_alignment: bool,
 }
 
 impl ChatRequestProcessor {
@@ -94,6 +96,7 @@ impl ChatRequestProcessor {
             tool_call_parser: ParserSelection::Auto,
             reasoning_parser: ParserSelection::Auto,
             tool_strict_level: ToolStrictLevel::Auto,
+            enable_prefix_token_alignment: false,
         }
     }
 
@@ -106,6 +109,7 @@ impl ChatRequestProcessor {
             tool_call_parser: ParserSelection::Auto,
             reasoning_parser: ParserSelection::Auto,
             tool_strict_level: ToolStrictLevel::Auto,
+            enable_prefix_token_alignment: false,
         }
     }
 
@@ -123,6 +127,12 @@ impl ChatRequestProcessor {
     /// Configure the server-side floor for tool-call structural tags.
     pub fn with_tool_strict_level(mut self, tool_strict_level: ToolStrictLevel) -> Self {
         self.tool_strict_level = tool_strict_level;
+        self
+    }
+
+    /// Allow requests to preserve exact prior tokens across chat turns.
+    pub fn with_prefix_token_alignment(mut self, enabled: bool) -> Self {
+        self.enable_prefix_token_alignment = enabled;
         self
     }
 
@@ -177,12 +187,39 @@ impl ChatRequestProcessor {
         Ok(Some(features))
     }
 
-    async fn prepare_text_request(&self, request: ChatRequest) -> Result<TextRequest> {
+    async fn prepare_text_request(
+        &self,
+        mut request: ChatRequest,
+        text_processor: &TextRequestProcessor,
+    ) -> Result<TextRequest> {
         // Stamp before rendering so render and tokenize count toward TTFT/e2e.
         let arrival_time = vllm_llm::current_unix_timestamp_secs();
+        prefix_alignment::validate_request(&request, self.enable_prefix_token_alignment)?;
+        let required_prefix =
+            request.required_prefix_token_ids.take().filter(|ids| !ids.is_empty());
+        let alignment = required_prefix
+            .map(|ids| {
+                Ok::<_, Error>((
+                    ids,
+                    text_processor.tokenizer(),
+                    text_processor.eos_token_ids()?,
+                ))
+            })
+            .transpose()?;
         let renderer = self.backend.chat_renderer();
         let (mut rendered, request) = tokio::task::spawn_blocking(move || {
-            renderer.render(&request).map(|rendered| (rendered, request))
+            let mut rendered = renderer.render(&request)?;
+            if let Some((prefix, tokenizer, eos_ids)) = alignment {
+                prefix_alignment::align_prompt(
+                    &request,
+                    &mut rendered,
+                    &prefix,
+                    renderer.as_ref(),
+                    tokenizer.as_ref(),
+                    &eos_ids,
+                )?;
+            }
+            Ok::<_, Error>((rendered, request))
         })
         .await
         .map_err(|e| Error::ChatTemplate(format!("render task join error: {e}")))??;
@@ -212,9 +249,13 @@ impl ChatRequestProcessor {
     }
 
     /// Prepare one chat request for tokenization without constructing an output processor.
-    pub async fn prepare_for_tokenization(&self, request: ChatRequest) -> Result<TextRequest> {
+    pub async fn prepare_for_tokenization(
+        &self,
+        request: ChatRequest,
+        text_processor: &TextRequestProcessor,
+    ) -> Result<TextRequest> {
         request.validate()?;
-        self.prepare_text_request(request).await
+        self.prepare_text_request(request, text_processor).await
     }
 
     /// Prepare one chat request without submitting it to an engine.
@@ -238,7 +279,7 @@ impl ChatRequestProcessor {
                 tool_strict_level: self.tool_strict_level,
             },
         )?;
-        let mut text_request = self.prepare_text_request(request).await?;
+        let mut text_request = self.prepare_text_request(request, text_processor).await?;
 
         // Initialize the output processor from the final prompt token IDs and apply
         // the output grammar to the request, if any.
@@ -298,6 +339,12 @@ impl ChatLlm {
     /// Set the server-side floor for tool-call structural tags.
     pub fn with_tool_strict_level(mut self, tool_strict_level: ToolStrictLevel) -> Self {
         self.processor.tool_strict_level = tool_strict_level;
+        self
+    }
+
+    /// Allow requests to preserve exact prior tokens across chat turns.
+    pub fn with_prefix_token_alignment(mut self, enabled: bool) -> Self {
+        self.processor.enable_prefix_token_alignment = enabled;
         self
     }
 

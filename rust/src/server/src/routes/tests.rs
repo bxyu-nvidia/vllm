@@ -8421,3 +8421,181 @@ async fn profile_routes_are_hidden_when_profiling_is_disabled() {
 }
 
 mod nemo_rl;
+
+#[derive(Clone)]
+struct PrefixChatBackend(FakeChatBackend);
+
+impl TextBackend for PrefixChatBackend {
+    fn tokenizer(&self) -> DynTokenizer {
+        self.0.tokenizer()
+    }
+    fn model_id(&self) -> &str {
+        self.0.model_id()
+    }
+    fn sampling_hints(&self) -> vllm_text::Result<vllm_text::backend::SamplingHints> {
+        Ok(vllm_text::backend::SamplingHints {
+            primary_eos_token_id: Some(u32::from(b'\n')),
+            ..Default::default()
+        })
+    }
+}
+
+impl ChatBackend for PrefixChatBackend {
+    fn chat_renderer(&self) -> DynChatRenderer {
+        self.0.chat_renderer()
+    }
+    fn new_chat_output_processor(
+        &self,
+        request: &mut ChatRequest,
+        options: NewChatOutputProcessorOptions<'_>,
+    ) -> vllm_chat::Result<DynChatOutputProcessor> {
+        self.0.new_chat_output_processor(request, options)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_prefix_alignment_preserves_engine_and_response_tokens() {
+    for stream in [false, true] {
+        let prefix = bytes_to_token_ids(b"user: hi\nassistant:  EXACT  \n");
+        let mut expected = prefix.clone();
+        expected.extend(bytes_to_token_ids(b"user: next\nassistant:"));
+        let expected_engine = expected.clone();
+        let (chat, engine_task) = test_models_with_engine_outputs_and_backend_inner(
+            b"engine-prefix-alignment",
+            default_stream_output_specs(),
+            move |request| assert_eq!(request.prompt_token_ids, Some(expected_engine)),
+            Arc::new(PrefixChatBackend(FakeChatBackend::new())),
+        )
+        .await;
+        let mut app = build_router(Arc::new(AppState::new(
+            vec!["model".into()],
+            chat.with_prefix_token_alignment(true),
+        )));
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "model", "stream": stream, "return_token_ids": true,
+                            "messages": [
+                                {"role":"user", "content":"hi"},
+                                {"role":"assistant", "content":"EXACT"},
+                                {"role":"user", "content":"next"}
+                            ],
+                            "required_prefix_token_ids": prefix,
+                            "max_completion_tokens": 8
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        if stream {
+            let text = std::str::from_utf8(&body).unwrap();
+            let chunks = sse_json_payloads(text);
+            assert_eq!(chunks[0]["prompt_token_ids"], json!(expected));
+            let generated: Vec<_> = chunks
+                .iter()
+                .flat_map(|chunk| {
+                    chunk["choices"][0]["token_ids"].as_array().into_iter().flatten().cloned()
+                })
+                .collect();
+            assert_eq!(generated, json!([104, 105, 33]).as_array().unwrap().clone());
+        } else {
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["prompt_token_ids"], json!(expected));
+            assert_eq!(body["choices"][0]["token_ids"], json!([104, 105, 33]));
+        }
+        engine_task.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_prefix_alignment_rejects_disabled_and_unsafe_requests() {
+    for (enabled, extra, message) in [
+        (false, json!({}), "--enable-prefix-token-alignment"),
+        (true, json!({"truncate_prompt_tokens": 4}), "truncation"),
+        (
+            true,
+            json!({"required_prefix_token_ids": [10, 2], "messages": [{"role":"user","content":"hi"}]}),
+            "prior assistant",
+        ),
+        (
+            true,
+            json!({"messages": [{"role":"assistant","content":"old"}, {"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}]}),
+            "multimodal",
+        ),
+    ] {
+        let (chat, _engine_task) =
+            test_chat_with_engine_outputs(b"engine-prefix-invalid", vec![]).await;
+        let mut app = build_router(Arc::new(AppState::new(
+            vec!["model".into()],
+            chat.with_prefix_token_alignment(enabled),
+        )));
+        let mut body = json!({"model":"model", "messages":[{"role":"assistant","content":"old"},{"role":"user","content":"next"}], "required_prefix_token_ids":[10, 2]});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            body["error"]["message"].as_str().unwrap().contains(message),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn chat_prefix_alignment_validates_final_context_length() {
+    let backend = Arc::new(PrefixChatBackend(FakeChatBackend::new()));
+    let mut app = build_render_router(Arc::new(RenderState {
+        model: "model".into(),
+        served_model_names: vec!["model".into()],
+        max_model_len: Some(64),
+        text: TextRequestProcessor::new(backend.clone(), 64),
+        chat: ChatRequestProcessor::render_only(backend).with_prefix_token_alignment(true),
+    }));
+    // The rendered history fits, but the exact model prefix does not.
+    let body = json!({
+        "model":"model", "messages":[{"role":"assistant","content":"x"},{"role":"user","content":"y"}],
+        "required_prefix_token_ids": vec![u32::from(b'x'); 64],
+        "max_completion_tokens": 1
+    });
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions/render")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("maximum context length"),
+        "{body}"
+    );
+}

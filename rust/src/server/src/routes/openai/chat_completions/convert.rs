@@ -155,6 +155,7 @@ pub(super) fn prepare_chat_request(
     let chat_request = ChatRequest {
         request_id: request_id.clone(),
         messages,
+        required_prefix_token_ids: request.required_prefix_token_ids,
         sampling_params: SamplingParams {
             temperature: request.temperature,
             watermarking: request.watermarking,

@@ -68,6 +68,7 @@ pub struct TokenizeChatRequest {
     pub model: Option<String>,
     #[validate(custom(function = "validate_messages"))]
     pub messages: Vec<ChatMessage>,
+    pub required_prefix_token_ids: Option<Vec<u32>>,
     #[serde(default = "default_true")]
     pub add_generation_prompt: bool,
     #[serde(default)]
@@ -108,6 +109,7 @@ impl TokenizeChatRequest {
         Ok(ChatRequest {
             request_id,
             messages,
+            required_prefix_token_ids: self.required_prefix_token_ids,
             sampling_params: SamplingParams::default(),
             chat_options: ChatOptions {
                 generation_prompt_mode,
@@ -224,6 +226,7 @@ mod tests {
     fn into_chat_request_rejects_conflicting_generation_flags() {
         let req = TokenizeChatRequest {
             model: None,
+            required_prefix_token_ids: None,
             messages: vec![ChatMessage::User {
                 content: MessageContent::Text("hi".to_string()),
                 name: None,

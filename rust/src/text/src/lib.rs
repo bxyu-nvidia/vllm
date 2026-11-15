@@ -78,6 +78,14 @@ impl TextRequestProcessor {
         self.backend.tokenizer()
     }
 
+    /// Return the model/tokenizer EOS IDs used to identify chat turn boundaries.
+    pub fn eos_token_ids(&self) -> Result<std::collections::BTreeSet<u32>> {
+        let hints = self.backend.sampling_hints()?;
+        let mut ids = hints.extra_eos_token_ids;
+        ids.extend(hints.primary_eos_token_id);
+        Ok(ids)
+    }
+
     /// Return the effective model context length.
     pub fn max_model_len(&self) -> u32 {
         self.max_model_len

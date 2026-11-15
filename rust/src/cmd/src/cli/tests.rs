@@ -201,6 +201,7 @@ fn serve_args_forward_python_flags_with_separator() {
                         enable_prompt_tokens_details: false,
                         enable_request_id_headers: false,
                         enable_scale_out: false,
+                        enable_prefix_token_alignment: false,
                         sse_keep_alive_interval: 0,
                         disable_log_stats: false,
                         served_model_name: [],
@@ -1069,6 +1070,7 @@ fn frontend_args_accept_json() {
                         enable_prompt_tokens_details: false,
                         enable_request_id_headers: false,
                         enable_scale_out: false,
+                        enable_prefix_token_alignment: false,
                         sse_keep_alive_interval: 0,
                         disable_log_stats: false,
                         served_model_name: [],
@@ -1740,6 +1742,7 @@ fn serve_args_accept_handshake_aliases() {
                         enable_prompt_tokens_details: false,
                         enable_request_id_headers: false,
                         enable_scale_out: false,
+                        enable_prefix_token_alignment: false,
                         sse_keep_alive_interval: 0,
                         disable_log_stats: false,
                         served_model_name: [],
@@ -1897,6 +1900,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
                 enable_prompt_tokens_details: false,
                 enable_request_id_headers: false,
                 enable_scale_out: false,
+                enable_prefix_token_alignment: false,
                 sse_keep_alive_interval: None,
             },
             cors: CorsConfig {
@@ -1991,6 +1995,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
                 enable_prompt_tokens_details: false,
                 enable_request_id_headers: false,
                 enable_scale_out: false,
+                enable_prefix_token_alignment: false,
                 sse_keep_alive_interval: None,
             },
             cors: CorsConfig {
@@ -2129,6 +2134,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
                 enable_prompt_tokens_details: false,
                 enable_request_id_headers: false,
                 enable_scale_out: false,
+                enable_prefix_token_alignment: false,
                 sse_keep_alive_interval: None,
             },
             cors: CorsConfig {
@@ -2327,4 +2333,27 @@ fn serve_revision_reaches_frontend_and_managed_engine() {
     );
     let engine = args.to_managed_engine_config(1234);
     assert!(engine.python_args.windows(2).any(|args| args == ["--revision", "release"]));
+}
+
+#[test]
+fn prefix_alignment_is_opt_in_for_cli_and_python_bootstrap() {
+    let cli = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "model",
+        "--enable-prefix-token-alignment",
+    ])
+    .unwrap();
+    let Command::Serve(args) = cli.command else {
+        panic!("expected serve args")
+    };
+    assert!(args.runtime.api_server_options().enable_prefix_token_alignment);
+    let args: super::SharedRuntimeArgs = serde_json::from_value(serde_json::json!({
+        "model_tag": "model", "enable_prefix_token_alignment": true
+    }))
+    .unwrap();
+    assert!(args.api_server_options().enable_prefix_token_alignment);
+    let args: super::SharedRuntimeArgs =
+        serde_json::from_value(serde_json::json!({"model_tag": "model"})).unwrap();
+    assert!(!args.api_server_options().enable_prefix_token_alignment);
 }

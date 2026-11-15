@@ -561,6 +561,9 @@ pub struct ChatRequest {
     pub request_id: String,
     /// Ordered chat history to render.
     pub messages: Vec<ChatMessage>,
+    /// Exact prior prompt and generated tokens to preserve across chat turns.
+    #[serde(default)]
+    pub required_prefix_token_ids: Option<Vec<u32>>,
     /// User-facing sampling parameters accepted by `vllm-chat`.
     pub sampling_params: SamplingParams,
     /// Chat-specific rendering options.
@@ -604,6 +607,7 @@ impl ChatRequest {
         Self {
             request_id: "test-request".to_string(),
             messages: vec![ChatMessage::text(ChatRole::User, "test")],
+            required_prefix_token_ids: None,
             sampling_params: SamplingParams::default(),
             chat_options: ChatOptions::default(),
             tool_context: ResolvedToolContext::default(),

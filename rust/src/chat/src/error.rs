@@ -13,6 +13,8 @@ pub enum Error {
     EmptyMessages,
     #[error("cannot continue the final message when the last message is not from the assistant")]
     ContinueFinalAssistantWithoutFinalAssistant,
+    #[error("invalid required_prefix_token_ids: {message}")]
+    InvalidPrefixAlignment { message: String },
     #[error("chat template is required but none was configured")]
     MissingChatTemplate,
     #[error("chat template error: {0}")]
@@ -113,7 +115,8 @@ impl Error {
     /// Whether this error represents invalid user request parameters.
     pub fn is_request_validation_error(&self) -> bool {
         match self {
-            Self::PromptTooLong { .. }
+            Self::InvalidPrefixAlignment { .. }
+            | Self::PromptTooLong { .. }
             | Self::ChatTemplateThrown { .. }
             | Self::InvalidReasoningEffort(_)
             | Self::InvalidReasoningControl { .. }

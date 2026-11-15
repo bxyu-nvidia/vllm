@@ -243,6 +243,9 @@ pub struct ChatCompletionRequest {
     /// logprobs
     pub return_tokens_as_token_ids: Option<bool>,
 
+    /// Preserve these exact prior tokens when prefix token alignment is enabled.
+    pub required_prefix_token_ids: Option<Vec<u32>>,
+
     /// Include token IDs alongside generated text
     pub return_token_ids: Option<bool>,
 
@@ -330,6 +333,7 @@ impl Default for ChatCompletionRequest {
             request_id: None,
             session_id: None,
             return_tokens_as_token_ids: None,
+            required_prefix_token_ids: None,
             return_token_ids: None,
             cache_salt: None,
             kv_transfer_params: None,

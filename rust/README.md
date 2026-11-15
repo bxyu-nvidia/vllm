@@ -75,6 +75,36 @@ For trainer-side usage, see the [IPC](../examples/rl/rlhf_http_ipc.py) and
 [NCCL](../examples/rl/rlhf_http_nccl.py) examples. Configure the weight-transfer
 backend on the server and pause generation during updates, as shown there.
 
+### Exact token prefixes for multi-turn training
+
+Enable exact-prefix alignment on the Rust frontend with:
+
+```bash
+VLLM_USE_RUST_FRONTEND=1 vllm serve MODEL --enable-prefix-token-alignment
+```
+
+Send `required_prefix_token_ids` on `/v1/chat/completions` containing the exact
+previous prompt plus generated tokens, through the last assistant turn in
+`messages`. The frontend renders the updated messages and replaces that
+historical portion with the supplied IDs. It identifies the boundary by counting
+model/tokenizer EOS tokens, so history formatting and removal of old reasoning
+do not change the tokens used for training. A generation that ended without EOS
+gets the template's turn terminator appended before the new messages.
+
+Use `return_token_ids: true` to receive the aligned `prompt_token_ids` and
+`choices[].token_ids`. Use `logprobs: true`, `top_logprobs`, and
+`return_tokens_as_token_ids: true` for token-ID-addressable logprobs. Keep
+`include_reasoning: true` (the default) to retain metadata for the full generated
+stream. These response fields work in both streaming and non-streaming chat.
+The chat-shaped `/tokenize` endpoint also accepts `required_prefix_token_ids`.
+
+Without the startup flag, supplying this field returns HTTP 400. Requests that
+omit it retain normal rendering; an empty list requests no replacement. The
+initial implementation supports text-only histories with EOS-delimited turns;
+nonempty prefixes cannot be combined with multimodal inputs, prompt truncation,
+or `continue_final_message`. Missing turn boundaries return HTTP 400. Context
+and vocabulary validation use the final aligned tokens.
+
 ### External Engine
 
 `vllm-rs serve` can be run standalone with `--data-parallel-size-local 0` when the Python engines
