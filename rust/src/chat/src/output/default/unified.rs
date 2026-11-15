@@ -269,6 +269,13 @@ pub(crate) async fn unified_event_stream(
                     .await;
                 }
                 if let Some(finished) = finished {
+                    if !finished.routed_experts.is_empty() {
+                        y.yield_ok(AssistantEvent::RoutedExperts {
+                            chunks: finished.routed_experts,
+                            dropped_tokens: finished.dropped_tokens,
+                        })
+                        .await;
+                    }
                     for next in state.finish()? {
                         y.yield_ok(next).await;
                     }

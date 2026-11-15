@@ -54,6 +54,7 @@ pub(super) struct ResponseOptions {
     pub echo: Option<String>,
     /// Whether to include token IDs alongside generated text.
     pub return_token_ids: bool,
+    pub routed_experts_prompt_start: u32,
     /// Whether to format logprob tokens as `token_id:{id}`.
     pub return_tokens_as_token_ids: bool,
     /// Whether the request forces one named function tool.
@@ -169,7 +170,7 @@ pub(super) fn prepare_chat_request(
             prompt_logprobs,
             prompt_logprob_token_ids: None,
             prompt_logprob_start: None,
-            routed_experts_prompt_start: 0,
+            routed_experts_prompt_start: request.routed_experts_prompt_start,
             min_p: request.min_p,
             frequency_penalty: request.frequency_penalty,
             presence_penalty: request.presence_penalty,
@@ -227,6 +228,7 @@ pub(super) fn prepare_chat_request(
             include_reasoning,
             echo,
             return_token_ids: request.return_token_ids.unwrap_or(false),
+            routed_experts_prompt_start: request.routed_experts_prompt_start,
             return_tokens_as_token_ids: request.return_tokens_as_token_ids.unwrap_or(false),
             is_named_tool_choice,
         },

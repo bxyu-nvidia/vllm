@@ -249,6 +249,10 @@ pub struct ChatCompletionRequest {
     /// Include token IDs alongside generated text
     pub return_token_ids: Option<bool>,
 
+    /// First prompt position whose expert routes should be returned.
+    #[serde(default)]
+    pub routed_experts_prompt_start: u32,
+
     /// Salt for prefix cache isolation in multi-user environments
     #[validate(length(min = 1))]
     pub cache_salt: Option<String>,
@@ -335,6 +339,7 @@ impl Default for ChatCompletionRequest {
             return_tokens_as_token_ids: None,
             required_prefix_token_ids: None,
             return_token_ids: None,
+            routed_experts_prompt_start: 0,
             cache_salt: None,
             kv_transfer_params: None,
             ec_transfer_params: None,
@@ -385,6 +390,8 @@ pub(super) struct ChatCompletionChoice {
     pub finish_reason: Option<String>,
     pub stop_reason: Option<Value>,
     pub token_ids: Option<Vec<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_experts: Option<String>,
 }
 
 /// A literal type for the "assistant" role, since the API only allows that
@@ -441,6 +448,8 @@ pub(super) struct ChatCompletionStreamChoice {
     pub finish_reason: Option<String>,
     pub stop_reason: Option<Value>,
     pub token_ids: Option<Vec<u32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_experts: Option<String>,
 }
 
 /// Mirrors the Python vLLM `DeltaMessage` class.

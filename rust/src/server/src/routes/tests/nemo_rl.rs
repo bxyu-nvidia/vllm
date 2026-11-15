@@ -217,3 +217,111 @@ async fn pd_refit_forwards_the_training_protocol_and_rejects_partial_updates() {
     }
     engine_task.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pd_chat_preserves_routes_in_json_and_streaming_with_stop_tail() {
+    for streaming in [false, true] {
+        let (mut app, engine_task) = test_admin_app_with_engine_script(|dealer, push| {
+            boxed_test_future(async move {
+                let add = recv_engine_message(dealer).await;
+                let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
+                assert_eq!(
+                    request.sampling_params.as_ref().unwrap().routed_experts_prompt_start,
+                    1
+                );
+                let prompt_count = request.prompt_token_ids.as_ref().unwrap().len();
+                let rows = prompt_count - 1;
+                let mut first = request_output(&request.request_id, bytes_to_token_ids(b"a"), None);
+                first.routed_experts = Some(Box::new(
+                    WireNdArray::from_i32(vec![rows, 1, 2], (0..(rows * 2) as i32).collect())
+                        .unwrap(),
+                ));
+                let mut last = request_output(
+                    &request.request_id,
+                    bytes_to_token_ids(b"b!x"),
+                    Some(EngineCoreFinishReason::Length),
+                );
+                last.routed_experts = Some(Box::new(
+                    WireNdArray::from_i32(
+                        vec![3, 1, 2],
+                        ((rows * 2) as i32..((rows + 3) * 2) as i32).collect(),
+                    )
+                    .unwrap(),
+                ));
+                send_outputs(
+                    push,
+                    RequestBatchOutputs {
+                        outputs: vec![first, last],
+                        ..Default::default()
+                    }
+                    .into(),
+                )
+                .await;
+            })
+        })
+        .await;
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "Qwen/Qwen1.5-0.5B-Chat",
+                            "messages": [{"role": "user", "content": "hi"}], "stream": streaming,
+                            "return_token_ids": true, "stop": "!", "routed_experts_prompt_start": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let responses: Vec<serde_json::Value> = if streaming {
+            std::str::from_utf8(&body)
+                .unwrap()
+                .split("\n\n")
+                .filter_map(|frame| frame.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect()
+        } else {
+            vec![serde_json::from_slice(&body).unwrap()]
+        };
+        assert!(
+            responses.iter().all(|r| r.get("error").is_none()),
+            "{responses:?}"
+        );
+        let prompt_count =
+            responses.iter().find_map(|r| r["prompt_token_ids"].as_array()).unwrap().len();
+        let tokens: Vec<_> = responses
+            .iter()
+            .filter_map(|r| r["choices"][0]["token_ids"].as_array())
+            .flatten()
+            .map(|t| t.as_u64().unwrap())
+            .collect();
+        assert_eq!(tokens, vec![97, 98, 33]);
+        let routes = responses
+            .iter()
+            .find_map(|r| r["choices"][0]["routed_experts"].as_str())
+            .unwrap();
+        let npy = STANDARD.decode(routes).unwrap();
+        let offset = 10 + usize::from(u16::from_le_bytes([npy[8], npy[9]]));
+        assert!(
+            std::str::from_utf8(&npy[10..offset])
+                .unwrap()
+                .contains(&format!("'shape': ({}, 1, 2)", prompt_count + 1))
+        );
+        assert_eq!(
+            &npy[offset..],
+            (0i32..((prompt_count + 1) * 2) as i32)
+                .flat_map(i32::to_ne_bytes)
+                .collect::<Vec<_>>()
+        );
+        engine_task.finish().await;
+    }
+}

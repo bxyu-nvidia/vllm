@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 mod convert;
-mod routed_experts;
+pub(super) mod routed_experts;
 mod types;
 mod validate;
 

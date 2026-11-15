@@ -21,6 +21,8 @@ pub struct CollectedAssistantMessage {
     pub prompt_logprobs: Option<DecodedPromptLogprobs>,
     pub logprobs: Option<DecodedLogprobs>,
     pub token_ids: Vec<u32>,
+    pub routed_experts: Vec<vllm_engine_core_client::protocol::tensor::WireNdArray>,
+    pub dropped_tokens: usize,
     pub usage: ChatTokenUsage,
     pub finish_reason: FinishReason,
     /// Connector-specific KV transfer parameters for disaggregated serving.
@@ -59,6 +61,8 @@ impl ChatEventStream {
         let mut prompt_token_ids: Arc<[u32]> = Arc::from([]);
         let mut logprob_positions: Vec<DecodedPositionLogprobs> = Vec::new();
         let mut token_ids: Vec<u32> = Vec::new();
+        let mut routed_experts = Vec::new();
+        let mut dropped_tokens = 0;
         while let Some(event) = self.next().await.transpose()? {
             match event {
                 ChatEvent::Start {
@@ -78,6 +82,13 @@ impl ChatEventStream {
                     }
                     token_ids.extend(delta_ids);
                 }
+                ChatEvent::RoutedExperts {
+                    chunks,
+                    dropped_tokens: dropped,
+                } => {
+                    routed_experts = chunks;
+                    dropped_tokens = dropped;
+                }
                 ChatEvent::Done {
                     message: done,
                     usage,
@@ -93,6 +104,8 @@ impl ChatEventStream {
                             positions: logprob_positions,
                         }),
                         token_ids,
+                        routed_experts,
+                        dropped_tokens,
                         usage,
                         finish_reason,
                         kv_transfer_params: kv_transfer_params.map(|value| *value),
@@ -236,6 +249,8 @@ mod tests {
                     }],
                 }),
                 token_ids: vec![],
+                routed_experts: Vec::new(),
+                dropped_tokens: 0,
                 usage: ChatTokenUsage::from(vllm_llm::TokenUsage {
                     prompt_token_count: 2,
                     output_token_count: 1,

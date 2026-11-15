@@ -211,6 +211,11 @@ pub enum ChatEvent {
         logprobs: Option<DecodedLogprobs>,
         token_ids: Vec<u32>,
     },
+    /// Expert routes from the complete generated stream, before stop-tail trimming.
+    RoutedExperts {
+        chunks: Vec<vllm_engine_core_client::protocol::tensor::WireNdArray>,
+        dropped_tokens: usize,
+    },
     /// One assistant output block has ended.
     BlockEnd {
         index: usize,

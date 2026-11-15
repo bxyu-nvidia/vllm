@@ -141,6 +141,7 @@ async fn collect_chat_completion(
         include_reasoning,
         echo,
         return_token_ids,
+        routed_experts_prompt_start,
         return_tokens_as_token_ids,
         is_named_tool_choice,
     }: ResponseOptions,
@@ -157,6 +158,8 @@ async fn collect_chat_completion(
         prompt_logprobs,
         logprobs,
         token_ids,
+        routed_experts,
+        dropped_tokens,
         usage,
         finish_reason,
         kv_transfer_params,
@@ -202,6 +205,17 @@ async fn collect_chat_completion(
     } else {
         None
     };
+    let routed_experts = if include_output_metadata {
+        super::completions::routed_experts::encode(
+            &routed_experts,
+            dropped_tokens,
+            prompt_token_ids.len(),
+            token_ids.len(),
+            routed_experts_prompt_start as usize,
+        )?
+    } else {
+        None
+    };
     let usage = Usage::from_token_usage(usage, enable_prompt_tokens_details);
 
     if enable_log_requests {
@@ -234,6 +248,7 @@ async fn collect_chat_completion(
             finish_reason: Some(finish_reason),
             stop_reason,
             token_ids: (return_token_ids && include_output_metadata).then_some(token_ids),
+            routed_experts,
         }],
         usage: Some(usage),
         system_fingerprint: None,
@@ -266,6 +281,7 @@ async fn chat_completion_chunk_stream(
         include_reasoning,
         echo,
         return_token_ids,
+        routed_experts_prompt_start,
         return_tokens_as_token_ids,
         is_named_tool_choice,
     }: ResponseOptions,
@@ -278,6 +294,8 @@ async fn chat_completion_chunk_stream(
         response_model,
     ));
     let mut saw_tool_calls = false;
+    let mut routed_experts = Vec::new();
+    let mut dropped_tokens = 0;
     // `LogprobsDelta` is emitted after all chat events for one decoded update.
     // If that update contains hidden reasoning, including delimiter-only block
     // starts or ends, omit its token metadata as well as its visible delta.
@@ -426,6 +444,13 @@ async fn chat_completion_chunk_stream(
             Ok(ChatEvent::ToolCallEnd { .. }) => {
                 debug!("ending current tool call");
             }
+            Ok(ChatEvent::RoutedExperts {
+                chunks,
+                dropped_tokens: dropped,
+            }) => {
+                routed_experts = chunks;
+                dropped_tokens = dropped;
+            }
             Ok(ChatEvent::Done {
                 usage: final_usage,
                 finish_reason,
@@ -461,7 +486,19 @@ async fn chat_completion_chunk_stream(
                     finish_reason,
                     saw_tool_calls && !is_named_tool_choice,
                 ) {
-                    Ok(chunk) => yield_chunk!(chunk),
+                    Ok(mut chunk) => {
+                        if include_reasoning {
+                            chunk.choices[0].routed_experts =
+                                super::completions::routed_experts::encode(
+                                    &routed_experts,
+                                    dropped_tokens,
+                                    final_usage.prompt_token_count,
+                                    final_usage.output_token_count,
+                                    routed_experts_prompt_start as usize,
+                                )?;
+                        }
+                        yield_chunk!(chunk);
+                    }
                     Err(error) => {
                         error!(
                             error = %error.to_error_response().error.message,

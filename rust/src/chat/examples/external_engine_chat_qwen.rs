@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
                     print!("[tool:{name}] ");
                     saw_stream_output = true;
                 }
-                ChatEvent::LogprobsDelta { .. } => {}
+                ChatEvent::LogprobsDelta { .. } | ChatEvent::RoutedExperts { .. } => {}
                 ChatEvent::Done {
                     message,
                     usage,

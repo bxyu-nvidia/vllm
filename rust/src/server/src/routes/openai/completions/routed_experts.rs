@@ -9,7 +9,7 @@ use vllm_engine_core_client::protocol::tensor::{ShapeExt as _, WireArrayData, Wi
 use crate::error::{ApiError, server_error};
 
 /// Match Python's base64-encoded NumPy array, preserving route order and dtype.
-pub(super) fn encode(
+pub(crate) fn encode(
     chunks: &[WireNdArray],
     dropped_tokens: usize,
     prompt_tokens: usize,
