@@ -246,6 +246,9 @@ pub struct ChatCompletionRequest {
     /// Preserve these exact prior tokens when prefix token alignment is enabled.
     pub required_prefix_token_ids: Option<Vec<u32>>,
 
+    /// Router-owned model-call identity, epoch and capture settings.
+    pub nemo_rl_capture: Option<vllm_chat::CaptureContext>,
+
     /// Include token IDs alongside generated text
     pub return_token_ids: Option<bool>,
 
@@ -338,6 +341,7 @@ impl Default for ChatCompletionRequest {
             session_id: None,
             return_tokens_as_token_ids: None,
             required_prefix_token_ids: None,
+            nemo_rl_capture: None,
             return_token_ids: None,
             routed_experts_prompt_start: 0,
             cache_salt: None,

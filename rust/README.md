@@ -105,6 +105,22 @@ nonempty prefixes cannot be combined with multimodal inputs, prompt truncation,
 or `continue_final_message`. Missing turn boundaries return HTTP 400. Context
 and vocabulary validation use the final aligned tokens.
 
+Managed PD capture also accepts a router-generated `nemo_rl_capture` object on
+chat requests. Version 1 carries the capture `admission`, authoritative
+`weight_version`, `phase` (`prefill` or `decode`), `top_logprobs`, and
+`routed_experts`. The frontend forwards it through
+`sampling_params.extra_args["nemo_rl_capture"]`; that key is reserved in HTTP
+`vllm_xargs`.
+
+For a child call, the frontend adds `alignment`: `suffix_start` indexes the
+first continuation token in the final engine prompt, `turn_end_token_id` is the
+template terminator, and `eos_token_ids` includes alternate model terminators.
+Callers cannot supply this boundary. Python reads and validates the metadata
+through `EngineCoreRequest.capture_context`. This is a transport handoff only:
+parent prefixes must still be resolved into `required_prefix_token_ids`, and
+the existing capture service still stages results. No TQ write or staging
+acknowledgment is performed by this interface.
+
 ### External Engine
 
 `vllm-rs serve` can be run standalone with `--data-parallel-size-local 0` when the Python engines

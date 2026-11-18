@@ -16,6 +16,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine.capture import CaptureContext, get_capture_context
 from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.metrics.stats import (
     PrefillStats,
@@ -159,6 +160,12 @@ class EngineCoreRequest(
 
     session_id: str | None = None
     kv_hints: KvHintsEnvelope | None = None
+
+    @property
+    def capture_context(self) -> CaptureContext | None:
+        """Return validated coordination metadata for the training adapter."""
+        extra_args = self.sampling_params.extra_args if self.sampling_params else None
+        return get_capture_context(extra_args, self.prompt_token_ids)
 
     @property
     def params(self) -> SamplingParams | PoolingParams:

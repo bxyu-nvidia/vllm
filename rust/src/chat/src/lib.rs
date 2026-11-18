@@ -50,12 +50,14 @@ pub use vllm_llm::FinishReason;
 pub use vllm_text::GenerationConfigMode;
 
 mod backend;
+mod capture;
 mod error;
 mod event;
 pub mod multimodal;
 mod output;
 mod parser;
 mod prefix_alignment;
+pub use capture::{CAPTURE_CONTEXT_KEY, CaptureContext};
 mod reasoning;
 mod renderer;
 mod request;
@@ -194,6 +196,7 @@ impl ChatRequestProcessor {
     ) -> Result<TextRequest> {
         // Stamp before rendering so render and tokenize count toward TTFT/e2e.
         let arrival_time = vllm_llm::current_unix_timestamp_secs();
+        let mut capture = capture::take_context(&mut request, self.enable_prefix_token_alignment)?;
         prefix_alignment::validate_request(&request, self.enable_prefix_token_alignment)?;
         let required_prefix =
             request.required_prefix_token_ids.take().filter(|ids| !ids.is_empty());
@@ -210,7 +213,7 @@ impl ChatRequestProcessor {
         let (mut rendered, request) = tokio::task::spawn_blocking(move || {
             let mut rendered = renderer.render(&request)?;
             if let Some((prefix, tokenizer, eos_ids)) = alignment {
-                prefix_alignment::align_prompt(
+                let boundary = prefix_alignment::align_prompt(
                     &request,
                     &mut rendered,
                     &prefix,
@@ -218,6 +221,17 @@ impl ChatRequestProcessor {
                     tokenizer.as_ref(),
                     &eos_ids,
                 )?;
+                if let Some(capture) = &mut capture {
+                    capture.alignment = boundary;
+                }
+            }
+            if let Some(capture) = capture {
+                request.sampling_params.vllm_xargs.get_or_insert_default().insert(
+                    CAPTURE_CONTEXT_KEY.into(),
+                    serde_json::to_value(capture).map_err(|error| {
+                        crate::error::invalid_prefix_alignment!("invalid capture context: {error}")
+                    })?,
+                );
             }
             Ok::<_, Error>((rendered, request))
         })

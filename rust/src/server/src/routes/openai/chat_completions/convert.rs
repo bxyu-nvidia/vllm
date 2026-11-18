@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use crate::error::invalid_request;
 use itertools::Itertools as _;
 use vllm_chat::{
     AssistantContentBlock, AssistantToolCall, ChatContent, ChatContentPart,
@@ -67,11 +68,32 @@ pub(super) struct ResponseOptions {
 /// `lora_resolution.model_names` must be non-empty; the first entry is used as
 /// the base `model` field in responses when no LoRA adapter is selected.
 pub(super) fn prepare_chat_request(
-    request: ChatCompletionRequest,
+    mut request: ChatCompletionRequest,
     lora_resolution: &LoraModelResolution,
     ctx: ResolvedRequestContext,
 ) -> Result<PreparedRequest, ApiError> {
     validate::validate_request_compat(&request, &lora_resolution.model_names)?;
+    if request
+        .vllm_xargs
+        .as_ref()
+        .is_some_and(|args| args.contains_key(vllm_chat::CAPTURE_CONTEXT_KEY))
+    {
+        return Err(invalid_request!(
+            param = Some("vllm_xargs"),
+            "nemo_rl_capture is a reserved vllm_xargs key"
+        ));
+    }
+    if let Some(context) = request.nemo_rl_capture.take() {
+        request.vllm_xargs.get_or_insert_default().insert(
+            vllm_chat::CAPTURE_CONTEXT_KEY.into(),
+            serde_json::to_value(context).map_err(|error| {
+                invalid_request!(
+                    param = Some("nemo_rl_capture"),
+                    "invalid capture context: {error}"
+                )
+            })?,
+        );
+    }
 
     let prompt_truncation = resolve_generation_prompt_truncation(
         request.truncate_prompt_tokens,

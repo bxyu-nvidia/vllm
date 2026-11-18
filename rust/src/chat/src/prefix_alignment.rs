@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use vllm_text::Prompt;
 use vllm_tokenizer::Tokenizer;
 
+use crate::capture::CaptureAlignment;
 use crate::error::{Result, bail_invalid_prefix_alignment, invalid_prefix_alignment};
 use crate::{ChatRenderer, ChatRequest, ChatRole, GenerationPromptMode, RenderedPrompt};
 
@@ -50,7 +51,7 @@ pub(crate) fn align_prompt(
     renderer: &dyn ChatRenderer,
     tokenizer: &dyn Tokenizer,
     eos_ids: &BTreeSet<u32>,
-) -> Result<()> {
+) -> Result<Option<CaptureAlignment>> {
     let last_assistant = request
         .messages
         .iter()
@@ -70,13 +71,10 @@ pub(crate) fn align_prompt(
     };
     let template_prefix = encode(prefix_rendered.prompt)?;
     let full_tokens = encode(std::mem::take(&mut rendered.prompt))?;
-    rendered.prompt = Prompt::TokenIds(splice_prefix(
-        required_prefix,
-        &template_prefix,
-        full_tokens,
-        eos_ids,
-    )?);
-    Ok(())
+    let (tokens, boundary) =
+        splice_prefix(required_prefix, &template_prefix, full_tokens, eos_ids)?;
+    rendered.prompt = Prompt::TokenIds(tokens);
+    Ok(boundary)
 }
 
 fn splice_prefix(
@@ -84,9 +82,9 @@ fn splice_prefix(
     template_prefix: &[u32],
     full_tokens: Vec<u32>,
     eos_ids: &BTreeSet<u32>,
-) -> Result<Vec<u32>> {
+) -> Result<(Vec<u32>, Option<CaptureAlignment>)> {
     if required_prefix.is_empty() {
-        return Ok(full_tokens);
+        return Ok((full_tokens, None));
     }
     if eos_ids.is_empty() {
         bail_invalid_prefix_alignment!("the model/tokenizer must define an EOS token ID");
@@ -115,8 +113,13 @@ fn splice_prefix(
     if !required_prefix.last().is_some_and(|id| eos_ids.contains(id)) {
         aligned.push(full_tokens[boundary]);
     }
+    let alignment = CaptureAlignment {
+        suffix_start: aligned.len(),
+        turn_end_token_id: full_tokens[boundary],
+        eos_token_ids: eos_ids.iter().copied().collect(),
+    };
     aligned.extend_from_slice(&full_tokens[boundary + 1..]);
-    Ok(aligned)
+    Ok((aligned, Some(alignment)))
 }
 
 #[cfg(test)]
@@ -133,7 +136,7 @@ mod tests {
             &BTreeSet::from([2]),
         )
         .unwrap();
-        assert_eq!(result, [10, 2, 90, 91, 92, 2, 40, 2, 50]);
+        assert_eq!(result.0, [10, 2, 90, 91, 92, 2, 40, 2, 50]);
     }
 
     #[test]
@@ -145,7 +148,11 @@ mod tests {
             &BTreeSet::from([2]),
         )
         .unwrap();
-        assert_eq!(result, [10, 90, 2, 40]);
+        assert_eq!(result.0, [10, 90, 2, 40]);
+        let boundary = result.1.unwrap();
+        assert_eq!(boundary.suffix_start, 3);
+        assert_eq!(boundary.turn_end_token_id, 2);
+        assert_eq!(boundary.eos_token_ids, vec![2]);
     }
 
     #[test]
@@ -157,14 +164,18 @@ mod tests {
             &BTreeSet::from([2, 3]),
         )
         .unwrap();
-        assert_eq!(result, [10, 90, 3, 40]);
+        assert_eq!(result.0, [10, 90, 3, 40]);
+        let boundary = result.1.unwrap();
+        assert_eq!(boundary.suffix_start, 3);
+        assert_eq!(boundary.turn_end_token_id, 2);
+        assert_eq!(boundary.eos_token_ids, vec![2, 3]);
     }
 
     #[test]
     fn empty_prefix_keeps_normal_prompt_without_requiring_eos() {
         assert_eq!(
             splice_prefix(&[], &[], vec![10, 20], &BTreeSet::new()).unwrap(),
-            [10, 20]
+            (vec![10, 20], None)
         );
     }
 

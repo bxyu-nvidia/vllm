@@ -8456,15 +8456,36 @@ impl ChatBackend for PrefixChatBackend {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn chat_prefix_alignment_preserves_engine_and_response_tokens() {
-    for stream in [false, true] {
+    for (stream, phase) in [
+        (false, None),
+        (true, None),
+        (false, Some("prefill")),
+        (false, Some("decode")),
+    ] {
         let prefix = bytes_to_token_ids(b"user: hi\nassistant:  EXACT  \n");
         let mut expected = prefix.clone();
         expected.extend(bytes_to_token_ids(b"user: next\nassistant:"));
         let expected_engine = expected.clone();
+        let context = phase.map(|phase| json!({
+            "version": 1, "admission": {"model_call_id": "call-2", "prev_len": prefix.len(), "staging_chain": ["parent-key"]},
+            "weight_version": 7, "phase": phase, "top_logprobs": 0, "routed_experts": false,
+        }));
+        let context_engine = context.clone();
+        let suffix_start = prefix.len();
         let (chat, engine_task) = test_models_with_engine_outputs_and_backend_inner(
             b"engine-prefix-alignment",
             default_stream_output_specs(),
-            move |request| assert_eq!(request.prompt_token_ids, Some(expected_engine)),
+            move |request| {
+                assert_eq!(request.prompt_token_ids, Some(expected_engine));
+                let args = request.sampling_params.as_ref().unwrap().extra_args.as_ref().unwrap();
+                assert_eq!(args["passthrough"], json!("preserved"));
+                if let Some(mut expected) = context_engine {
+                    expected["alignment"] = json!({"suffix_start": suffix_start, "turn_end_token_id": 10, "eos_token_ids": [10]});
+                    assert_eq!(args["nemo_rl_capture"], expected);
+                } else {
+                    assert!(!args.contains_key("nemo_rl_capture"));
+                }
+            },
             Arc::new(PrefixChatBackend(FakeChatBackend::new())),
         )
         .await;
@@ -8487,6 +8508,8 @@ async fn chat_prefix_alignment_preserves_engine_and_response_tokens() {
                                 {"role":"user", "content":"next"}
                             ],
                             "required_prefix_token_ids": prefix,
+                            "nemo_rl_capture": context,
+                            "vllm_xargs": {"passthrough": "preserved"},
                             "max_completion_tokens": 8
                         })
                         .to_string(),
@@ -8561,6 +8584,39 @@ async fn chat_prefix_alignment_rejects_disabled_and_unsafe_requests() {
             body["error"]["message"].as_str().unwrap().contains(message),
             "{body}"
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_capture_rejects_spoofed_boundaries_and_reserved_extra_args() {
+    let (chat, _engine_task) = test_chat_with_engine_outputs(b"capture-invalid", vec![]).await;
+    let mut app = build_router(Arc::new(AppState::new(
+        vec!["model".into()],
+        chat.with_prefix_token_alignment(true),
+    )));
+    let context = json!({"version":1,"admission":{"prev_len":0},"weight_version":7,"phase":"decode","top_logprobs":0,"routed_experts":false});
+    let mut spoofed = context.clone();
+    spoofed["alignment"] = json!({"suffix_start":0});
+    for extra in [
+        json!({"vllm_xargs":{"nemo_rl_capture":context}}),
+        json!({"nemo_rl_capture":spoofed}),
+        json!({"nemo_rl_capture":{"version":2,"admission":{"prev_len":0},"weight_version":7,"phase":"decode","top_logprobs":0,"routed_experts":false}}),
+    ] {
+        let mut body = json!({"model":"model","messages":[{"role":"user","content":"hi"}]});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
     }
 }
 
