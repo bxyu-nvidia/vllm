@@ -24,6 +24,11 @@ use crate::utils::utility_call_error;
 pub(super) fn router(token: &str) -> Router<Arc<AppState>> {
     Router::new()
         .route("/nemo_rl/capture/metadata", get(capture_metadata))
+        // The random ticket is a per-capture capability, stripped from agent responses.
+        .route(
+            "/nemo_rl/capture/result/{engine}/{ticket}",
+            get(resolve_capture).delete(release_capture),
+        )
         .route("/nemo_rl/capture/metrics/{engine}", get(capture_metrics))
         .route(
             "/nemo_rl/refit",
@@ -34,6 +39,30 @@ pub(super) fn router(token: &str) -> Router<Arc<AppState>> {
             post(configure_capture)
                 .route_layer(from_fn_with_state(hash_api_key(token), authenticate)),
         )
+}
+
+async fn resolve_capture(
+    State(state): State<Arc<AppState>>,
+    Path((engine, ticket)): Path<(u32, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let result = state
+        .engine_core_client()
+        .call_utility_on(engine, "resolve_capture", (ticket,))
+        .await
+        .map_err(|error| utility_call_error("resolve_capture", error))?;
+    Ok(Json(result))
+}
+
+async fn release_capture(
+    State(state): State<Arc<AppState>>,
+    Path((engine, ticket)): Path<(u32, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let released: bool = state
+        .engine_core_client()
+        .call_utility_on(engine, "release_capture", (ticket,))
+        .await
+        .map_err(|error| utility_call_error("release_capture", error))?;
+    Ok(Json(json!({"ok": released})))
 }
 
 async fn capture_metrics(

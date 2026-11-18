@@ -373,3 +373,57 @@ async fn capture_metrics_scrape_returns_engine_snapshot() {
     );
     engine_task.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn pending_capture_result_and_release_target_the_owner() {
+    let (state, engine_task) =
+        test_admin_state_with_ready_and_engine_script(default_ready_response(), |dealer, push| {
+            boxed_test_future(async move {
+                for (method, result) in [
+                    (
+                        "resolve_capture",
+                        json!({"disposition": "staged", "model_call_id": "call"}),
+                    ),
+                    ("release_capture", json!(true)),
+                ] {
+                    let msg = recv_engine_message(dealer).await;
+                    let payload = decode_value(&msg[1]).unwrap();
+                    let array = payload.as_array().unwrap();
+                    assert_eq!(array[2], Value::from(method));
+                    assert_eq!(
+                        array[3],
+                        rmpv::ext::to_value(json!(["opaque-ticket"])).unwrap()
+                    );
+                    send_outputs(
+                        push,
+                        utility_outputs(array[1].as_u64().unwrap(), utility_result_value(result)),
+                    )
+                    .await;
+                }
+            })
+        })
+        .await;
+    let mut app = super::super::nemo_rl::router("control-secret").with_state(state);
+    for method in ["GET", "DELETE"] {
+        let response = app
+            .call(
+                Request::builder()
+                    .method(method)
+                    .uri("/nemo_rl/capture/result/0/opaque-ticket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if method == "GET" {
+            assert_eq!(body["disposition"], "staged");
+        } else {
+            assert_eq!(body, json!({"ok":true}));
+        }
+    }
+    engine_task.finish().await;
+}

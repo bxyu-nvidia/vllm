@@ -1779,9 +1779,10 @@ class EngineCoreProc(EngineCore):
         if self.capture_runtime is not None:
             raise RuntimeError("engine capture is already configured")
         self.capture_runtime = EngineCapture()
-        return self.capture_runtime.configure(
-            factory, {**config, "engine_index": self.engine_index}
-        )
+        config = {**config, "engine_index": self.engine_index}
+        if config.get("result_url"):
+            config["result_url"] = f"{config['result_url']}/{self.engine_index}"
+        return self.capture_runtime.configure(factory, config)
 
     def get_capture_metrics(self) -> str:
         """Snapshot capture counters without waiting for storage or GPU work."""
@@ -1817,6 +1818,18 @@ class EngineCoreProc(EngineCore):
 
         self.output_queue.put_nowait(finalize)
         return future
+
+    def resolve_capture(self, ticket: str) -> Future:
+        """Resolve a pending receipt on its owning engine."""
+        if self.capture_runtime is None:
+            raise RuntimeError("engine capture is not configured")
+        return self.capture_runtime.resolve_result(ticket)
+
+    def release_capture(self, ticket: str) -> Future:
+        """Release receipt metadata after the ledger acknowledgment."""
+        if self.capture_runtime is None:
+            raise RuntimeError("engine capture is not configured")
+        return self.capture_runtime.release_result(ticket)
 
     def drain_capture(self) -> Future | bool:
         """Drain capture before any policy mutation, including pending writes."""

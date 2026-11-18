@@ -587,3 +587,72 @@ def test_engine_capture_batch_preserves_outputs_before_finish_and_finalize(fail_
             ]
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize("fail_write", [False, True])
+def test_pending_capture_returns_before_cpu_work_and_preserves_completion_barriers(
+    fail_write,
+):
+    import asyncio
+    import threading
+
+    from vllm.v1.engine.capture_runtime import EngineCapture
+
+    entered = threading.Event()
+    release = None
+
+    class Adapter:
+        async def finalize(self, request_id, served_tokens, prefill_key):
+            nonlocal release
+            release = asyncio.Event()
+            entered.set()
+            await release.wait()
+            if fail_write:
+                raise OSError("TQ rejected capture")
+            return {"disposition": "staged", "served_tokens": served_tokens}
+
+        async def close(self):
+            pass
+
+    runtime = EngineCapture()
+    runtime.adapter = Adapter()
+    runtime.result_url = "http://owner/nemo_rl/capture/result/3"
+    runtime._active.add("request")
+    runtime._metadata["request"] = {
+        "phase": "decode",
+        "rollout_id": "rollout",
+        "model_call_id": "call",
+    }
+    try:
+        receipt = runtime.finalize("request", 2, "prefill").result(5)
+        assert receipt["disposition"] == "pending"
+        assert receipt["rollout_id"] == "rollout"
+        assert entered.wait(5)
+        assert release is not None
+        ticket = receipt["resolve_url"].rsplit("/", 1)[1]
+        cancelled_reader = runtime.resolve_result(ticket)
+        assert cancelled_reader.cancel()
+        reader = runtime.resolve_result(ticket)
+        drain = runtime.drain()
+        assert not reader.done() and not drain.done()
+        with pytest.raises(ValueError, match="pending capture"):
+            runtime.release_result(ticket).result(5)
+        runtime.loop.call_soon_threadsafe(release.set)
+        if fail_write:
+            with pytest.raises(OSError, match="TQ rejected"):
+                reader.result(5)
+            with pytest.raises(OSError, match="TQ rejected"):
+                drain.result(5)
+            with pytest.raises(RuntimeError, match="failed capture"):
+                runtime.resume()
+        else:
+            expected = {"disposition": "staged", "served_tokens": 2}
+            assert reader.result(5) == expected
+            assert runtime.resolve_result(ticket).result(5) == expected
+            assert drain.result(5) is True
+        assert runtime.release_result(ticket).result(5) is True
+        assert runtime.release_result(ticket).result(5) is True
+        with pytest.raises(KeyError):
+            runtime.resolve_result(ticket).result(5)
+    finally:
+        runtime.close()

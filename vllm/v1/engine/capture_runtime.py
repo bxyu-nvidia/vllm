@@ -4,6 +4,7 @@
 
 import asyncio
 import threading
+import uuid
 from collections.abc import Callable
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Protocol
@@ -48,6 +49,8 @@ class EngineCapture:
         self.pending: dict[str, asyncio.Task] = {}
         self.failure: BaseException | None = None
         self.writes: dict[str, asyncio.Task] = {}
+        self.results: dict[str, asyncio.Task] = {}
+        self.result_url: str | None = None
         self._metadata: dict[str, dict[str, Any]] = {}
         self._closed_admission = False
         self._admission_lock = threading.Lock()
@@ -69,6 +72,7 @@ class EngineCapture:
             if self.adapter is not None:
                 raise RuntimeError("engine capture is already configured")
             self.adapter = await resolve_obj_by_qualname(factory)(config)
+            self.result_url = config.get("result_url")
             return True
 
         return asyncio.run_coroutine_threadsafe(configure(), self.loop)
@@ -116,6 +120,11 @@ class EngineCapture:
                             "phase": context.phase,
                             "prefill_key": context.prefill_key,
                         }
+                        if self.result_url is not None:
+                            self._metadata[request.request_id].update(
+                                rollout_id=context.admission["rollout_id"],
+                                model_call_id=context.admission["model_call_id"],
+                            )
                         ready()
                         scheduled = True
                     else:
@@ -206,7 +215,7 @@ class EngineCapture:
     def finalize(
         self, request_id: str, served_tokens: int, prefill_key: str | None
     ) -> Future:
-        """Acknowledge storage only after the frontend supplies its final length."""
+        """Start finalization after the frontend supplies its final served length."""
 
         async def write() -> dict[str, Any]:
             try:
@@ -221,6 +230,9 @@ class EngineCapture:
                 return result
             except Exception as error:
                 self.failure = error
+                logger.exception(
+                    "Background capture finalization failed: %s", request_id
+                )
                 raise
             finally:
                 self.writes.pop(request_id, None)
@@ -228,12 +240,48 @@ class EngineCapture:
         async def finalize() -> dict[str, Any]:
             if request_id in self.writes:
                 raise ValueError("capture finalization already pending")
+            self._adapter()
+            metadata = self._metadata.get(request_id, {})
             task = self.loop.create_task(write())
             self.writes[request_id] = task
-            # The write and its cleanup stay tracked if a utility caller leaves.
+            if self.result_url is not None and metadata["phase"] == "decode":
+                ticket = uuid.uuid4().hex
+                self.results[ticket] = task
+                # Observe background failures even if no consumer ever resolves
+                # the handle; the task remains available for retrying readers.
+                task.add_done_callback(
+                    lambda done: None if done.cancelled() else done.exception()
+                )
+                return {
+                    "disposition": "pending",
+                    "rollout_id": metadata["rollout_id"],
+                    "model_call_id": metadata["model_call_id"],
+                    "resolve_url": f"{self.result_url}/{ticket}",
+                }
             return await asyncio.shield(task)
 
         return asyncio.run_coroutine_threadsafe(finalize(), self.loop)
+
+    def resolve_result(self, ticket: str) -> Future:
+        """Wait for one capture without transferring cancellation to its write."""
+
+        async def resolve() -> dict[str, Any]:
+            return await asyncio.shield(self.results[ticket])
+
+        return asyncio.run_coroutine_threadsafe(resolve(), self.loop)
+
+    def release_result(self, ticket: str) -> Future:
+        """Forget acknowledged metadata after Gym has durably recorded it."""
+
+        async def release() -> bool:
+            task = self.results.get(ticket)
+            if task is not None:
+                if not task.done():
+                    raise ValueError("cannot release a pending capture")
+                del self.results[ticket]
+            return True
+
+        return asyncio.run_coroutine_threadsafe(release(), self.loop)
 
     def finish(self, request_id: str) -> None:
         # Called after the scheduler abort and all previously queued outputs.
