@@ -1149,7 +1149,9 @@ class EngineCoreProc(EngineCore):
         engine_index: int = 0,
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
-        self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
+        self.output_queue = queue.Queue[
+            tuple[int, EngineCoreOutputs] | bytes | Callable[[], None]
+        ]()
         executor_fail_callback = lambda: self.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b"")
         )
@@ -1785,7 +1787,37 @@ class EngineCoreProc(EngineCore):
         """Commit native data using the frontend's final served-token count."""
         if self.capture_runtime is None:
             raise RuntimeError("engine capture is not configured")
-        return self.capture_runtime.finalize(request_id, served_tokens, prefill_key)
+        # Rust may stop on a string before the scheduler reaches EOS. Stop the
+        # request, then finalize after all queued native outputs are observed.
+        self.abort_requests([request_id])
+        future: Future = Future()
+
+        def finalize() -> None:
+            assert self.capture_runtime is not None
+            self.capture_runtime.finish(request_id)
+            pending = self.capture_runtime.finalize(
+                request_id, served_tokens, prefill_key
+            )
+
+            def done(result: Future) -> None:
+                try:
+                    future.set_result(result.result())
+                except Exception as error:
+                    future.set_exception(error)
+
+            pending.add_done_callback(done)
+
+        self.output_queue.put_nowait(finalize)
+        return future
+
+    def drain_capture(self) -> Future | bool:
+        """Drain capture before any policy mutation, including pending writes."""
+        return self.capture_runtime.drain() if self.capture_runtime else True
+
+    def resume_capture(self) -> bool:
+        if self.capture_runtime is not None:
+            self.capture_runtime.resume()
+        return True
 
     def discard_capture(self, request_id: str) -> Future:
         """Release an abandoned call without staging a successful training row."""
@@ -2024,6 +2056,9 @@ class EngineCoreProc(EngineCore):
 
             while True:
                 output = self.output_queue.get()
+                if callable(output):
+                    output()
+                    continue
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:
                     for socket in sockets:
                         socket.send(output)
@@ -2032,8 +2067,11 @@ class EngineCoreProc(EngineCore):
                 client_index, outputs = output
                 outputs.engine_index = engine_index
                 if self.capture_runtime is not None:
-                    for item in outputs.outputs:
+                    for index, item in enumerate(outputs.outputs):
                         self.capture_runtime.observe(item)
+                        outputs.outputs[index] = self.capture_runtime.wire_output(
+                            item, engine_index
+                        )
 
                 if client_index == -1:
                     # Don't reuse buffer for coordinator message

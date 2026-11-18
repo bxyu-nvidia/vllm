@@ -267,13 +267,21 @@ def test_engine_capture_lookup_does_not_block_other_requests_and_abort_cannot_ad
     runtime.adapter = Adapter()
     try:
         runtime.prepare(
-            SimpleNamespace(request_id="slow"),
+            SimpleNamespace(
+                request_id="slow",
+                capture_context=SimpleNamespace(phase="decode", prefill_key="p"),
+                prompt_token_ids=[1],
+            ),
             lambda: failures.append("late ADD"),
             lambda: failures.append("error"),
         )
         assert entered.wait(5)
         runtime.prepare(
-            SimpleNamespace(request_id="fast"),
+            SimpleNamespace(
+                request_id="fast",
+                capture_context=SimpleNamespace(phase="decode", prefill_key="p"),
+                prompt_token_ids=[1],
+            ),
             added.set,
             lambda: failures.append("error"),
         )
@@ -353,7 +361,20 @@ def test_engine_capture_prepares_exact_prompt_before_block_hashing():
         request_id="capture",
         prompt_token_ids=[10, 2, 40],
         mm_features=None,
-        sampling_params=SamplingParams(max_tokens=7),
+        sampling_params=SamplingParams(
+            max_tokens=7,
+            extra_args={
+                "nemo_rl_capture": {
+                    "version": 1,
+                    "engine_capture": True,
+                    "admission": {"prev_len": 0},
+                    "weight_version": 0,
+                    "phase": "decode",
+                    "top_logprobs": 0,
+                    "routed_experts": False,
+                }
+            },
+        ),
         pooling_params=None,
         arrival_time=0,
         lora_request=None,
@@ -394,3 +415,114 @@ def test_engine_capture_failure_still_allows_discard_and_shutdown():
     finally:
         runtime.close()
     assert not runtime.thread.is_alive()
+
+
+@pytest.mark.parametrize("cancel_caller", [False, True])
+def test_engine_capture_drain_waits_for_write_and_blocks_new_admission(cancel_caller):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.capture_runtime import EngineCapture
+
+    entered = threading.Event()
+    release = None
+
+    class Adapter:
+        async def finalize(self, request_id, served_tokens, prefill_key):
+            nonlocal release
+            release = asyncio.Event()
+            entered.set()
+            await release.wait()
+            return {"disposition": "staged"}
+
+        async def close(self):
+            pass
+
+    runtime = EngineCapture()
+    runtime.adapter = Adapter()
+    runtime._active.add("request")
+    try:
+        write = runtime.finalize("request", 1, "prefill")
+        assert entered.wait(5)
+        if cancel_caller:
+            assert write.cancel()
+        drain = runtime.drain()
+        with pytest.raises(RuntimeError, match="paused"):
+            runtime.prepare(
+                SimpleNamespace(request_id="child"), lambda: None, lambda: None
+            )
+        assert not drain.done()
+        assert release is not None
+        runtime.loop.call_soon_threadsafe(release.set)
+        if not cancel_caller:
+            assert write.result(5) == {"disposition": "staged"}
+        assert drain.result(5) is True
+        runtime.resume()
+    finally:
+        runtime.close()
+
+
+def test_engine_capture_wire_output_omits_training_arrays_without_mutation():
+    import numpy as np
+
+    from vllm.v1.engine import EngineCoreOutput
+    from vllm.v1.engine.capture_runtime import EngineCapture
+    from vllm.v1.outputs import LogprobsLists
+
+    runtime = EngineCapture()
+    runtime._metadata["r"] = {"request_id": "r", "prompt_tokens": 100}
+    output = EngineCoreOutput(
+        "r",
+        [3],
+        new_logprobs=LogprobsLists(np.array([[3]]), np.array([[-0.5]]), np.array([1])),
+        routed_experts=np.zeros((1, 1, 1)),
+        kv_transfer_params={"remote_num_tokens": 80},
+    )
+    try:
+        wire = runtime.wire_output(output, 2)
+        assert wire.new_logprobs is None and wire.routed_experts is None
+        assert output.new_logprobs is not None and output.routed_experts is not None
+        assert "__nemo_rl_capture" not in output.kv_transfer_params
+        assert wire.kv_transfer_params["__nemo_rl_capture"]["engine_index"] == 2
+        assert wire.kv_transfer_params["remote_num_tokens"] == 80
+    finally:
+        runtime.close()
+
+
+def test_engine_capture_finalization_follows_queued_outputs():
+    import queue
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.core import EngineCoreProc
+
+    engine = EngineCoreProc.__new__(EngineCoreProc)
+    engine.output_queue = queue.Queue()
+    events = []
+    stored: Future[dict[str, str]] = Future()
+
+    def finalize(request_id, served_tokens, prefill_key):
+        events.append(("finalize", request_id, served_tokens, prefill_key))
+        return stored
+
+    engine.capture_runtime = SimpleNamespace(
+        finish=lambda request_id: events.append(("finish", request_id)),
+        finalize=finalize,
+    )
+    engine.abort_requests = lambda ids: events.append(("abort", ids))
+    engine.output_queue.put(lambda: events.append(("output", "r")))
+    result = engine.finalize_capture("r", 2, "prefill")
+    assert events == [("abort", ["r"])]
+    assert not result.done()
+    engine.output_queue.get_nowait()()
+    engine.output_queue.get_nowait()()
+    assert events == [
+        ("abort", ["r"]),
+        ("output", "r"),
+        ("finish", "r"),
+        ("finalize", "r", 2, "prefill"),
+    ]
+    assert not result.done()
+    stored.set_result({"disposition": "staged"})
+    assert result.result(5) == {"disposition": "staged"}

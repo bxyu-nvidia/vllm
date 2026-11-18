@@ -83,6 +83,17 @@ pub(super) fn prepare_chat_request(
             "nemo_rl_capture is a reserved vllm_xargs key"
         ));
     }
+    let engine_capture = request
+        .nemo_rl_capture
+        .as_ref()
+        .filter(|context| context.engine_capture)
+        .cloned();
+    if engine_capture.is_some() && request.stream {
+        return Err(invalid_request!(
+            param = Some("stream"),
+            "engine capture requires stream=false"
+        ));
+    }
     if let Some(context) = request.nemo_rl_capture.take() {
         request.vllm_xargs.get_or_insert_default().insert(
             vllm_chat::CAPTURE_CONTEXT_KEY.into(),
@@ -139,7 +150,7 @@ pub(super) fn prepare_chat_request(
             .as_ref()
             .and_then(|options| options.continuous_usage_stats)
             .unwrap_or(false);
-    let requested_logprobs = request.logprobs;
+    let requested_logprobs = request.logprobs && engine_capture.is_none();
     let is_named_tool_choice = matches!(&request.tool_choice, Some(ToolChoice::Function { .. }));
 
     // Auto-enable prompt logprobs for non-streaming echo, matching Python vLLM's
@@ -150,7 +161,10 @@ pub(super) fn prepare_chat_request(
         .or((request.echo && !request.stream).then_some(top_logprobs));
     let include_prompt_logprobs = prompt_logprobs.is_some();
     let logprob_token_ids = request.logprob_token_ids.filter(|ids| !ids.is_empty());
-    let logprobs = (request.logprobs && logprob_token_ids.is_none()).then_some(top_logprobs);
+    let logprobs = engine_capture
+        .as_ref()
+        .map(|context| context.top_logprobs as i32)
+        .or_else(|| (request.logprobs && logprob_token_ids.is_none()).then_some(top_logprobs));
     let output_top_logprobs = if logprob_token_ids.is_some() {
         -1
     } else {

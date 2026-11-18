@@ -46,6 +46,8 @@ pub struct CaptureContext {
     pub routed_experts: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub engine_capture: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_key: Option<String>,
     /// Computed by the frontend, never accepted from the HTTP caller.
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<CaptureAlignment>,

@@ -631,11 +631,48 @@ async fn test_models_with_engine_outputs_and_backend_inner(
                 let request: EngineCoreRequest =
                     rmp_serde::from_slice(&add[1]).expect("decode request");
                 check_request(&request);
-                send_outputs(
-                    push,
-                    engine_outputs_for_request(&request.request_id, output_specs),
-                )
-                .await;
+                let context = request
+                    .sampling_params
+                    .as_ref()
+                    .and_then(|p| p.extra_args.as_ref())
+                    .and_then(|a| a.get("nemo_rl_capture"));
+                let captured = context.is_some_and(|context| context["engine_capture"] == true);
+                let mut outputs = engine_outputs_for_request(&request.request_id, output_specs);
+                if captured {
+                    for output in &mut outputs.as_request_batch_mut().unwrap().outputs {
+                        output.kv_transfer_params = Some(Box::new(json!({"__nemo_rl_capture": {
+                            "request_id": request.request_id, "engine_index": 0,
+                            "prompt_tokens": 123, "phase": context.unwrap()["phase"], "prefill_key": "prefill-ref"
+                        }})));
+                    }
+                }
+                send_outputs(push, outputs).await;
+                if captured {
+                    let msg = recv_engine_message(dealer).await;
+                    let payload = decode_value(&msg[1]).unwrap();
+                    let array = payload.as_array().unwrap();
+                    assert_eq!(array[2], Value::from("finalize_capture"));
+                    let count = if context.unwrap()["phase"] == "prefill" {
+                        0
+                    } else {
+                        3
+                    };
+                    assert_eq!(
+                        array[3],
+                        rmpv::ext::to_value(json!([request.request_id, count, "prefill-ref"]))
+                            .unwrap()
+                    );
+                    send_outputs(
+                        push,
+                        utility_outputs(
+                            array[1].as_u64().unwrap(),
+                            utility_result_value(
+                                json!({"prefill_key":"opaque-prefill", "disposition":"staged"}),
+                            ),
+                        ),
+                    )
+                    .await;
+                }
             })
         },
     ));
@@ -8547,8 +8584,20 @@ async fn chat_prefix_alignment_preserves_engine_and_response_tokens() {
             assert_eq!(generated, json!([104, 105, 33]).as_array().unwrap().clone());
         } else {
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["prompt_token_ids"], json!(expected));
-            assert_eq!(body["choices"][0]["token_ids"], json!([104, 105, 33]));
+            if deferred {
+                assert_eq!(body["usage"]["prompt_tokens"], 123);
+                assert!(body["kv_transfer_params"].get("__nemo_rl_capture").is_none());
+                if phase == Some("decode") {
+                    assert_eq!(body["ng_commit_coords"]["disposition"], "staged");
+                }
+            }
+            if deferred {
+                assert!(body["prompt_token_ids"].is_null());
+                assert!(body["choices"][0]["token_ids"].is_null());
+            } else {
+                assert_eq!(body["prompt_token_ids"], json!(expected));
+                assert_eq!(body["choices"][0]["token_ids"], json!([104, 105, 33]));
+            }
         }
         engine_task.finish().await;
     }

@@ -35,6 +35,7 @@ class CaptureContext(msgspec.Struct, forbid_unknown_fields=True):  # type: ignor
     routed_experts: bool
     alignment: CaptureAlignment | None = None
     engine_capture: bool = False
+    prefill_key: str | None = None
 
 
 def get_capture_context(

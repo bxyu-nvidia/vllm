@@ -8,6 +8,8 @@ from collections.abc import Callable
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Protocol
 
+import msgspec
+
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 
@@ -28,6 +30,8 @@ class CaptureAdapter(Protocol):
         self, request_id: str, served_tokens: int, prefill_key: str | None
     ) -> dict[str, Any]: ...
 
+    def finish(self, request_id: str) -> None: ...
+
     def discard(self, request_id: str) -> None: ...
 
     async def close(self) -> None: ...
@@ -41,6 +45,9 @@ class EngineCapture:
         self.adapter: CaptureAdapter | None = None
         self.pending: dict[str, asyncio.Task] = {}
         self.failure: BaseException | None = None
+        self.writes: dict[str, asyncio.Task] = {}
+        self._metadata: dict[str, dict[str, Any]] = {}
+        self._closed_admission = False
         self._admission_lock = threading.Lock()
         self._preparing: set[str] = set()
         self._active: set[str] = set()
@@ -78,6 +85,8 @@ class EngineCapture:
         failed: Callable[[], None],
     ) -> None:
         with self._admission_lock:
+            if self._closed_admission:
+                raise RuntimeError("engine capture is paused")
             if request.request_id in self._active:
                 raise ValueError("duplicate capture request")
             self._active.add(request.request_id)
@@ -86,11 +95,19 @@ class EngineCapture:
         async def prepare() -> None:
             scheduled = False
             try:
+                context = request.capture_context
+                assert context is not None
                 await self._adapter().prepare(request)
                 # Serialize ADD publication with input-thread ABORT admission.
                 # Otherwise a slow lookup could enqueue ADD after its ABORT.
                 with self._admission_lock:
                     if request.request_id in self._preparing:
+                        self._metadata[request.request_id] = {
+                            "request_id": request.request_id,
+                            "prompt_tokens": len(request.prompt_token_ids or []),
+                            "phase": context.phase,
+                            "prefill_key": context.prefill_key,
+                        }
                         ready()
                         scheduled = True
                     else:
@@ -108,6 +125,7 @@ class EngineCapture:
                     self._preparing.discard(request.request_id)
                     if not scheduled:
                         self._active.discard(request.request_id)
+                        self._metadata.pop(request.request_id, None)
                 self.pending.pop(request.request_id, None)
 
         def start() -> None:
@@ -131,6 +149,25 @@ class EngineCapture:
 
         self.loop.call_soon_threadsafe(abort)
 
+    def wire_output(
+        self, output: "EngineCoreOutput", engine_index: int
+    ) -> "EngineCoreOutput":
+        """Keep training arrays in Python; send only text tokens and coordination."""
+        with self._admission_lock:
+            metadata = self._metadata.get(output.request_id)
+            if metadata is None:
+                return output
+            metadata = {**metadata, "engine_index": engine_index}
+        return msgspec.structs.replace(
+            output,
+            new_logprobs=None,
+            routed_experts=None,
+            kv_transfer_params={
+                **(output.kv_transfer_params or {}),
+                "__nemo_rl_capture": metadata,
+            },
+        )
+
     def observe(self, output: "EngineCoreOutput") -> None:
         with self._admission_lock:
             if output.request_id not in self._active:
@@ -153,15 +190,69 @@ class EngineCapture:
     ) -> Future:
         """Acknowledge storage only after the frontend supplies its final length."""
 
+        async def write() -> dict[str, Any]:
+            try:
+                result = await self._adapter().finalize(
+                    request_id, served_tokens, prefill_key
+                )
+                if result.get("disposition") == "capture_failed":
+                    raise RuntimeError("engine capture storage rejected the row")
+                with self._admission_lock:
+                    self._active.discard(request_id)
+                    self._metadata.pop(request_id, None)
+                return result
+            except Exception as error:
+                self.failure = error
+                raise
+            finally:
+                self.writes.pop(request_id, None)
+
         async def finalize() -> dict[str, Any]:
-            result = await self._adapter().finalize(
-                request_id, served_tokens, prefill_key
-            )
-            with self._admission_lock:
-                self._active.discard(request_id)
-            return result
+            if request_id in self.writes:
+                raise ValueError("capture finalization already pending")
+            task = self.loop.create_task(write())
+            self.writes[request_id] = task
+            # The write and its cleanup stay tracked if a utility caller leaves.
+            return await asyncio.shield(task)
 
         return asyncio.run_coroutine_threadsafe(finalize(), self.loop)
+
+    def finish(self, request_id: str) -> None:
+        # Called after the scheduler abort and all previously queued outputs.
+        def finish() -> None:
+            try:
+                self._adapter().finish(request_id)
+            except Exception as error:
+                self.failure = error
+                logger.exception("Could not finish engine capture: %s", request_id)
+
+        self.loop.call_soon_threadsafe(finish)
+
+    def drain(self) -> Future:
+        """Close admission and wait for storage; unresolved calls block refit."""
+        with self._admission_lock:
+            self._closed_admission = True
+
+        async def drain() -> bool:
+            await asyncio.gather(*list(self.pending.values()))
+            await asyncio.gather(*list(self.writes.values()))
+            self._adapter()
+            with self._admission_lock:
+                if self._active:
+                    raise RuntimeError(
+                        f"cannot refit with {len(self._active)} unfinalized captures"
+                    )
+            return True
+
+        return asyncio.run_coroutine_threadsafe(drain(), self.loop)
+
+    def resume(self) -> None:
+        if self.failure is not None:
+            raise RuntimeError("cannot resume failed capture") from self.failure
+        with self._admission_lock:
+            if self._active:
+                raise RuntimeError("cannot resume undrained capture")
+            self._closed_admission = False
 
     def discard(self, request_id: str) -> Future:
         async def discard() -> None:
@@ -173,12 +264,13 @@ class EngineCapture:
                 self.adapter.discard(request_id)
             with self._admission_lock:
                 self._active.discard(request_id)
+                self._metadata.pop(request_id, None)
 
         return asyncio.run_coroutine_threadsafe(discard(), self.loop)
 
     def close(self) -> None:
         async def close() -> None:
-            tasks = list(self.pending.values())
+            tasks = list(self.pending.values()) + list(self.writes.values())
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)

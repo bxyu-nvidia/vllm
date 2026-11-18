@@ -22,10 +22,38 @@ use crate::state::{ApiKeyHash, AppState, hash_api_key};
 use crate::utils::utility_call_error;
 
 pub(super) fn router(token: &str) -> Router<Arc<AppState>> {
-    Router::new().route("/nemo_rl/capture/metadata", get(capture_metadata)).route(
-        "/nemo_rl/refit",
-        post(refit).route_layer(from_fn_with_state(hash_api_key(token), authenticate)),
-    )
+    Router::new()
+        .route("/nemo_rl/capture/metadata", get(capture_metadata))
+        .route(
+            "/nemo_rl/refit",
+            post(refit).route_layer(from_fn_with_state(hash_api_key(token), authenticate)),
+        )
+        .route(
+            "/nemo_rl/capture/configure",
+            post(configure_capture)
+                .route_layer(from_fn_with_state(hash_api_key(token), authenticate)),
+        )
+}
+
+async fn configure_capture(
+    State(state): State<Arc<AppState>>,
+    Json(config): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let results: Vec<bool> = state
+        .engine_core_client()
+        .call_utility(
+            "configure_capture",
+            (
+                "nemo_rl.models.generation.vllm.engine_capture.create_adapter",
+                config,
+            ),
+        )
+        .await
+        .map_err(|error| utility_call_error("configure_capture", error))?;
+    if results.iter().any(|result| !result) {
+        return Err(server_error!("engine capture configuration failed"));
+    }
+    Ok(Json(json!({"ok": true})))
 }
 
 async fn authenticate(
@@ -218,6 +246,10 @@ async fn refit(
                     Some("refit_timeout_s"),
                 ));
             }
+            client
+                .call_utility::<bool, _>("drain_capture", ())
+                .await
+                .map_err(|error| utility_call_error("drain_capture", error))?;
             collective(
                 client,
                 workers,
@@ -229,6 +261,10 @@ async fn refit(
         }
         RefitRequest::Pause {} => {
             client
+                .call_utility::<bool, _>("drain_capture", ())
+                .await
+                .map_err(|error| utility_call_error("drain_capture", error))?;
+            client
                 .pause_scheduler(
                     vllm_engine_core_client::protocol::utility::PauseMode::Wait,
                     false,
@@ -237,6 +273,10 @@ async fn refit(
                 .map_err(|error| utility_call_error("pause_scheduler", error))?;
         }
         RefitRequest::Resume {} => {
+            client
+                .call_utility::<bool, _>("resume_capture", ())
+                .await
+                .map_err(|error| utility_call_error("resume_capture", error))?;
             client
                 .resume_scheduler()
                 .await
