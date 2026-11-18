@@ -27,6 +27,10 @@ fn weight_operation_duration_histogram() -> Histogram {
     Histogram::new([0.01, 0.1, 1.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0])
 }
 
+fn capture_finalize_rpc_histogram() -> Histogram {
+    Histogram::new([0.001, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0])
+}
+
 fn sleep_mode_operation_duration_histogram() -> Histogram {
     Histogram::new([0.01, 0.1, 1.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0])
 }
@@ -54,6 +58,14 @@ pub struct SleepModeOperationLabels {
     pub operation: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct CapturePhaseLabels {
+    pub phase: &'static str,
+}
+
+pub(crate) type CaptureFinalizeHistogramFamily =
+    Family<CapturePhaseLabels, Histogram, fn() -> Histogram>;
+
 pub(crate) type HttpRequestCounterFamily = Family<HttpRequestLabels, U64Counter>;
 pub(crate) type HttpHandlerHistogramFamily =
     Family<HttpHandlerLabels, Histogram, fn() -> Histogram>;
@@ -73,6 +85,8 @@ pub struct ApiServerMetrics {
     pub weight_operations_in_flight: WeightOperationGaugeFamily,
     pub sleep_mode_operation_duration_seconds: SleepModeOperationHistogramFamily,
     pub sleep_mode_operations_in_flight: SleepModeOperationGaugeFamily,
+    pub capture_finalize_rpc_seconds: CaptureFinalizeHistogramFamily,
+    pub capture_finalize_rpcs_in_flight: Family<CapturePhaseLabels, U64Gauge>,
 }
 
 impl ApiServerMetrics {
@@ -132,7 +146,23 @@ impl ApiServerMetrics {
             sleep_mode_operations_in_flight.clone(),
         );
 
+        let capture_finalize_rpc_seconds =
+            Family::new_with_constructor(capture_finalize_rpc_histogram as fn() -> Histogram);
+        registry.register(
+            "vllm:rl_capture_finalize_rpc_seconds",
+            "Time awaiting the engine capture acknowledgment after generation, including RPC queueing.",
+            capture_finalize_rpc_seconds.clone(),
+        );
+        let capture_finalize_rpcs_in_flight = Family::default();
+        registry.register(
+            "vllm:rl_capture_finalize_rpcs_in_flight",
+            "Frontend requests currently waiting for engine capture acknowledgment.",
+            capture_finalize_rpcs_in_flight.clone(),
+        );
+
         Self {
+            capture_finalize_rpc_seconds,
+            capture_finalize_rpcs_in_flight,
             http_requests,
             http_request_duration_seconds,
             http_request_duration_highr_seconds,
@@ -140,6 +170,18 @@ impl ApiServerMetrics {
             weight_operations_in_flight,
             sleep_mode_operation_duration_seconds,
             sleep_mode_operations_in_flight,
+        }
+    }
+
+    /// Measure the complete finalization RPC, including errors and cancellation.
+    pub fn record_capture_finalize(&self, phase: &'static str) -> CaptureFinalizeRecorder {
+        let labels = CapturePhaseLabels { phase };
+        let in_flight = self.capture_finalize_rpcs_in_flight.get_or_create_owned(&labels);
+        in_flight.inc();
+        CaptureFinalizeRecorder {
+            started_at: Instant::now(),
+            duration: self.capture_finalize_rpc_seconds.get_or_create_owned(&labels),
+            in_flight,
         }
     }
 
@@ -168,6 +210,19 @@ impl ApiServerMetrics {
             duration: self.sleep_mode_operation_duration_seconds.get_or_create_owned(&labels),
             in_flight,
         }
+    }
+}
+
+pub struct CaptureFinalizeRecorder {
+    started_at: Instant,
+    duration: Histogram,
+    in_flight: U64Gauge,
+}
+
+impl Drop for CaptureFinalizeRecorder {
+    fn drop(&mut self) {
+        self.duration.observe(self.started_at.elapsed().as_secs_f64());
+        self.in_flight.dec();
     }
 }
 
@@ -270,5 +325,26 @@ mod tests {
         assert!(after.contains(
             "vllm:rl_weight_update_operation_duration_seconds_count{operation=\"update\"} 1"
         ));
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use crate::Metrics;
+
+    #[test]
+    fn finalize_gauge_clears_and_histogram_records_when_scope_exits() {
+        let metrics = Metrics::new();
+        let recorder = metrics.api_server.record_capture_finalize("decode");
+        assert!(
+            metrics
+                .render()
+                .unwrap()
+                .contains("vllm:rl_capture_finalize_rpcs_in_flight{phase=\"decode\"} 1")
+        );
+        drop(recorder);
+        let text = metrics.render().unwrap();
+        assert!(text.contains("vllm:rl_capture_finalize_rpcs_in_flight{phase=\"decode\"} 0"));
+        assert!(text.contains("vllm:rl_capture_finalize_rpc_seconds_count{phase=\"decode\"} 1"));
     }
 }

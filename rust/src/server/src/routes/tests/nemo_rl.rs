@@ -326,3 +326,50 @@ async fn pd_chat_preserves_routes_in_json_and_streaming_with_stop_tail() {
         engine_task.finish().await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn capture_metrics_scrape_returns_engine_snapshot() {
+    let text = "# TYPE nemo_rl_capture_executor_queued gauge\nnemo_rl_capture_executor_queued{engine=\"0\",operation=\"prepare\"} 17\n";
+    let (state, engine_task) = test_admin_state_with_ready_and_engine_script(
+        default_ready_response(),
+        move |dealer, push| {
+            boxed_test_future(async move {
+                let message = recv_engine_message(dealer).await;
+                let payload = decode_value(&message[1]).unwrap();
+                let array = payload.as_array().unwrap();
+                assert_eq!(array[2], Value::from("get_capture_metrics"));
+                assert_eq!(array[3], Value::Array(vec![]));
+                send_outputs(
+                    push,
+                    utility_outputs(
+                        array[1].as_u64().unwrap(),
+                        utility_result_value(json!(text)),
+                    ),
+                )
+                .await;
+            })
+        },
+    )
+    .await;
+    let mut app = super::super::nemo_rl::router("control-secret").with_state(state);
+    let response = app
+        .call(
+            Request::builder()
+                .uri("/nemo_rl/capture/metrics/0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        text
+    );
+    engine_task.finish().await;
+}

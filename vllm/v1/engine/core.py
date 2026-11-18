@@ -1779,7 +1779,15 @@ class EngineCoreProc(EngineCore):
         if self.capture_runtime is not None:
             raise RuntimeError("engine capture is already configured")
         self.capture_runtime = EngineCapture()
-        return self.capture_runtime.configure(factory, config)
+        return self.capture_runtime.configure(
+            factory, {**config, "engine_index": self.engine_index}
+        )
+
+    def get_capture_metrics(self) -> str:
+        """Snapshot capture counters without waiting for storage or GPU work."""
+        if self.capture_runtime is None:
+            raise RuntimeError("engine capture is not configured")
+        return self.capture_runtime.render_metrics()
 
     def finalize_capture(
         self, request_id: str, served_tokens: int, prefill_key: str | None = None

@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -24,6 +24,7 @@ use crate::utils::utility_call_error;
 pub(super) fn router(token: &str) -> Router<Arc<AppState>> {
     Router::new()
         .route("/nemo_rl/capture/metadata", get(capture_metadata))
+        .route("/nemo_rl/capture/metrics/{engine}", get(capture_metrics))
         .route(
             "/nemo_rl/refit",
             post(refit).route_layer(from_fn_with_state(hash_api_key(token), authenticate)),
@@ -33,6 +34,22 @@ pub(super) fn router(token: &str) -> Router<Arc<AppState>> {
             post(configure_capture)
                 .route_layer(from_fn_with_state(hash_api_key(token), authenticate)),
         )
+}
+
+async fn capture_metrics(
+    State(state): State<Arc<AppState>>,
+    Path(engine): Path<u32>,
+) -> Result<Response, ApiError> {
+    let text: String = state
+        .engine_core_client()
+        .call_utility_on(engine, "get_capture_metrics", ())
+        .await
+        .map_err(|error| utility_call_error("get_capture_metrics", error))?;
+    Ok((
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        text,
+    )
+        .into_response())
 }
 
 async fn configure_capture(

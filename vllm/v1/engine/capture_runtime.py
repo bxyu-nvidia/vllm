@@ -36,6 +36,8 @@ class CaptureAdapter(Protocol):
 
     async def close(self) -> None: ...
 
+    def render_metrics(self) -> str: ...
+
 
 class EngineCapture:
     """Run asynchronous storage work without blocking input or output sockets."""
@@ -70,6 +72,12 @@ class EngineCapture:
             return True
 
         return asyncio.run_coroutine_threadsafe(configure(), self.loop)
+
+    def render_metrics(self) -> str:
+        """Read thread-safe counters even when capture work is stalled or failed."""
+        if self.adapter is None:
+            raise RuntimeError("engine capture must be configured before scraping")
+        return self.adapter.render_metrics()
 
     def _adapter(self) -> CaptureAdapter:
         if self.failure is not None:

@@ -259,6 +259,9 @@ def test_engine_capture_lookup_does_not_block_other_requests_and_abort_cannot_ad
             assert request_id == "slow"
             discarded.set()
 
+        def render_metrics(self):
+            return "capture_in_flight 1\n"
+
         async def close(self):
             pass
 
@@ -275,6 +278,8 @@ def test_engine_capture_lookup_does_not_block_other_requests_and_abort_cannot_ad
             lambda: failures.append("error"),
         )
         assert entered.wait(5)
+        # Metrics remain readable while admission is stalled, without draining it.
+        assert runtime.render_metrics() == "capture_in_flight 1\n"
         runtime.prepare(
             SimpleNamespace(
                 request_id="fast",

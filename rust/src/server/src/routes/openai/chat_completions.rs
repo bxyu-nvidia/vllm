@@ -166,6 +166,11 @@ async fn finalize_engine_capture(
     } else {
         usage.completion_tokens.unwrap_or(0)
     };
+    let timing = vllm_metrics::METRICS.api_server.record_capture_finalize(if prefill {
+        "prefill"
+    } else {
+        "decode"
+    });
     let receipt: Value = state
         .engine_core_client()
         .call_utility_on(
@@ -179,6 +184,7 @@ async fn finalize_engine_capture(
         )
         .await
         .map_err(|error| crate::utils::utility_call_error("finalize_capture", error))?;
+    drop(timing);
     if prefill {
         params.insert("nemo_rl_prefill_key".into(), receipt["prefill_key"].clone());
     }
