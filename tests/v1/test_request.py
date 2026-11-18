@@ -208,3 +208,189 @@ def test_capture_rejects_boundaries_outside_prompt_or_without_terminator(boundar
     }
     with pytest.raises(ValueError, match="alignment boundary"):
         get_capture_context({"nemo_rl_capture": context}, [10, 2, 40])
+
+
+@pytest.mark.parametrize("prefix", [[10, 3], [10, 90]])
+def test_engine_capture_aligns_parent_before_scheduler_hashing(prefix):
+    from vllm.v1.engine.capture import align_capture_prompt, get_capture_context
+
+    prompt = [100, 2, 40]
+    raw = {
+        "version": 1,
+        "admission": {"prev_len": 2},
+        "weight_version": 7,
+        "phase": "prefill",
+        "top_logprobs": 0,
+        "routed_experts": False,
+        "engine_capture": True,
+        "alignment": {
+            "suffix_start": 2,
+            "turn_end_token_id": 2,
+            "eos_token_ids": [2, 3],
+        },
+    }
+    context = get_capture_context({"nemo_rl_capture": raw}, prompt)
+    assert context is not None
+    expected = prefix + ([] if prefix[-1] == 3 else [2]) + [40]
+    assert align_capture_prompt(context, prompt, prefix) == expected
+    assert prompt == [100, 2, 40]
+    with pytest.raises(ValueError, match="length"):
+        align_capture_prompt(context, prompt, [10])
+
+
+def test_engine_capture_lookup_does_not_block_other_requests_and_abort_cannot_add():
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.capture_runtime import EngineCapture
+
+    entered = threading.Event()
+    added = threading.Event()
+    discarded = threading.Event()
+    failures = []
+
+    class Adapter:
+        async def prepare(self, request):
+            if request.request_id == "slow":
+                entered.set()
+                await asyncio.Event().wait()
+
+        def discard(self, request_id):
+            assert request_id == "slow"
+            discarded.set()
+
+        async def close(self):
+            pass
+
+    runtime = EngineCapture()
+    runtime.adapter = Adapter()
+    try:
+        runtime.prepare(
+            SimpleNamespace(request_id="slow"),
+            lambda: failures.append("late ADD"),
+            lambda: failures.append("error"),
+        )
+        assert entered.wait(5)
+        runtime.prepare(
+            SimpleNamespace(request_id="fast"),
+            added.set,
+            lambda: failures.append("error"),
+        )
+        assert added.wait(5)
+        runtime.abort_pending(["slow"])
+        assert discarded.wait(5)
+    finally:
+        runtime.close()
+    assert not failures
+
+
+def test_engine_capture_utility_waits_for_storage_ack():
+    import asyncio
+    import threading
+
+    from vllm.v1.engine.capture_runtime import EngineCapture
+
+    entered = threading.Event()
+
+    class Adapter:
+        release = None
+
+        async def finalize(self, request_id, served_tokens, prefill_key):
+            self.release = asyncio.Event()
+            entered.set()
+            await self.release.wait()
+            return {"disposition": "staged", "served_tokens": served_tokens}
+
+        async def close(self):
+            pass
+
+    adapter = Adapter()
+    runtime = EngineCapture()
+    runtime.adapter = adapter
+    try:
+        future = runtime.finalize("request", 2, None)
+        assert entered.wait(5)
+        assert not future.done()
+        assert adapter.release is not None
+        runtime.loop.call_soon_threadsafe(adapter.release.set)
+        assert future.result(5) == {"disposition": "staged", "served_tokens": 2}
+    finally:
+        runtime.close()
+
+
+def test_engine_capture_prepares_exact_prompt_before_block_hashing():
+    import queue
+    from types import SimpleNamespace
+
+    from vllm.v1.engine import EngineCoreRequestType
+    from vllm.v1.engine.capture_runtime import EngineCapture
+    from vllm.v1.engine.core import EngineCoreProc
+
+    class Adapter:
+        async def prepare(self, request):
+            request.prompt_token_ids = [10, 90, 2, 40]
+
+        async def close(self):
+            pass
+
+    engine = EngineCoreProc.__new__(EngineCoreProc)
+    engine.capture_runtime = EngineCapture()
+    engine.capture_runtime.adapter = Adapter()
+    engine.mm_receiver_cache = None
+    engine.input_queue = queue.Queue()
+    engine.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=8, logprobs_mode="raw_logprobs")
+    )
+    seen = []
+
+    def hash_prompt(request):
+        seen.append(list(request.prompt_token_ids))
+        return []
+
+    engine.request_block_hasher = hash_prompt
+    request = EngineCoreRequest(
+        request_id="capture",
+        prompt_token_ids=[10, 2, 40],
+        mm_features=None,
+        sampling_params=SamplingParams(max_tokens=7),
+        pooling_params=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    try:
+        engine._prepare_capture_request(request)
+        kind, (scheduled, wave) = engine.input_queue.get(timeout=5)
+        assert kind == EngineCoreRequestType.ADD
+        assert scheduled.prompt_token_ids == [10, 90, 2, 40]
+        assert scheduled.max_tokens == 4
+        assert seen == [[10, 90, 2, 40]]
+    finally:
+        engine.capture_runtime.close()
+
+
+def test_engine_capture_failure_still_allows_discard_and_shutdown():
+    from vllm.v1.engine.capture_runtime import EngineCapture
+
+    discarded = []
+
+    class Adapter:
+        def discard(self, request_id):
+            discarded.append(request_id)
+
+        async def close(self):
+            raise OSError("storage unavailable")
+
+    runtime = EngineCapture()
+    runtime.adapter = Adapter()
+    runtime.failure = ValueError("invalid capture output")
+    try:
+        with pytest.raises(RuntimeError, match="engine capture failed"):
+            runtime.finalize("request", 1, None).result(5)
+        runtime.discard("request").result(5)
+        assert discarded == ["request"]
+    finally:
+        runtime.close()
+    assert not runtime.thread.is_alive()

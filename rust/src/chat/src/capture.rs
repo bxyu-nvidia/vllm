@@ -44,6 +44,8 @@ pub struct CaptureContext {
     pub phase: CapturePhase,
     pub top_logprobs: u32,
     pub routed_experts: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub engine_capture: bool,
     /// Computed by the frontend, never accepted from the HTTP caller.
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub alignment: Option<CaptureAlignment>,
@@ -82,9 +84,12 @@ pub(crate) fn take_context(
         invalid_prefix_alignment!("capture admission requires nonnegative prev_len")
     })?;
     let prefix_len = request.required_prefix_token_ids.as_ref().map_or(0, Vec::len);
-    // Until engine-side prefix lookup is installed, never silently schedule an
-    // unaligned child. TODO: defer this lookup to engine-side preparation.
-    if prev_len != prefix_len as u64 {
+    if context.engine_capture && prefix_len != 0 {
+        bail_invalid_prefix_alignment!(
+            "engine capture resolves the parent; omit required_prefix_token_ids"
+        );
+    }
+    if !context.engine_capture && prev_len != prefix_len as u64 {
         bail_invalid_prefix_alignment!(
             "capture parent must be resolved into required_prefix_token_ids before engine dispatch"
         );
@@ -120,6 +125,11 @@ mod tests {
             invalid[key] = value;
             assert!(take_context(&mut request(invalid), true).is_err(), "{key}");
         }
+        let mut deferred = valid.clone();
+        deferred["engine_capture"] = json!(true);
+        deferred["admission"] = json!({"prev_len": 5});
+        let mut child = request(deferred);
+        assert!(take_context(&mut child, true).unwrap().unwrap().engine_capture);
         let context = take_context(&mut request(valid), true).unwrap().unwrap();
         assert_eq!(context.weight_version, 7);
         assert_eq!(context.alignment, None);

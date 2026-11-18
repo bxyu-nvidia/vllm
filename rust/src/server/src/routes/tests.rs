@@ -8456,22 +8456,36 @@ impl ChatBackend for PrefixChatBackend {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn chat_prefix_alignment_preserves_engine_and_response_tokens() {
-    for (stream, phase) in [
-        (false, None),
-        (true, None),
-        (false, Some("prefill")),
-        (false, Some("decode")),
+    for (stream, phase, deferred) in [
+        (false, None, false),
+        (true, None, false),
+        (false, Some("prefill"), false),
+        (false, Some("decode"), false),
+        (false, Some("prefill"), true),
+        (false, Some("decode"), true),
     ] {
         let prefix = bytes_to_token_ids(b"user: hi\nassistant:  EXACT  \n");
-        let mut expected = prefix.clone();
+        let rendered_prefix = bytes_to_token_ids(b"user: hi\nassistant: EXACT\n");
+        let mut expected = if deferred {
+            rendered_prefix.clone()
+        } else {
+            prefix.clone()
+        };
         expected.extend(bytes_to_token_ids(b"user: next\nassistant:"));
         let expected_engine = expected.clone();
-        let context = phase.map(|phase| json!({
+        let mut context = phase.map(|phase| json!({
             "version": 1, "admission": {"model_call_id": "call-2", "prev_len": prefix.len(), "staging_chain": ["parent-key"]},
             "weight_version": 7, "phase": phase, "top_logprobs": 0, "routed_experts": false,
         }));
+        if deferred {
+            context.as_mut().unwrap()["engine_capture"] = json!(true);
+        }
         let context_engine = context.clone();
-        let suffix_start = prefix.len();
+        let suffix_start = if deferred {
+            rendered_prefix.len()
+        } else {
+            prefix.len()
+        };
         let (chat, engine_task) = test_models_with_engine_outputs_and_backend_inner(
             b"engine-prefix-alignment",
             default_stream_output_specs(),
@@ -8507,7 +8521,7 @@ async fn chat_prefix_alignment_preserves_engine_and_response_tokens() {
                                 {"role":"assistant", "content":"EXACT"},
                                 {"role":"user", "content":"next"}
                             ],
-                            "required_prefix_token_ids": prefix,
+                            "required_prefix_token_ids": if deferred { vec![] } else { prefix },
                             "nemo_rl_capture": context,
                             "vllm_xargs": {"passthrough": "preserved"},
                             "max_completion_tokens": 8

@@ -200,7 +200,13 @@ impl ChatRequestProcessor {
         prefix_alignment::validate_request(&request, self.enable_prefix_token_alignment)?;
         let required_prefix =
             request.required_prefix_token_ids.take().filter(|ids| !ids.is_empty());
+        let deferred = capture.as_ref().is_some_and(|ctx| {
+            ctx.engine_capture
+                && ctx.admission.get("prev_len").and_then(serde_json::Value::as_u64).unwrap_or(0)
+                    > 0
+        });
         let alignment = required_prefix
+            .or_else(|| deferred.then(Vec::new))
             .map(|ids| {
                 Ok::<_, Error>((
                     ids,
@@ -213,14 +219,24 @@ impl ChatRequestProcessor {
         let (mut rendered, request) = tokio::task::spawn_blocking(move || {
             let mut rendered = renderer.render(&request)?;
             if let Some((prefix, tokenizer, eos_ids)) = alignment {
-                let boundary = prefix_alignment::align_prompt(
-                    &request,
-                    &mut rendered,
-                    &prefix,
-                    renderer.as_ref(),
-                    tokenizer.as_ref(),
-                    &eos_ids,
-                )?;
+                let boundary = if deferred {
+                    Some(prefix_alignment::locate_boundary(
+                        &request,
+                        &mut rendered,
+                        renderer.as_ref(),
+                        tokenizer.as_ref(),
+                        &eos_ids,
+                    )?)
+                } else {
+                    prefix_alignment::align_prompt(
+                        &request,
+                        &mut rendered,
+                        &prefix,
+                        renderer.as_ref(),
+                        tokenizer.as_ref(),
+                        &eos_ids,
+                    )?
+                };
                 if let Some(capture) = &mut capture {
                     capture.alignment = boundary;
                 }

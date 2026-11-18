@@ -224,3 +224,36 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     "stream": true
   }'
 ```
+
+#### Engine-local training capture
+
+The optional Python engine capture API accepts `engine_capture: true` in the
+`nemo_rl_capture` context. For a continuation, omit `required_prefix_token_ids`:
+Rust locates the assistant-turn boundary in the rendered prompt and Python
+resolves the exact parent before scheduler block hashing and KV lookup.
+Requests fail if the engine adapter has not been configured. Existing capture
+requests without this field keep their current behavior.
+
+The per-engine utility methods are:
+
+- `configure_capture(factory, config)`: connect an adapter before admission.
+  NeMo RL supplies `nemo_rl.models.generation.vllm.engine_capture.create_adapter`.
+  Its config contains the existing `capture` settings, `layer_ids`,
+  `ray_address`, `ray_namespace`, and a separate `prefill_partition` whose
+  `PREFILL_FIELDS` the launcher must register before use.
+- `finalize_capture(request_id, served_tokens, prefill_key=None)`: wait for a
+  storage acknowledgment. Prefill uses zero served tokens and returns a small
+  opaque key. Decode uses that key and the frontend's final served-token count,
+  including any stop-string trimming, and returns Gym commit coordinates.
+- `discard_capture(request_id)`: release an abandoned call without staging it.
+
+The adapter receives native sampler arrays and expert-route tensors. It discards
+prefill's disposable sample, joins the P/D route fragments at the KV transfer
+boundary, and retains the final-token route sentinel used by R3. Storage I/O
+runs outside the GPU scheduler and socket threads. Finalization must target the
+engine that owns the request after its terminal output; it is not a broadcast.
+
+These APIs do not switch the RL launcher or router over automatically. That
+integration must configure every engine, finalize each leg, forward the small
+receipt, and discard abandoned requests before the HTTP capture service can be
+removed. Background-write readiness and refit draining remain separate work.

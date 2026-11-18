@@ -3,8 +3,8 @@
 
 """Request metadata for an engine-local training capture adapter.
 
-This module transports and validates coordination data only. It does not join a
-Ray cluster, resolve parent tokens, or acknowledge TQ writes.
+The optional engine adapter resolves parents and stages native outputs. Ordinary
+serving does not import any RL or TransferQueue dependency.
 """
 
 from typing import Annotated, Any, Literal
@@ -34,6 +34,7 @@ class CaptureContext(msgspec.Struct, forbid_unknown_fields=True):  # type: ignor
     top_logprobs: NonNegativeInt
     routed_experts: bool
     alignment: CaptureAlignment | None = None
+    engine_capture: bool = False
 
 
 def get_capture_context(
@@ -63,3 +64,29 @@ def get_capture_context(
     ):
         raise ValueError("invalid capture alignment boundary")
     return context
+
+
+def align_capture_prompt(
+    context: CaptureContext, prompt: list[int], prefix: list[int]
+) -> list[int]:
+    """Splice the exact stored parent before scheduler hashing or KV lookup.
+
+    In engine capture mode the frontend boundary addresses the rendered prompt;
+    otherwise it addresses a prompt that the frontend already aligned.
+    """
+    if len(prefix) != context.admission["prev_len"]:
+        raise ValueError("stored parent length differs from capture admission")
+    if not prefix:
+        return prompt
+    alignment = context.alignment
+    if alignment is None:
+        raise ValueError("capture parent requires an alignment boundary")
+    if not context.engine_capture:
+        if prompt[: len(prefix)] != prefix:
+            raise ValueError("prompt differs from the committed capture parent")
+        return prompt
+    aligned = list(prefix)
+    if prefix[-1] not in alignment.eos_token_ids:
+        aligned.append(alignment.turn_end_token_id)
+    aligned.extend(prompt[alignment.suffix_start :])
+    return aligned

@@ -52,6 +52,23 @@ pub(crate) fn align_prompt(
     tokenizer: &dyn Tokenizer,
     eos_ids: &BTreeSet<u32>,
 ) -> Result<Option<CaptureAlignment>> {
+    let boundary = locate_boundary(request, rendered, renderer, tokenizer, eos_ids)?;
+    let Prompt::TokenIds(full_tokens) = std::mem::take(&mut rendered.prompt) else {
+        unreachable!("locate_boundary tokenizes the prompt");
+    };
+    let (tokens, boundary) = splice_at_boundary(required_prefix, full_tokens, boundary);
+    rendered.prompt = Prompt::TokenIds(tokens);
+    Ok(Some(boundary))
+}
+
+/// Locate a continuation without fetching or transmitting the stored parent.
+pub(crate) fn locate_boundary(
+    request: &ChatRequest,
+    rendered: &mut RenderedPrompt,
+    renderer: &dyn ChatRenderer,
+    tokenizer: &dyn Tokenizer,
+    eos_ids: &BTreeSet<u32>,
+) -> Result<CaptureAlignment> {
     let last_assistant = request
         .messages
         .iter()
@@ -71,12 +88,12 @@ pub(crate) fn align_prompt(
     };
     let template_prefix = encode(prefix_rendered.prompt)?;
     let full_tokens = encode(std::mem::take(&mut rendered.prompt))?;
-    let (tokens, boundary) =
-        splice_prefix(required_prefix, &template_prefix, full_tokens, eos_ids)?;
-    rendered.prompt = Prompt::TokenIds(tokens);
+    let boundary = find_boundary(&template_prefix, &full_tokens, eos_ids)?;
+    rendered.prompt = Prompt::TokenIds(full_tokens);
     Ok(boundary)
 }
 
+#[cfg(test)]
 fn splice_prefix(
     required_prefix: &[u32],
     template_prefix: &[u32],
@@ -86,6 +103,16 @@ fn splice_prefix(
     if required_prefix.is_empty() {
         return Ok((full_tokens, None));
     }
+    let alignment = find_boundary(template_prefix, &full_tokens, eos_ids)?;
+    let (tokens, alignment) = splice_at_boundary(required_prefix, full_tokens, alignment);
+    Ok((tokens, Some(alignment)))
+}
+
+fn find_boundary(
+    template_prefix: &[u32],
+    full_tokens: &[u32],
+    eos_ids: &BTreeSet<u32>,
+) -> Result<CaptureAlignment> {
     if eos_ids.is_empty() {
         bail_invalid_prefix_alignment!("the model/tokenizer must define an EOS token ID");
     }
@@ -106,20 +133,29 @@ fn splice_prefix(
                 "EOS boundary #{turn_end_count} is missing from the full prompt"
             )
         })?;
+    Ok(CaptureAlignment {
+        suffix_start: boundary + 1,
+        turn_end_token_id: full_tokens[boundary],
+        eos_token_ids: eos_ids.iter().copied().collect(),
+    })
+}
+
+fn splice_at_boundary(
+    required_prefix: &[u32],
+    full_tokens: Vec<u32>,
+    mut alignment: CaptureAlignment,
+) -> (Vec<u32>, CaptureAlignment) {
+    let boundary = alignment.suffix_start - 1;
     let mut aligned = Vec::with_capacity(required_prefix.len() + full_tokens.len() - boundary);
     aligned.extend_from_slice(required_prefix);
     // A length-limited generation has no EOS. Insert the template's terminator;
     // otherwise retain the exact EOS emitted by the model, including alternate IDs.
-    if !required_prefix.last().is_some_and(|id| eos_ids.contains(id)) {
+    if !required_prefix.last().is_some_and(|id| alignment.eos_token_ids.contains(id)) {
         aligned.push(full_tokens[boundary]);
     }
-    let alignment = CaptureAlignment {
-        suffix_start: aligned.len(),
-        turn_end_token_id: full_tokens[boundary],
-        eos_token_ids: eos_ids.iter().copied().collect(),
-    };
+    alignment.suffix_start = aligned.len();
     aligned.extend_from_slice(&full_tokens[boundary + 1..]);
-    Ok((aligned, Some(alignment)))
+    (aligned, alignment)
 }
 
 #[cfg(test)]
@@ -231,6 +267,22 @@ mod tests {
             )
             .unwrap();
         let mut rendered = renderer.render(&request).unwrap();
+        let boundary = locate_boundary(
+            &request,
+            &mut rendered,
+            &renderer,
+            &tokenizer,
+            &BTreeSet::from([256]),
+        )
+        .unwrap();
+        let Prompt::TokenIds(tokens) = &rendered.prompt else {
+            panic!("expected tokens")
+        };
+        assert_eq!(tokens[boundary.suffix_start - 1], 256);
+        assert_eq!(
+            tokens[boundary.suffix_start..],
+            tokenizer.encode("tool: tool result<eos>assistant:", false).unwrap()
+        );
         align_prompt(
             &request,
             &mut rendered,
