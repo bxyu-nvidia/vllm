@@ -2075,8 +2075,8 @@ class EngineCoreProc(EngineCore):
                 client_index, outputs = output
                 outputs.engine_index = engine_index
                 if self.capture_runtime is not None:
+                    self.capture_runtime.observe_batch(outputs.outputs)
                     for index, item in enumerate(outputs.outputs):
-                        self.capture_runtime.observe(item)
                         outputs.outputs[index] = self.capture_runtime.wire_output(
                             item, engine_index
                         )

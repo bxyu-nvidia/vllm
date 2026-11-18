@@ -529,3 +529,61 @@ def test_engine_capture_finalization_follows_queued_outputs():
     assert not result.done()
     stored.set_result({"disposition": "staged"})
     assert result.result(5) == {"disposition": "staged"}
+
+
+@pytest.mark.parametrize("fail_output", [False, True])
+def test_engine_capture_batch_preserves_outputs_before_finish_and_finalize(fail_output):
+    from unittest.mock import patch
+
+    from vllm.v1.engine import EngineCoreOutput
+    from vllm.v1.engine.capture_runtime import EngineCapture
+
+    events = []
+
+    class Adapter:
+        def observe(self, output):
+            if fail_output:
+                raise ValueError("bad training output")
+            events.append((output.request_id, output.new_token_ids))
+
+        def finish(self, request_id):
+            events.append(("finish", request_id))
+
+        async def finalize(self, request_id, served_tokens, prefill_key):
+            events.append(("finalize", request_id))
+            return {"disposition": "staged"}
+
+        async def close(self):
+            pass
+
+    runtime = EngineCapture()
+    runtime.adapter = Adapter()
+    runtime._active.update(str(i) for i in range(2048))
+    outputs = [EngineCoreOutput(str(i), [i]) for i in range(2048)]
+    outputs.insert(1, EngineCoreOutput("uncaptured", [99]))
+    try:
+        with patch.object(
+            runtime.loop,
+            "call_soon_threadsafe",
+            wraps=runtime.loop.call_soon_threadsafe,
+        ) as schedule:
+            runtime.observe_batch(outputs)
+            assert schedule.call_count == 1
+            runtime.observe_batch([EngineCoreOutput("uncaptured", [100])])
+            assert schedule.call_count == 1
+        # The caller may replace its list with wire copies immediately.
+        outputs[:] = [EngineCoreOutput("wire", [])]
+        runtime.finish("0")
+        result = runtime.finalize("0", 1, None)
+        if fail_output:
+            with pytest.raises(RuntimeError, match="engine capture failed"):
+                result.result(5)
+            assert not events
+        else:
+            assert result.result(5) == {"disposition": "staged"}
+            assert events == [(str(i), [i]) for i in range(2048)] + [
+                ("finish", "0"),
+                ("finalize", "0"),
+            ]
+    finally:
+        runtime.close()

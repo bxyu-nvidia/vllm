@@ -177,19 +177,29 @@ class EngineCapture:
         )
 
     def observe(self, output: "EngineCoreOutput") -> None:
-        with self._admission_lock:
-            if output.request_id not in self._active:
-                return
+        self.observe_batch([output])
 
-        # CPU arrays are owned by EngineCoreOutput. Retain the object until the
-        # adapter consumes it, before the frontend can request finalization.
+    def observe_batch(self, outputs: list["EngineCoreOutput"]) -> None:
+        """Enqueue one callback per engine batch, before finish/finalize callbacks."""
+        with self._admission_lock:
+            captured = tuple(
+                item for item in outputs if item.request_id in self._active
+            )
+        if not captured:
+            return
+
+        # Keep our own container: the socket thread replaces entries in outputs
+        # with wire copies. The original objects own the training arrays.
         def observe() -> None:
-            try:
-                if self.adapter is not None:
+            for output in captured:
+                try:
                     self._adapter().observe(output)
-            except Exception as error:
-                self.failure = error
-                logger.exception("Engine capture output failed: %s", output.request_id)
+                except Exception as error:
+                    self.failure = error
+                    logger.exception(
+                        "Engine capture output failed: %s", output.request_id
+                    )
+                    return
 
         self.loop.call_soon_threadsafe(observe)
 
