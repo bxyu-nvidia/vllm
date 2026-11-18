@@ -63,8 +63,7 @@ pub async fn chat_completions(
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let stream = body.stream;
-    let engine_capture =
-        body.nemo_rl_capture.as_ref().is_some_and(|context| context.engine_capture);
+    let engine_capture = body.nemo_rl_capture.is_some();
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
     let requested_model = body.model.as_deref().filter(|model| !model.is_empty());
     let lora_resolution = state.resolve_model_with_loras(requested_model).await;

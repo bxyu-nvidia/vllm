@@ -1985,7 +1985,7 @@ class EngineCoreProc(EngineCore):
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         try:
                             capture = req.capture_context
-                            if capture is not None and capture.engine_capture:
+                            if capture is not None:
                                 self._prepare_capture_request(req)
                                 continue
                             request = self.preprocess_add_request(req)

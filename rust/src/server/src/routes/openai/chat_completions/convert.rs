@@ -83,11 +83,7 @@ pub(super) fn prepare_chat_request(
             "nemo_rl_capture is a reserved vllm_xargs key"
         ));
     }
-    let engine_capture = request
-        .nemo_rl_capture
-        .as_ref()
-        .filter(|context| context.engine_capture)
-        .cloned();
+    let engine_capture = request.nemo_rl_capture.clone();
     if engine_capture.is_some() && request.stream {
         return Err(invalid_request!(
             param = Some("stream"),

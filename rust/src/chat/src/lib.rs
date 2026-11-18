@@ -201,9 +201,7 @@ impl ChatRequestProcessor {
         let required_prefix =
             request.required_prefix_token_ids.take().filter(|ids| !ids.is_empty());
         let deferred = capture.as_ref().is_some_and(|ctx| {
-            ctx.engine_capture
-                && ctx.admission.get("prev_len").and_then(serde_json::Value::as_u64).unwrap_or(0)
-                    > 0
+            ctx.admission.get("prev_len").and_then(serde_json::Value::as_u64).unwrap_or(0) > 0
         });
         let alignment = required_prefix
             .or_else(|| deferred.then(Vec::new))

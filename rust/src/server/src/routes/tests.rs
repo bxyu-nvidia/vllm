@@ -636,7 +636,7 @@ async fn test_models_with_engine_outputs_and_backend_inner(
                     .as_ref()
                     .and_then(|p| p.extra_args.as_ref())
                     .and_then(|a| a.get("nemo_rl_capture"));
-                let captured = context.is_some_and(|context| context["engine_capture"] == true);
+                let captured = context.is_some();
                 let mut outputs = engine_outputs_for_request(&request.request_id, output_specs);
                 if captured {
                     for output in &mut outputs.as_request_batch_mut().unwrap().outputs {
@@ -8496,8 +8496,6 @@ async fn chat_prefix_alignment_preserves_engine_and_response_tokens() {
     for (stream, phase, deferred) in [
         (false, None, false),
         (true, None, false),
-        (false, Some("prefill"), false),
-        (false, Some("decode"), false),
         (false, Some("prefill"), true),
         (false, Some("decode"), true),
     ] {
@@ -8510,13 +8508,10 @@ async fn chat_prefix_alignment_preserves_engine_and_response_tokens() {
         };
         expected.extend(bytes_to_token_ids(b"user: next\nassistant:"));
         let expected_engine = expected.clone();
-        let mut context = phase.map(|phase| json!({
+        let context = phase.map(|phase| json!({
             "version": 1, "admission": {"model_call_id": "call-2", "prev_len": prefix.len(), "staging_chain": ["parent-key"]},
             "weight_version": 7, "phase": phase, "top_logprobs": 0, "routed_experts": false,
         }));
-        if deferred {
-            context.as_mut().unwrap()["engine_capture"] = json!(true);
-        }
         let context_engine = context.clone();
         let suffix_start = if deferred {
             rendered_prefix.len()

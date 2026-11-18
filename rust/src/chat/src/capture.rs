@@ -44,8 +44,6 @@ pub struct CaptureContext {
     pub phase: CapturePhase,
     pub top_logprobs: u32,
     pub routed_experts: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub engine_capture: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_key: Option<String>,
     /// Computed by the frontend, never accepted from the HTTP caller.
@@ -82,18 +80,13 @@ pub(crate) fn take_context(
             "capture context requires untruncated text with a completed assistant turn"
         );
     }
-    let prev_len = context.admission.get("prev_len").and_then(Value::as_u64).ok_or_else(|| {
+    context.admission.get("prev_len").and_then(Value::as_u64).ok_or_else(|| {
         invalid_prefix_alignment!("capture admission requires nonnegative prev_len")
     })?;
     let prefix_len = request.required_prefix_token_ids.as_ref().map_or(0, Vec::len);
-    if context.engine_capture && prefix_len != 0 {
+    if prefix_len != 0 {
         bail_invalid_prefix_alignment!(
             "engine capture resolves the parent; omit required_prefix_token_ids"
-        );
-    }
-    if !context.engine_capture && prev_len != prefix_len as u64 {
-        bail_invalid_prefix_alignment!(
-            "capture parent must be resolved into required_prefix_token_ids before engine dispatch"
         );
     }
     Ok(Some(context))
@@ -111,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_or_unresolved_capture_before_engine_dispatch() {
+    fn rejects_unsupported_capture_before_engine_dispatch() {
         let valid = json!({"version":1,"admission":{"prev_len":0},"weight_version":7,"phase":"decode","top_logprobs":0,"routed_experts":false});
         assert!(take_context(&mut request(valid.clone()), false).is_err());
         for (key, value) in [
@@ -119,7 +112,6 @@ mod tests {
             ("weight_version", json!(-1)),
             ("weight_version", json!(true)),
             ("phase", json!("unknown")),
-            ("admission", json!({"prev_len":1})),
             ("admission", json!({"prev_len":true})),
             ("alignment", json!({"suffix_start":0})),
         ] {
@@ -128,10 +120,15 @@ mod tests {
             assert!(take_context(&mut request(invalid), true).is_err(), "{key}");
         }
         let mut deferred = valid.clone();
-        deferred["engine_capture"] = json!(true);
         deferred["admission"] = json!({"prev_len": 5});
         let mut child = request(deferred);
-        assert!(take_context(&mut child, true).unwrap().unwrap().engine_capture);
+        assert_eq!(
+            take_context(&mut child, true).unwrap().unwrap().admission["prev_len"],
+            5
+        );
+        let mut conflicting = request(valid.clone());
+        conflicting.required_prefix_token_ids = Some(vec![1]);
+        assert!(take_context(&mut conflicting, true).is_err());
         let context = take_context(&mut request(valid), true).unwrap().unwrap();
         assert_eq!(context.weight_version, 7);
         assert_eq!(context.alignment, None);

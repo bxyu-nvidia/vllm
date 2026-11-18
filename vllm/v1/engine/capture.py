@@ -34,7 +34,6 @@ class CaptureContext(msgspec.Struct, forbid_unknown_fields=True):  # type: ignor
     top_logprobs: NonNegativeInt
     routed_experts: bool
     alignment: CaptureAlignment | None = None
-    engine_capture: bool = False
     prefill_key: str | None = None
 
 
@@ -70,11 +69,7 @@ def get_capture_context(
 def align_capture_prompt(
     context: CaptureContext, prompt: list[int], prefix: list[int]
 ) -> list[int]:
-    """Splice the exact stored parent before scheduler hashing or KV lookup.
-
-    In engine capture mode the frontend boundary addresses the rendered prompt;
-    otherwise it addresses a prompt that the frontend already aligned.
-    """
+    """Splice the stored parent into the rendered prompt before scheduler hashing."""
     if len(prefix) != context.admission["prev_len"]:
         raise ValueError("stored parent length differs from capture admission")
     if not prefix:
@@ -82,10 +77,6 @@ def align_capture_prompt(
     alignment = context.alignment
     if alignment is None:
         raise ValueError("capture parent requires an alignment boundary")
-    if not context.engine_capture:
-        if prompt[: len(prefix)] != prefix:
-            raise ValueError("prompt differs from the committed capture parent")
-        return prompt
     aligned = list(prefix)
     if prefix[-1] not in alignment.eos_token_ids:
         aligned.append(alignment.turn_end_token_id)

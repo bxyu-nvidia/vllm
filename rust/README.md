@@ -227,12 +227,11 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 #### Engine-local training capture
 
-The optional Python engine capture API accepts `engine_capture: true` in the
-`nemo_rl_capture` context. For a continuation, omit `required_prefix_token_ids`:
-Rust locates the assistant-turn boundary in the rendered prompt and Python
-resolves the exact parent before scheduler block hashing and KV lookup.
-Requests fail if the engine adapter has not been configured. Existing capture
-requests without this field keep their current behavior.
+Managed PD capture uses `nemo_rl_capture` metadata. For a continuation, omit
+`required_prefix_token_ids`: Rust locates the assistant-turn boundary in the
+rendered prompt and Python resolves the exact parent before scheduler block
+hashing and KV lookup. Requests fail if the engine adapter is not configured.
+Ordinary serving can still use `required_prefix_token_ids` without capture.
 
 The per-engine utility methods are:
 
@@ -253,8 +252,8 @@ boundary, and retains the final-token route sentinel used by R3. Storage I/O
 runs outside the GPU scheduler and socket threads. Finalization must target the
 engine that owns the request after its terminal output; it is not a broadcast.
 
-NeMo RL selects this path with `policy.generation.vllm_cfg.pd_services.capture.backend: engine`
-and `VLLM_USE_RUST_FRONTEND=1`. Its SOTA recipe selects it. Startup registers a
+NeMo RL always uses engine capture for managed PD serving and defaults to the
+Rust frontend (`VLLM_USE_RUST_FRONTEND=1`). Startup registers a
 separate TQ prefill partition, configures every engine through the authenticated
 `/nemo_rl/capture/configure` endpoint, and configures the router while admission
 is paused. This mode does not start a standalone HTTP capture server.
@@ -269,5 +268,5 @@ abort and output-queue ordering handle stop strings before finalization.
 unfinalized calls or storage failures prevent a successful refit pause.
 `resume_capture()` reopens it only after a successful drain. The existing Gym
 receipt still means storage acknowledged the row: asynchronous engine I/O does
-not acknowledge a pending write as successfully staged. Legacy HTTP capture
-remains available with `backend: rpc` until its separate removal.
+not acknowledge a pending write as successfully staged. There is no standalone
+capture service or capture backend/process-count setting.

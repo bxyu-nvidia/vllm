@@ -222,7 +222,6 @@ def test_engine_capture_aligns_parent_before_scheduler_hashing(prefix):
         "phase": "prefill",
         "top_logprobs": 0,
         "routed_experts": False,
-        "engine_capture": True,
         "alignment": {
             "suffix_start": 2,
             "turn_end_token_id": 2,
@@ -366,7 +365,6 @@ def test_engine_capture_prepares_exact_prompt_before_block_hashing():
             extra_args={
                 "nemo_rl_capture": {
                     "version": 1,
-                    "engine_capture": True,
                     "admission": {"prev_len": 0},
                     "weight_version": 0,
                     "phase": "decode",
