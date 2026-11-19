@@ -22,6 +22,9 @@ from tests.distributed.aux_output_connector.test_store import (
     _request_metadata,
 )
 from tests.v1.attention.utils import dense_kv_cache_views
+from vllm.distributed.aux_output_connector.mooncake_store import (
+    MooncakeBlockObjectStore,
+)
 from vllm.distributed.aux_output_connector.store import BlockObjectStoreError
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     worker as mooncake_store_worker,
@@ -68,6 +71,13 @@ class _DictStore:
     def register_buffer(self, addr, length):
         return 0
 
+    def put_batch(self, keys, values, config):
+        self._data.update(zip(keys, values, strict=True))
+        return 0
+
+    def get_batch(self, keys):
+        return [self._data.get(key, b"") for key in keys]
+
     def batch_is_exist(self, keys):
         return [1 if k in self._data else 0 for k in keys]
 
@@ -82,6 +92,7 @@ class _DictStore:
 
 def _minimal_vllm_config(cache_block_size=16):
     cfg = MagicMock()
+    cfg.aux_output_config.enabled = False
     cfg.cache_config.block_size = cache_block_size
     cfg.cache_config.num_gpu_blocks = 4
     cfg.cache_config.hash_block_size = None
@@ -295,8 +306,14 @@ def test_e2e_swa_plus_full_save_then_lookup_hits():
     assert worker.lookup(num_tokens=64, block_hashes=hs).hit_length == 0
 
 
-def test_mooncake_kv_restore_does_not_restore_expert_routes() -> None:
-    """Real connector save/load succeeds, but the new engine lacks R3 blocks.
+@pytest.mark.parametrize(
+    "shared_routes,evict_routes", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("is_hma_required", [False, True])
+def test_mooncake_kv_restore_requires_expert_routes(
+    shared_routes, evict_routes, is_hma_required
+) -> None:
+    """Restore exact R3 rows or reject a KV load whose routes were evicted.
 
     CPU tensors stand in for GPU KV pages; the store copies their actual bytes.
     No Mooncake daemon, RDMA, GPU kernel, or R3 compatibility guard is exercised.
@@ -347,6 +364,17 @@ def test_mooncake_kv_restore_does_not_restore_expert_routes() -> None:
     hashes = [BlockHash(b"a" * 32), BlockHash(b"b" * 32)]
     rows = np.arange(9 * np.prod(_SHAPE), dtype=_DTYPE).reshape(9, *_SHAPE)
     producer, consumer = _make_worker(1), _make_worker(1)
+    if shared_routes:
+        for worker in (producer, consumer):
+            worker._store.close()
+            worker._shared_store = MooncakeBlockObjectStore(
+                client=store,
+                replicate_config=None,
+                namespace="r3-model",
+                max_bytes=1 << 20,
+                object_nbytes=_BLOCK_SIZE * int(np.prod(_SHAPE)),
+            )
+            worker._store = worker._shared_store
     try:
         produced = _process_output(
             producer,
@@ -380,6 +408,18 @@ def test_mooncake_kv_restore_does_not_restore_expert_routes() -> None:
         keys = [databases[1].key_for(block_hash) for block_hash in hashes]
         assert store.batch_is_exist(keys) == [1, 1]
 
+        prepare_routes = None
+        if shared_routes:
+            # Exercise the production callback, including hash-boundary selection.
+            kv_worker = object.__new__(mooncake_store_worker.MooncakeStoreWorker)
+            kv_worker.aux_store = consumer._shared_store
+            kv_worker.hash_block_size = _BLOCK_SIZE
+            consumer._shared_store.reserve_prefetch("restored")
+            route_keys = producer._shared_store.keys(hashes)
+            assert store.batch_is_exist(route_keys) == [1, 1]
+            if evict_routes:
+                del store._data[route_keys[-1]]
+            prepare_routes = kv_worker._prepare_aux_output
         recv = KVCacheStoreRecvingThread(
             store=store,
             coord=coord,
@@ -387,6 +427,8 @@ def test_mooncake_kv_restore_does_not_restore_expert_routes() -> None:
             block_size=_BLOCK_SIZE,
             tp_rank=0,
             ready_event=threading.Event(),
+            prepare_aux_output=prepare_routes,
+            is_hma_required=is_hma_required,
         )
         recv.request_queue.put(
             ReqMeta(
@@ -404,11 +446,33 @@ def test_mooncake_kv_restore_does_not_restore_expert_routes() -> None:
         )
         recv._handle_request(recv.request_queue.get_nowait())
         assert recv.get_and_clear_finished_requests() == {"restored"}
+        if evict_routes:
+            assert recv.get_and_clear_block_ids_with_load_errors() == (
+                set() if is_hma_required else {1, 2}
+            )
+            assert recv.get_and_clear_failed_requests() == (
+                {"restored"} if is_hma_required else set()
+            )
+            assert torch.count_nonzero(destination) == 0
+            return
         assert recv.get_and_clear_block_ids_with_load_errors() == set()
         torch.testing.assert_close(destination[1:], source[1:])
         assert torch.count_nonzero(destination[0]) == 0
 
-        # Successful KV restoration must not be mistaken for route availability.
+        if shared_routes:
+            # Once KV restore succeeds, routes survive eviction from Mooncake.
+            for key in route_keys:
+                del store._data[key]
+            restored = _process_output(
+                consumer,
+                _metadata(0, [_request_metadata("restored", 8, 1, 0, hashes)], {}),
+                rows[8:],
+                ["restored"],
+                np.array([0]),
+            )
+            np.testing.assert_array_equal(restored["restored"].rows, rows)
+            return
+        # The local-only backend is a negative control for cross-engine KV reuse.
         with pytest.raises(BlockObjectStoreError, match="does not exist"):
             _process_output(
                 consumer,

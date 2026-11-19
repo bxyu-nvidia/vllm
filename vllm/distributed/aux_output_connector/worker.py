@@ -17,6 +17,9 @@ from vllm.distributed.aux_output_connector.connector import (
     AuxOutputConnectorMetadata,
     AuxRequestOutput,
 )
+from vllm.distributed.aux_output_connector.mooncake_store import (
+    MooncakeBlockObjectStore,
+)
 from vllm.distributed.aux_output_connector.routed_experts import (
     RoutedExpertsBuffer,
     materialize_routed_experts,
@@ -35,6 +38,9 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
+        MooncakeStoreWorker,
+    )
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -100,6 +106,7 @@ class AuxOutputWorkerConnector:
         self._buffer: RoutedExpertsBuffer | None = None
         self._requests: dict[str, _WorkerRequestState] = {}
         self._generation = 0
+        self._shared_store: MooncakeBlockObjectStore | None = None
         self._step_metadata: AuxOutputConnectorMetadata | None = None
         # Steps whose asynchronous copy has not been consumed yet. The engine
         # consumes step outputs in order, so at most max_concurrent_batches
@@ -122,10 +129,42 @@ class AuxOutputWorkerConnector:
         max_bytes = vllm_config.aux_output_config.max_bytes
         if max_bytes is None:
             max_bytes = kv_cache_config.num_blocks * hashes_per_kv_block * block_nbytes
+        store: BlockObjectStore
+        mooncake_worker = _get_mooncake_worker()
+        if mooncake_worker is not None:
+            from vllm.config.utils import hash_factors
+
+            model_config = vllm_config.model_config
+            namespace = hash_factors(
+                {
+                    "format": "routed-experts-v1",
+                    "model": model_config.model,
+                    "revision": model_config.revision,
+                    "dtype": str(model_config.dtype),
+                    "quantization": model_config.quantization,
+                    "shape": shape_per_token,
+                    "route_dtype": dtype.name,
+                    "hash_block_size": hash_block_size,
+                    "cache_prefix": mooncake_worker.aux_cache_prefix,
+                }
+            )
+            store = MooncakeBlockObjectStore(
+                client=mooncake_worker.store,
+                replicate_config=mooncake_worker.store_replicate_config,
+                namespace=namespace,
+                max_bytes=max_bytes,
+                object_nbytes=block_nbytes,
+            )
+            self._shared_store = store
+            mooncake_worker.aux_store = store
+        else:
+            store = BlockObjectStore(max_bytes=max_bytes, object_nbytes=block_nbytes)
         self._store = BackgroundBlockObjectStore(
-            BlockObjectStore(max_bytes=max_bytes, object_nbytes=block_nbytes),
+            store,
             max_pending_batches=2 * vllm_config.scheduler_config.max_num_seqs,
         )
+        if mooncake_worker is not None:
+            mooncake_worker.aux_store_writer = self._store
         self._buffer = RoutedExpertsBuffer(
             dtype,
             shape_per_token,
@@ -361,6 +400,8 @@ class AuxOutputWorkerConnector:
                 self._buffer.reset()
                 self._requests.clear()
                 self._generation = metadata.generation
+                if self._shared_store is not None:
+                    self._shared_store.generation = metadata.generation
             for request_id, emit_start in metadata.requests.items():
                 state = self._requests.setdefault(
                     request_id, _WorkerRequestState(emit_cursor=emit_start)
@@ -377,7 +418,11 @@ class AuxOutputWorkerConnector:
             retained_keys: list[str] = []
             for request_id, block_hashes in metadata.block_hashes.items():
                 state = self._requests[request_id]
-                keys = routed_experts_keys(block_hashes, str(self._generation))
+                keys = (
+                    self._shared_store.keys(list(block_hashes))
+                    if self._shared_store is not None
+                    else routed_experts_keys(block_hashes, str(self._generation))
+                )
                 state.aux_output_keys.extend(keys)
                 retained_keys.extend(keys)
                 block_batches.append((state, []))
@@ -400,6 +445,36 @@ class AuxOutputWorkerConnector:
                     self._store.close()
                 finally:
                     self._store = None
+
+
+def _get_mooncake_worker() -> MooncakeStoreWorker | None:
+    from vllm.distributed.kv_transfer.kv_transfer_state import (
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+    )
+
+    if not has_kv_transfer_group():
+        return None
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import (
+        MooncakeStoreConnector,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiConnector,
+    )
+
+    pending = [get_kv_transfer_group()]
+    workers = []
+    while pending:
+        connector = pending.pop()
+        if isinstance(connector, MultiConnector):
+            pending.extend(connector.sub_connectors)
+        elif isinstance(connector, MooncakeStoreConnector):
+            workers.append(connector.connector_worker)
+    if len(workers) > 1:
+        raise ValueError(
+            "Expert-route storage requires a single MooncakeStoreConnector"
+        )
+    return workers[0] if workers else None
 
 
 def get_aux_output_connector(

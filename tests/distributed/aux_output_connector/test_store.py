@@ -17,6 +17,9 @@ from vllm.distributed.aux_output_connector.connector import (
     AuxRequestOutput,
     PackedBlockHashes,
 )
+from vllm.distributed.aux_output_connector.mooncake_store import (
+    MooncakeBlockObjectStore,
+)
 from vllm.distributed.aux_output_connector.routed_experts import (
     RoutedExpertsBuffer,
     materialize_routed_experts,
@@ -185,6 +188,7 @@ def _make_worker(
     )
     worker._requests = {}
     worker._generation = 0
+    worker._shared_store = None
     worker._step_metadata = None
     worker._pending_outputs = []
     worker._lock = threading.Lock()
@@ -1952,3 +1956,165 @@ def test_scheduler_connector_reset_derives_emit_start_from_request():
     assert metadata.generation == 1
     assert metadata.requests[request.request_id] == 4
     assert list(metadata.block_hashes[request.request_id]) == [b"a" * 32]
+
+
+def _make_shared_route_store(data, *, num_blocks=2):
+    client = Mock()
+
+    def put_batch(keys, values, _config):
+        data.update(zip(keys, values, strict=True))
+        return 0
+
+    client.put_batch.side_effect = put_batch
+    client.get_batch.side_effect = lambda keys: [data.get(key, b"") for key in keys]
+    return MooncakeBlockObjectStore(
+        client=client,
+        replicate_config=None,
+        namespace="model-v1",
+        max_bytes=2 * num_blocks,
+        object_nbytes=2,
+    )
+
+
+def test_shared_routes_restore_after_local_eviction_in_requested_order():
+    data: dict[str, bytes] = {}
+    producer = _make_shared_route_store(data)
+    consumer = _make_shared_route_store(data)
+    try:
+        producer.put([BlockObject("a", b"aa"), BlockObject("b", b"bb")])
+        producer.put([BlockObject("c", b"cc")])
+        assert consumer.get_concatenated(["b", "a", "b"]) == b"bbaabb"
+        consumer.client.get_batch.assert_called_once_with(["b", "a"])
+        assert consumer.get_concatenated(["a"]) == b"aa"
+        assert consumer.client.get_batch.call_count == 1
+    finally:
+        producer.close()
+        consumer.close()
+
+
+def test_route_prefetch_pins_until_request_finishes_or_is_cancelled():
+    data = {"a": b"aa", "b": b"bb"}
+    store = _make_shared_route_store(data)
+    try:
+        store.reserve_prefetch("request")
+        store.prefetch("request", ["a", "b"])
+        data.clear()  # Remote eviction cannot invalidate an admitted KV load.
+        with pytest.raises(BlockObjectStoreError, match="cannot retain"):
+            store.put([BlockObject("c", b"cc")])
+        assert store.get_concatenated(["a", "b"]) == b"aabb"
+        store.release_prefetches(["request"])
+        store.put([BlockObject("c", b"cc")])
+        store.reserve_prefetch("cancelled")
+        store.release_prefetches(["cancelled"])
+        with pytest.raises(BlockObjectStoreError, match="cancelled"):
+            store.prefetch("cancelled", ["b"])
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("payload", [b"", b"x", b"oversized", None])
+def test_route_prefetch_rejects_missing_or_malformed_blocks_without_pin_leak(payload):
+    store = _make_shared_route_store({"a": payload}, num_blocks=1)
+    try:
+        store.reserve_prefetch("request")
+        with pytest.raises(
+            BlockObjectStoreError, match="missing or have an invalid size"
+        ):
+            store.prefetch("request", ["a"])
+        store.put([BlockObject("a", b"aa")])
+        store.put([BlockObject("b", b"bb")])  # Failed load left no pinned slot.
+        assert store.get_concatenated(["b"]) == b"bb"
+    finally:
+        store.close()
+
+
+def test_route_publication_failure_preserves_local_capture():
+    store = _make_shared_route_store({})
+    store.client.put_batch.side_effect = None
+    store.client.put_batch.return_value = -1
+    try:
+        store.put([BlockObject("a", b"aa")])
+        assert store.get_concatenated(["a"]) == b"aa"
+    finally:
+        store.close()
+
+
+def test_worker_automatically_shares_mooncake_client_and_resets_namespace(monkeypatch):
+    from vllm.distributed.aux_output_connector import worker as worker_module
+
+    data: dict[str, bytes] = {}
+    remote = _make_shared_route_store(data)
+    kv_worker = SimpleNamespace(
+        store=remote.client, store_replicate_config=None, aux_cache_prefix="deployment"
+    )
+    monkeypatch.setattr(worker_module, "_get_mooncake_worker", lambda: kv_worker)
+    monkeypatch.setattr(
+        worker_module, "get_tp_group", lambda: SimpleNamespace(is_first_rank=True)
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "RoutedExpertsCapturer",
+        lambda **kwargs: SimpleNamespace(
+            shape_per_token=_SHAPE, output_dtype_name="uint8"
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module, "bind_routed_experts_capturer", lambda *args: None
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "resolve_kv_cache_block_sizes",
+        lambda *args: (_BLOCK_SIZE, _BLOCK_SIZE),
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="r3-model",
+            revision="checkpoint-1",
+            dtype="bfloat16",
+            quantization=None,
+        ),
+        aux_output_config=SimpleNamespace(max_bytes=1 << 20),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=1),
+        max_concurrent_batches=2,
+    )
+    workers = []
+    try:
+        for _ in range(2):
+            workers.append(
+                AuxOutputWorkerConnector(
+                    vllm_config=config,
+                    model=torch.nn.Identity(),
+                    kv_cache_config=SimpleNamespace(num_blocks=8),
+                )
+            )
+        producer, consumer = workers
+        hashes = [b"a" * 32, b"b" * 32]
+        rows = np.arange(9 * np.prod(_SHAPE), dtype=_DTYPE).reshape(9, *_SHAPE)
+        _process_output(
+            producer,
+            _metadata(0, [_request_metadata("p", 0, 8, 0, hashes)], {}),
+            rows[:8],
+            ["p"],
+            np.array([0]),
+        )
+        # Waiting on the existing writer guarantees publication in this test;
+        # production lookup only advertises routes after publication completes.
+        producer._store.get_concatenated(producer._shared_store.keys(hashes))
+        restored = _process_output(
+            consumer,
+            _metadata(0, [_request_metadata("c", 8, 1, 0, hashes)], {}),
+            rows[8:],
+            ["c"],
+            np.array([0]),
+        )
+        np.testing.assert_array_equal(restored["c"].rows, rows)
+        assert kv_worker.aux_store is consumer._shared_store
+        assert kv_worker.aux_store_writer is consumer._store
+        old_keys = consumer._shared_store.keys(hashes)
+        consumer.begin_step(_metadata(1, [], {}).metadata)
+        assert consumer._shared_store.keys(hashes) != old_keys
+        assert all(key in data for key in old_keys)
+    finally:
+        for worker in workers:
+            worker.close()
+        remote.close()
