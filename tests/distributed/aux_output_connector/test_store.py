@@ -590,6 +590,93 @@ def test_worker_data_plane_publishes_blocks_and_reuses_prefix():
     worker.close()
 
 
+@pytest.mark.parametrize("reuse_worker", [True, False], ids=["local", "remote"])
+def test_prefix_routes_are_available_only_on_the_worker_that_computed_them(
+    reuse_worker: bool,
+) -> None:
+    """Identical KV hashes do not move auxiliary rows to a different engine."""
+    producer = _make_worker(1)
+    consumer = producer if reuse_worker else _make_worker(1)
+    hashes = [b"a" * 32, b"b" * 32]
+    rows = np.arange(9 * np.prod(_SHAPE), dtype=_DTYPE).reshape(9, *_SHAPE)
+    try:
+        produced = _process_output(
+            producer,
+            _metadata(0, [_request_metadata("producer", 0, 8, 0, hashes)], {}),
+            rows[:8],
+            ["producer"],
+            np.array([0]),
+        )
+        np.testing.assert_array_equal(produced["producer"].rows, rows[:8])
+        _begin_step(producer, _metadata(0, [], {"producer": []}))
+
+        # KV reuse skips the first eight tokens, but this request still needs
+        # their routes. Only model execution is mocked by _process_output.
+        expected = (
+            nullcontext()
+            if reuse_worker
+            else pytest.raises(BlockObjectStoreError, match="does not exist")
+        )
+        with expected:
+            output = _process_output(
+                consumer,
+                _metadata(0, [_request_metadata("consumer", 8, 1, 0, hashes)], {}),
+                rows[8:],
+                ["consumer"],
+                np.array([0]),
+            )
+            np.testing.assert_array_equal(output["consumer"].rows, rows)
+    finally:
+        if consumer is not producer:
+            consumer.close()
+        producer.close()
+
+
+@pytest.mark.parametrize("boundary", [4, 5, 7, 8])
+def test_pd_handoff_without_aux_transfer_requires_hash_aligned_start(
+    boundary: int,
+) -> None:
+    """Even suffix-only capture needs an existing tail at sub-block handoffs."""
+    producer, consumer = _make_worker(1), _make_worker(1)
+    hashes = [b"a" * 32, b"b" * 32]
+    rows = np.arange(9 * np.prod(_SHAPE), dtype=_DTYPE).reshape(9, *_SHAPE)
+    try:
+        _process_output(
+            producer,
+            _metadata(0, [_request_metadata("prefill", 0, 9, 0, hashes)], {}),
+            rows,
+            ["prefill"],
+            np.array([0]),
+        )
+        _begin_step(producer, _metadata(0, [], {"prefill": []}))
+        expected = (
+            pytest.raises(AssertionError, match="capture is not contiguous")
+            if boundary % _BLOCK_SIZE
+            else nullcontext()
+        )
+        with expected:
+            output = _process_output(
+                consumer,
+                _metadata(
+                    0,
+                    [
+                        _request_metadata(
+                            "decode", boundary, 9 - boundary, boundary, hashes
+                        )
+                    ],
+                    {},
+                ),
+                rows[boundary:],
+                ["decode"],
+                np.array([0]),
+            )
+            assert output["decode"].token_start == boundary
+            np.testing.assert_array_equal(output["decode"].rows, rows[boundary:])
+    finally:
+        producer.close()
+        consumer.close()
+
+
 def test_worker_matches_kv_eviction_order_after_requests_finish():
     worker = _make_worker(2, max_store_blocks=3)
     hashes = [bytes([value]) * 32 for value in range(5)]

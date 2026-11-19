@@ -8,9 +8,21 @@ import threading
 import types
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import pytest
 import torch
 
+from tests.distributed.aux_output_connector.test_store import (
+    _BLOCK_SIZE,
+    _DTYPE,
+    _SHAPE,
+    _make_worker,
+    _metadata,
+    _process_output,
+    _request_metadata,
+)
 from tests.v1.attention.utils import dense_kv_cache_views
+from vllm.distributed.aux_output_connector.store import BlockObjectStoreError
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
     worker as mooncake_store_worker,
 )
@@ -281,6 +293,133 @@ def test_e2e_swa_plus_full_save_then_lookup_hits():
     # (the pre-fix arithmetic clamp would have returned 48 and livelocked
     # on load failure -> recompute -> same lookup).
     assert worker.lookup(num_tokens=64, block_hashes=hs).hit_length == 0
+
+
+def test_mooncake_kv_restore_does_not_restore_expert_routes() -> None:
+    """Real connector save/load succeeds, but the new engine lacks R3 blocks.
+
+    CPU tensors stand in for GPU KV pages; the store copies their actual bytes.
+    No Mooncake daemon, RDMA, GPU kernel, or R3 compatibility guard is exercised.
+    """
+    spec = FullAttentionSpec(
+        block_size=_BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+    coord = MooncakeStoreCoordinator(
+        [KVCacheGroupSpec(["attention"], spec)], _BLOCK_SIZE, _BLOCK_SIZE
+    )
+    source = torch.arange(3 * spec.page_size_bytes, dtype=torch.uint8).reshape(3, -1)
+    destination = torch.zeros_like(source)
+    buffers = {
+        block.data_ptr(): block for cache in (source, destination) for block in cache
+    }
+
+    class CopyingStore(_DictStore):
+        def batch_put_from_multi_buffers(self, keys, addrs, sizes, *_args, **_kwargs):
+            for key, addresses, lengths in zip(keys, addrs, sizes, strict=True):
+                self._data[key] = b"".join(
+                    bytes(buffers[addr][:size].numpy())
+                    for addr, size in zip(addresses, lengths, strict=True)
+                )
+            return [0] * len(keys)
+
+        def batch_get_into_multi_buffers(self, keys, addrs, sizes, *_args, **_kwargs):
+            for key, addresses, lengths in zip(keys, addrs, sizes, strict=True):
+                payload = self._data[key]
+                offset = 0
+                for addr, size in zip(addresses, lengths, strict=True):
+                    buffers[addr][:size].copy_(
+                        torch.frombuffer(
+                            bytearray(payload[offset : offset + size]),
+                            dtype=torch.uint8,
+                        )
+                    )
+                    offset += size
+                assert offset == len(payload)
+            return [0] * len(keys)
+
+    store = CopyingStore()
+    databases = []
+    for cache in (source, destination):
+        db = ChunkedTokenDatabase(KeyMetadata("r3-model", 0, 0, 0, 0), _BLOCK_SIZE)
+        db.set_kv_caches_base_addr([cache.data_ptr()])
+        db.set_block_len([spec.page_size_bytes])
+        databases.append(db)
+    hashes = [BlockHash(b"a" * 32), BlockHash(b"b" * 32)]
+    rows = np.arange(9 * np.prod(_SHAPE), dtype=_DTYPE).reshape(9, *_SHAPE)
+    producer, consumer = _make_worker(1), _make_worker(1)
+    try:
+        produced = _process_output(
+            producer,
+            _metadata(0, [_request_metadata("prefill", 0, 8, 0, hashes)], {}),
+            rows[:8],
+            ["prefill"],
+            np.array([0]),
+        )
+        np.testing.assert_array_equal(produced["prefill"].rows, rows[:8])
+        send = KVCacheStoreSendingThread(
+            store=store,
+            coord=coord,
+            token_databases=[databases[0]],
+            block_size=_BLOCK_SIZE,
+            tp_rank=0,
+            group_put_steps=[1],
+            kv_role="kv_producer",
+            ready_event=threading.Event(),
+        )
+        send.add_request(
+            ReqMeta(
+                req_id="prefill",
+                token_len_chunk=8,
+                block_ids=([1, 2],),
+                block_hashes=hashes,
+                can_save=True,
+                store_job_id=1,
+            )
+        )
+        send._handle_request(send.request_queue.get_nowait())
+        keys = [databases[1].key_for(block_hash) for block_hash in hashes]
+        assert store.batch_is_exist(keys) == [1, 1]
+
+        recv = KVCacheStoreRecvingThread(
+            store=store,
+            coord=coord,
+            token_databases=[databases[1]],
+            block_size=_BLOCK_SIZE,
+            tp_rank=0,
+            ready_event=threading.Event(),
+        )
+        recv.request_queue.put(
+            ReqMeta(
+                req_id="restored",
+                token_len_chunk=8,
+                block_ids=([1, 2],),
+                block_hashes=hashes,
+                load_spec=LoadSpec(
+                    vllm_cached_tokens=0,
+                    kvpool_cached_tokens=8,
+                    can_load=True,
+                    token_len=8,
+                ),
+            )
+        )
+        recv._handle_request(recv.request_queue.get_nowait())
+        assert recv.get_and_clear_finished_requests() == {"restored"}
+        assert recv.get_and_clear_block_ids_with_load_errors() == set()
+        torch.testing.assert_close(destination[1:], source[1:])
+        assert torch.count_nonzero(destination[0]) == 0
+
+        # Successful KV restoration must not be mistaken for route availability.
+        with pytest.raises(BlockObjectStoreError, match="does not exist"):
+            _process_output(
+                consumer,
+                _metadata(0, [_request_metadata("restored", 8, 1, 0, hashes)], {}),
+                rows[8:],
+                ["restored"],
+                np.array([0]),
+            )
+    finally:
+        producer.close()
+        consumer.close()
 
 
 def test_recv_skips_swa_blocks_before_window():
