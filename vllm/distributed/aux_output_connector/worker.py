@@ -49,6 +49,9 @@ if TYPE_CHECKING:
 class _WorkerRequestState:
     aux_output_keys: list[str] = field(default_factory=list)
     pending_blocks: list[tuple[int, np.ndarray]] = field(default_factory=list)
+    # A NIXL handoff can begin inside a hash block. Keep only its locally
+    # computed suffix; never publish it as a complete reusable block.
+    leading_rows: AuxRequestOutput | None = None
     capture_cursor: int | None = None
     scheduled_cursor: int = 0
     emit_cursor: int = 0
@@ -102,6 +105,7 @@ class AuxOutputWorkerConnector:
         )
         bind_routed_experts_capturer(model, capturer)
         self._capturer = capturer
+        self._use_capture_handoff = vllm_config.aux_output_config.use_capture_handoff
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
         self._requests: dict[str, _WorkerRequestState] = {}
@@ -283,7 +287,7 @@ class AuxOutputWorkerConnector:
 
             emit_start = state.emit_cursor
             # Complete blocks without keys remain pending until a hash update.
-            completed = buffer.capture(request_id, capture_start, rows)
+            completed = self._capture_rows(request_id, state, capture_start, rows)
             token_end = capture_start + len(rows)
             state.capture_cursor = token_end
             state.scheduled_cursor = token_start + request_num_tokens
@@ -303,28 +307,97 @@ class AuxOutputWorkerConnector:
 
         for request_id, emit_start, token_end in materialize_outputs:
             state = self._requests[request_id]
-            stored_end = (
-                min(token_end // block_size, len(state.aux_output_keys)) * block_size
-            )
-            if emit_start < stored_end:
-                first_block = emit_start // block_size
-                stored = materialize_routed_experts(
-                    store,
-                    state.aux_output_keys[first_block : stored_end // block_size],
-                    shape_per_token=buffer.shape_per_token,
-                    dtype=buffer.dtype,
-                )
-                local_start = emit_start % block_size
-                rows = stored[local_start : local_start + stored_end - emit_start]
-                if stored_end < token_end:
-                    rows = np.concatenate(
-                        (rows, buffer.read(request_id, stored_end, token_end))
+            parts = []
+            token_start = emit_start
+            leading = state.leading_rows
+            if leading is not None and emit_start < leading.token_start + len(
+                leading.rows
+            ):
+                if emit_start < leading.token_start:
+                    parts.append(
+                        self._read_rows(request_id, emit_start, leading.token_start)
                     )
-            else:
-                rows = buffer.read(request_id, emit_start, token_end)
-            outputs[request_id] = AuxRequestOutput(emit_start, rows)
+                    emit_start = leading.token_start
+                leading_end = min(token_end, leading.token_start + len(leading.rows))
+                parts.append(
+                    leading.rows[
+                        emit_start - leading.token_start : leading_end
+                        - leading.token_start
+                    ]
+                )
+                emit_start = leading_end
+            if emit_start < token_end:
+                parts.append(self._read_rows(request_id, emit_start, token_end))
+            outputs[request_id] = AuxRequestOutput(
+                token_start, parts[0] if len(parts) == 1 else np.concatenate(parts)
+            )
             state.emit_cursor = token_end
+        for request_id in outputs:
+            state = self._requests[request_id]
+            leading = state.leading_rows
+            if leading is not None:
+                block_end = (leading.token_start // block_size + 1) * block_size
+                if state.emit_cursor >= block_end:
+                    state.leading_rows = None
         return outputs
+
+    def _capture_rows(
+        self,
+        request_id: str,
+        state: _WorkerRequestState,
+        token_start: int,
+        rows: np.ndarray,
+    ) -> list[tuple[int, np.ndarray]]:
+        buffer = self._buffer
+        assert buffer is not None
+        if (
+            self._use_capture_handoff
+            and state.capture_cursor is None
+            and token_start % buffer.block_size
+        ):
+            state.leading_rows = AuxRequestOutput(token_start, rows[:0])
+        leading = state.leading_rows
+        count = 0
+        if leading is not None:
+            block_end = (
+                leading.token_start // buffer.block_size + 1
+            ) * buffer.block_size
+            count = max(0, min(block_end - token_start, len(rows)))
+            if count:
+                assert token_start == leading.token_start + len(leading.rows), (
+                    "auxiliary output handoff suffix is not contiguous"
+                )
+                leading.rows = np.concatenate((leading.rows, rows[:count]))
+        return buffer.capture(request_id, token_start + count, rows[count:])
+
+    def _read_rows(
+        self, request_id: str, token_start: int, token_end: int
+    ) -> np.ndarray:
+        buffer, store = self._buffer, self._store
+        assert buffer is not None and store is not None
+        state = self._requests[request_id]
+        block_size = buffer.block_size
+        emit_start = token_start
+        stored_end = (
+            min(token_end // block_size, len(state.aux_output_keys)) * block_size
+        )
+        if emit_start < stored_end:
+            first_block = emit_start // block_size
+            stored = materialize_routed_experts(
+                store,
+                state.aux_output_keys[first_block : stored_end // block_size],
+                shape_per_token=buffer.shape_per_token,
+                dtype=buffer.dtype,
+            )
+            local_start = emit_start % block_size
+            rows = stored[local_start : local_start + stored_end - emit_start]
+            if stored_end < token_end:
+                rows = np.concatenate(
+                    (rows, buffer.read(request_id, stored_end, token_end))
+                )
+        else:
+            rows = buffer.read(request_id, emit_start, token_end)
+        return rows
 
     def _publish_blocks(
         self,

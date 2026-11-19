@@ -423,7 +423,9 @@ class NixlBaseConnectorScheduler:
             and not request.get_skip_reading_prefix_cache()
         ):
             if request.prompt_token_ids is not None:
-                del request.prompt_token_ids[-backoff:]
+                # Capture retains the full aligned prompt for the RL handoff.
+                # Scheduler truncation must not mutate that shared input list.
+                request.prompt_token_ids = request.prompt_token_ids[:-backoff]
             elif request.prompt_embeds is not None:
                 request.prompt_embeds = request.prompt_embeds[:-backoff]
             else:

@@ -7,9 +7,12 @@ The optional engine adapter resolves parents and stages native outputs. Ordinary
 serving does not import any RL or TransferQueue dependency.
 """
 
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import msgspec
+
+if TYPE_CHECKING:
+    from vllm.v1.engine import EngineCoreRequest
 
 CAPTURE_CONTEXT_KEY = "nemo_rl_capture"
 NonNegativeInt = Annotated[int, msgspec.Meta(ge=0)]
@@ -82,3 +85,38 @@ def align_capture_prompt(
         aligned.append(alignment.turn_end_token_id)
     aligned.extend(prompt[alignment.suffix_start :])
     return aligned
+
+
+def validate_capture_handoff(request: "EngineCoreRequest") -> None:
+    """Validate the adapter's route boundary before NIXL scheduler admission."""
+    params = request.sampling_params
+    raw_context = (params.extra_args or {}).get(CAPTURE_CONTEXT_KEY) if params else None
+    # The adapter has replaced the rendered prefix with exact parent tokens.
+    # Its original alignment boundary no longer indexes the prepared prompt.
+    context = msgspec.convert(raw_context, CaptureContext) if raw_context else None
+    prompt = request.prompt_token_ids
+    if context is None or not context.routed_experts or params is None or not prompt:
+        raise ValueError("use_capture_handoff requires managed routed-experts capture")
+    previous = context.admission.get("prev_len")
+    if type(previous) is not int or previous < 0:
+        raise ValueError("capture admission requires nonnegative prev_len")
+    if previous > len(prompt):
+        raise ValueError("capture parent exceeds the aligned prompt")
+    start = max(previous - 1, 0)
+    transfer = (params.extra_args or {}).get("kv_transfer_params") or {}
+    if context.phase == "decode":
+        remote = transfer.get("remote_num_tokens")
+        if (
+            not context.prefill_key
+            or not transfer.get("do_remote_prefill")
+            or type(remote) is not int
+            or not 0 <= remote <= len(prompt)
+        ):
+            raise ValueError("decode capture requires an acknowledged prefill handoff")
+        start = max(start, min(remote, len(prompt) - 1))
+    elif not transfer.get("do_remote_decode") or transfer.get("do_remote_prefill"):
+        raise ValueError("prefill capture requires a NIXL producer request")
+    if params.routed_experts_prompt_start != start:
+        raise ValueError(
+            "capture route start differs from the prepared handoff boundary"
+        )

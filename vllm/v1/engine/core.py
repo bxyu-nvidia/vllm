@@ -78,6 +78,7 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.capture import validate_capture_handoff
 from vllm.v1.engine.capture_runtime import EngineCapture
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
@@ -1096,6 +1097,12 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        if self.vllm_config.aux_output_config.use_capture_handoff:
+            if self.capture_runtime is None:
+                raise RuntimeError(
+                    "use_capture_handoff requires a configured capture adapter"
+                )
+            validate_capture_handoff(request)
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.

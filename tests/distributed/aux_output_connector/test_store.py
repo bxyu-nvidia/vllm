@@ -189,6 +189,7 @@ def _make_worker(
     worker._requests = {}
     worker._generation = 0
     worker._shared_store = None
+    worker._use_capture_handoff = False
     worker._step_metadata = None
     worker._pending_outputs = []
     worker._lock = threading.Lock()
@@ -637,11 +638,14 @@ def test_prefix_routes_are_available_only_on_the_worker_that_computed_them(
 
 
 @pytest.mark.parametrize("boundary", [4, 5, 7, 8])
-def test_pd_handoff_without_aux_transfer_requires_hash_aligned_start(
+@pytest.mark.parametrize("capture_handoff", [False, True])
+def test_pd_handoff_returns_suffix_without_caching_incomplete_blocks(
     boundary: int,
+    capture_handoff: bool,
 ) -> None:
-    """Even suffix-only capture needs an existing tail at sub-block handoffs."""
+    """Only the capture handoff supports a cold, sub-block decode start."""
     producer, consumer = _make_worker(1), _make_worker(1)
+    consumer._use_capture_handoff = capture_handoff
     hashes = [b"a" * 32, b"b" * 32]
     rows = np.arange(9 * np.prod(_SHAPE), dtype=_DTYPE).reshape(9, *_SHAPE)
     try:
@@ -655,7 +659,7 @@ def test_pd_handoff_without_aux_transfer_requires_hash_aligned_start(
         _begin_step(producer, _metadata(0, [], {"prefill": []}))
         expected = (
             pytest.raises(AssertionError, match="capture is not contiguous")
-            if boundary % _BLOCK_SIZE
+            if boundary % _BLOCK_SIZE and not capture_handoff
             else nullcontext()
         )
         with expected:
@@ -676,6 +680,12 @@ def test_pd_handoff_without_aux_transfer_requires_hash_aligned_start(
             )
             assert output["decode"].token_start == boundary
             np.testing.assert_array_equal(output["decode"].rows, rows[boundary:])
+            if boundary % _BLOCK_SIZE:
+                key = consumer._requests["decode"].aux_output_keys[
+                    boundary // _BLOCK_SIZE
+                ]
+                with pytest.raises(BlockObjectStoreError, match="does not exist"):
+                    consumer._store.get_concatenated([key])
     finally:
         producer.close()
         consumer.close()
@@ -2073,7 +2083,7 @@ def test_worker_automatically_shares_mooncake_client_and_resets_namespace(monkey
             dtype="bfloat16",
             quantization=None,
         ),
-        aux_output_config=SimpleNamespace(max_bytes=1 << 20),
+        aux_output_config=SimpleNamespace(max_bytes=1 << 20, use_capture_handoff=False),
         scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=1),
         max_concurrent_batches=2,
     )
@@ -2118,3 +2128,49 @@ def test_worker_automatically_shares_mooncake_client_and_resets_namespace(monkey
         for worker in workers:
             worker.close()
         remote.close()
+
+
+@pytest.mark.parametrize("first_sample", [False, True])
+def test_capture_handoff_accumulates_partial_block_across_steps(first_sample):
+    worker = _make_worker(1)
+    worker._use_capture_handoff = True
+    hashes = [bytes([i]) * 32 for i in range(4)]
+    rows = np.arange(15 * np.prod(_SHAPE), dtype=_DTYPE).reshape(15, *_SHAPE)
+    emitted = []
+    cursor = 5
+    try:
+        for start, end, sample, rejected in [
+            (5, 6, first_sample, 0),
+            (6, 12, False, 0),
+            (12, 15, True, 1),
+        ]:
+            output = _process_output(
+                worker,
+                _metadata(
+                    0,
+                    [_request_metadata("decode", start, end - start, cursor, hashes)],
+                    {},
+                ),
+                rows[start:end],
+                ["decode"],
+                np.array([rejected]),
+                np.array([int(sample)]),
+            )
+            if sample:
+                assert output["decode"].token_start == cursor
+                emitted.append(output["decode"].rows)
+                cursor += len(emitted[-1])
+            else:
+                assert output == {}
+        np.testing.assert_array_equal(np.concatenate(emitted), rows[5:14])
+        keys = worker._requests["decode"].aux_output_keys
+        with pytest.raises(BlockObjectStoreError, match="does not exist"):
+            worker._store.get_concatenated([keys[1]])
+        assert worker._store.get_concatenated([keys[2]]) == rows[8:12].tobytes()
+        assert worker._requests["decode"].leading_rows is None
+        _begin_step(worker, _metadata(0, [], {"decode": []}))
+        assert not worker._requests
+        assert not worker._buffer._requests
+        assert not worker._buffer._owned_slots
+    finally:
+        worker.close()

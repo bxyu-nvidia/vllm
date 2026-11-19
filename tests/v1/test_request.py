@@ -352,7 +352,8 @@ def test_engine_capture_prepares_exact_prompt_before_block_hashing():
     engine.mm_receiver_cache = None
     engine.input_queue = queue.Queue()
     engine.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(max_model_len=8, logprobs_mode="raw_logprobs")
+        model_config=SimpleNamespace(max_model_len=8, logprobs_mode="raw_logprobs"),
+        aux_output_config=SimpleNamespace(use_capture_handoff=False),
     )
     seen = []
 
@@ -656,3 +657,135 @@ def test_pending_capture_returns_before_cpu_work_and_preserves_completion_barrie
             runtime.resolve_result(ticket).result(5)
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+@pytest.mark.parametrize("remote", [0, 2, 4])
+def test_capture_handoff_checks_prepared_route_boundary(phase, remote):
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.capture import CaptureContext, validate_capture_handoff
+
+    context = CaptureContext(
+        version=1,
+        admission={"prev_len": 2},
+        weight_version=0,
+        phase=phase,
+        top_logprobs=0,
+        routed_experts=True,
+        prefill_key="prefill-key" if phase == "decode" else None,
+    )
+    transfer = {
+        "do_remote_prefill": phase == "decode",
+        "do_remote_decode": phase == "prefill",
+        "remote_num_tokens": remote,
+    }
+    params = SamplingParams(
+        routed_experts_prompt_start=max(1, min(remote, 3)) if phase == "decode" else 1,
+        extra_args={
+            "kv_transfer_params": transfer,
+            "nemo_rl_capture": msgspec.to_builtins(context),
+        },
+    )
+    request = SimpleNamespace(sampling_params=params, prompt_token_ids=[1, 2, 3, 4])
+    validate_capture_handoff(request)
+    params.routed_experts_prompt_start += 1
+    with pytest.raises(ValueError, match="handoff boundary"):
+        validate_capture_handoff(request)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["context", "routes", "prefill_key", "remote_num_tokens", "do_remote_prefill"],
+)
+def test_capture_handoff_rejects_incomplete_decode_metadata(missing):
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.capture import CaptureContext, validate_capture_handoff
+
+    context = CaptureContext(
+        version=1,
+        admission={"prev_len": 0},
+        weight_version=0,
+        phase="decode",
+        top_logprobs=0,
+        routed_experts=True,
+        prefill_key="key",
+    )
+    transfer = {"do_remote_prefill": True, "remote_num_tokens": 2}
+    if missing == "context":
+        context = None
+    elif missing == "routes":
+        context.routed_experts = False
+    elif missing == "prefill_key":
+        context.prefill_key = None
+    else:
+        del transfer[missing]
+    request = SimpleNamespace(
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(
+            routed_experts_prompt_start=2,
+            extra_args={
+                "kv_transfer_params": transfer,
+                "nemo_rl_capture": msgspec.to_builtins(context),
+            },
+        ),
+    )
+    with pytest.raises(ValueError, match="requires"):
+        validate_capture_handoff(request)
+
+
+def test_engine_rejects_handoff_without_configured_adapter_before_scheduling():
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.core import EngineCore
+
+    engine = object.__new__(EngineCore)
+    engine.vllm_config = SimpleNamespace(
+        aux_output_config=SimpleNamespace(use_capture_handoff=True)
+    )
+    engine.capture_runtime = None
+    with pytest.raises(RuntimeError, match="configured capture adapter"):
+        engine.preprocess_add_request(None)
+    engine.capture_runtime = object()
+    with pytest.raises(ValueError, match="managed routed-experts"):
+        engine.preprocess_add_request(
+            SimpleNamespace(
+                capture_context=None, sampling_params=None, prompt_token_ids=[1]
+            )
+        )
+
+
+@pytest.mark.parametrize("backoff", [1, 4])
+def test_nixl_prefill_truncation_preserves_capture_prompt(backoff):
+    from types import SimpleNamespace
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
+        NixlBaseConnectorScheduler,
+    )
+
+    prompt = list(range(11))
+    core_request = EngineCoreRequest(
+        request_id="prefill",
+        prompt_token_ids=prompt,
+        mm_features=None,
+        sampling_params=SamplingParams(
+            max_tokens=1, extra_args={"kv_transfer_params": {"do_remote_decode": True}}
+        ),
+        pooling_params=None,
+        arrival_time=0.0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    scheduled = Request.from_engine_core_request(core_request, block_hasher=None)
+    scheduler = SimpleNamespace(_prefill_backoff=lambda: backoff)
+    NixlBaseConnectorScheduler._truncate_request_for_prefill(scheduler, scheduled)
+    assert scheduled.prompt_token_ids == list(range(11 - backoff))
+    assert scheduled.num_prompt_tokens == 11 - backoff
+    assert list(scheduled.all_token_ids) == scheduled.prompt_token_ids
+    assert core_request.prompt_token_ids == list(range(11))
+    assert prompt == list(range(11))
+    # Re-admission must not truncate it twice.
+    NixlBaseConnectorScheduler._truncate_request_for_prefill(scheduler, scheduled)
+    assert scheduled.num_prompt_tokens == 11 - backoff
