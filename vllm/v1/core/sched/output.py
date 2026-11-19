@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+import vllm.envs as envs
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.multimodal.utils import strip_covered_mm_data
 
@@ -54,6 +55,13 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    # VLLM_SKIP_COMPUTED_PROMPT_TOKENS: whether the copy sent to the workers may
+    # leave out prompt_token_ids and the computed prefix of prefill_token_ids.
+    # The two fields after it are set only in that copy (see __getstate__).
+    drop_computed_tokens_when_sent: bool = False
+    num_prompt_tokens: int | None = None
+    # Position of prefill_token_ids[0] in the request's token sequence.
+    prefill_token_ids_start: int = 0
 
     @classmethod
     def from_request(
@@ -63,6 +71,23 @@ class NewRequestData:
         prefill_token_ids: list[int] | None = None,
         uses_mrope: bool = False,
     ) -> "NewRequestData":
+        # The v2 workers read prefill tokens only from num_computed_tokens on,
+        # unless the request needs earlier tokens for penalties, bad words,
+        # prompt logprobs, multimodal positions or prompt embeddings.
+        sp = request.sampling_params
+        drop_computed_tokens_when_sent = (
+            envs.VLLM_SKIP_COMPUTED_PROMPT_TOKENS
+            and prefill_token_ids is not None
+            and not uses_mrope
+            and not request.mm_features
+            and request.prompt_embeds is None
+            and sp is not None
+            and sp.prompt_logprobs is None
+            and not sp.bad_words
+            and sp.repetition_penalty == 1.0
+            and sp.frequency_penalty == 0.0
+            and sp.presence_penalty == 0.0
+        )
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -80,10 +105,30 @@ class NewRequestData:
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
             replay_start=request.replay_start,
+            drop_computed_tokens_when_sent=drop_computed_tokens_when_sent,
         )
+
+    def __getstate__(self) -> dict:
+        # Pickling is how the scheduler output reaches the worker processes.
+        # A long multi-turn prompt is mostly computed already (prefix cache or
+        # KV transfer), so sending only its uncomputed tail saves pickling,
+        # unpickling and staging tens of thousands of token ids per request,
+        # while this process keeps the full lists for the KV connectors.
+        state = self.__dict__.copy()
+        if self.drop_computed_tokens_when_sent:
+            assert self.prompt_token_ids is not None
+            assert self.prefill_token_ids is not None
+            start = self.num_computed_tokens
+            state["prompt_token_ids"] = None
+            state["num_prompt_tokens"] = len(self.prompt_token_ids)
+            state["prefill_token_ids"] = self.prefill_token_ids[start:]
+            state["prefill_token_ids_start"] = start
+        return state
 
     @property
     def prompt_len(self) -> int:
+        if self.num_prompt_tokens is not None:
+            return self.num_prompt_tokens
         if self.prompt_token_ids is not None:
             return len(self.prompt_token_ids)
         if self.prompt_embeds is not None:
