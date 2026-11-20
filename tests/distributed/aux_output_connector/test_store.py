@@ -35,6 +35,9 @@ from vllm.distributed.aux_output_connector.store import (
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
 )
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+)
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.gpu import async_utils
@@ -430,6 +433,70 @@ def test_worker_ignores_cudagraph_query_padding():
     np.testing.assert_array_equal(output["first"].rows, logical[:1])
     np.testing.assert_array_equal(output["second"].rows, logical[1:])
     worker.close()
+
+
+def test_mtp_mixed_acceptance_keeps_only_target_routes() -> None:
+    """Five drafts per request, rejection rollback, batch reorder and graph padding.
+
+    Model math is omitted: this exercises the real snapshot, acceptance filtering,
+    request cursors and block buffering using identifiable target-route rows.
+    """
+    worker = _make_worker(3, max_num_batched_tokens=24)
+    capturer = RoutedExpertsCapturer.__new__(RoutedExpertsCapturer)
+    capturer.device_buffer = torch.empty((24, *_SHAPE), dtype=torch.int32)
+    capturer.output_dtype = torch.uint8
+    worker._capturer = capturer
+    logical = {
+        name: np.arange(12 * 6, dtype=np.uint8).reshape(12, *_SHAPE) + i * 75
+        for i, name in enumerate(("none", "some", "all"))
+    }
+    cursors = dict.fromkeys(logical, 0)
+    emitted: dict[str, list[np.ndarray]] = {name: [] for name in logical}
+    try:
+        for step, (names, accepted) in enumerate(
+            [(["none", "some", "all"], [0, 2, 5]), (["all", "none", "some"], [0, 5, 2])]
+        ):
+            # Rejected positions, graph padding and the subsequent draft forward
+            # use poison values absent from the accepted target rows.
+            capturer.device_buffer.fill_(250)
+            expected = {}
+            for index, (name, count) in enumerate(zip(names, accepted)):
+                start = cursors[name]
+                rows = logical[name][start : start + count + 1]
+                capturer.device_buffer[index * 6 : index * 6 + len(rows)] = (
+                    torch.from_numpy(rows)
+                )
+                expected[name] = rows.copy()
+            metadata = _metadata(
+                0,
+                [
+                    _request_metadata(name, step * 6, 6, cursors[name], [])
+                    for name in names
+                ],
+                {},
+            )
+            worker.begin_step(metadata.metadata)
+            pending = worker.prepare_output(
+                _input_batch(names, np.full(3, step * 6), np.array([0, 6, 12, 18, 24]))
+            )
+            assert pending is not None
+            # The target snapshot must remain stable across another forward.
+            capturer.device_buffer.fill_(251)
+            pending.enqueue_cpu_copy(np.array(accepted) + 1, 5 - np.array(accepted))
+            output = pending.process_output()
+            assert set(output) == set(names)
+            for name in names:
+                assert output[name].token_start == cursors[name]
+                np.testing.assert_array_equal(output[name].rows, expected[name])
+                emitted[name].append(output[name].rows.copy())
+                cursors[name] += len(expected[name])
+                assert worker._requests[name].capture_cursor == cursors[name]
+        for name in logical:
+            np.testing.assert_array_equal(
+                np.concatenate(emitted[name]), logical[name][: cursors[name]]
+            )
+    finally:
+        worker.close()
 
 
 def test_worker_rejects_scheduler_emit_cursor_ahead():

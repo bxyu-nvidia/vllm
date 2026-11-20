@@ -7,6 +7,7 @@ import sys
 import time
 import weakref
 from datetime import timedelta
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -476,9 +477,16 @@ def test_ipc_prefetch_preserves_weights_with_idle_and_unequal_workers(
 def _moe_worker(rank, path, backend, merge_free, nvfp4=False, gated=False, refit=False):
     from tests.kernels.moe.utils import make_dummy_moe_config
     from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.forward_context import set_forward_context
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        RoutedExpertsCapturer,
+    )
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+        FusedTopKRouter,
+    )
     from vllm.model_executor.model_loader.reload.layerwise import (
         finalize_layerwise_reload,
         initialize_layerwise_reload,
@@ -510,7 +518,23 @@ def _moe_worker(rank, path, backend, merge_free, nvfp4=False, gated=False, refit
     intermediate = 512 if nvfp4 else 256
     sharded: list[RoutedExperts] = []
     baselines: list[RoutedExperts] = []
-    with set_current_vllm_config(VllmConfig()), torch.device(device):
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config), torch.device(device):
+        capturer = RoutedExpertsCapturer(
+            128,
+            SimpleNamespace(
+                model_config=SimpleNamespace(
+                    get_total_num_hidden_layers=lambda: 4,
+                    get_num_experts=lambda: num_experts,
+                    get_num_experts_per_tok=lambda: 2,
+                    hf_text_config=SimpleNamespace(model_type="nemotron_h"),
+                ),
+                parallel_config=vllm_config.parallel_config,
+            ),
+        )
+        router = FusedTopKRouter(
+            top_k=2, global_num_experts=num_experts, scoring_func="sigmoid"
+        )
         for layer_id in range(4):
             torch.manual_seed(42 + layer_id)
             full_w13 = (
@@ -609,12 +633,40 @@ def _moe_worker(rank, path, backend, merge_free, nvfp4=False, gated=False, refit
                     )
         for tokens in [1, 17, 65, 1]:
             x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
-            ids = (torch.arange(tokens * 2).view(tokens, 2) % num_experts).int()
-            scores = torch.full((tokens, 2), 0.5, dtype=torch.float32)
-            for actual, baseline in zip(sharded, baselines):
-                expected = baseline.forward_modular(x.clone(), scores, ids)
-                result = actual.forward_modular(x.clone(), scores, ids)
+            # Every token uses one expert from each owner, including uneven
+            # NVFP4 shards. Captured IDs must stay global after buffer reuse.
+            split = expert_range(num_experts, 0, 2)[1]
+            token = torch.arange(tokens)
+            planted = torch.stack(
+                (token % split, split + token % (num_experts - split)), dim=1
+            )
+            logits = torch.full((tokens, num_experts), -4.0)
+            logits.scatter_(1, planted[:, :1], 4.0)
+            logits.scatter_(1, planted[:, 1:], 3.0)
+            capturer.device_buffer.fill_(-1)
+            for layer_id, (actual, baseline) in enumerate(zip(sharded, baselines)):
+                with set_forward_context(None, vllm_config):
+                    router.set_capture_fn(None)
+                    scores, ids = router.select_experts(x, logits)
+                    expected = baseline.forward_modular(x.clone(), scores, ids)
+                    uncaptured = actual.forward_modular(x.clone(), scores, ids).clone()
+                    router.set_capture_fn(partial(capturer.capture, layer_id))
+                    captured_scores, captured_ids = router.select_experts(x, logits)
+                    result = actual.forward_modular(
+                        x.clone(), captured_scores, captured_ids
+                    )
                 torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                torch.testing.assert_close(result, uncaptured, rtol=0, atol=0)
+                torch.testing.assert_close(captured_scores, scores, rtol=0, atol=0)
+                torch.testing.assert_close(captured_ids, ids, rtol=0, atol=0)
+                torch.testing.assert_close(ids.long(), planted, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    capturer.snapshot_routing_data(tokens)[:, layer_id].int(),
+                    ids,
+                    rtol=0,
+                    atol=0,
+                )
+            assert (capturer.device_buffer[tokens:] == -1).all()
         if refit:
             pointers = [
                 {name: param.data_ptr() for name, param in layer.named_parameters()}
