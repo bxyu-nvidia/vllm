@@ -314,6 +314,9 @@ def test_engine_capture_utility_waits_for_storage_ack():
             await self.release.wait()
             return {"disposition": "staged", "served_tokens": served_tokens}
 
+        async def drain(self, *, release_transients=False):
+            pass
+
         async def close(self):
             pass
 
@@ -439,6 +442,9 @@ def test_engine_capture_drain_waits_for_write_and_blocks_new_admission(cancel_ca
             entered.set()
             await release.wait()
             return {"disposition": "staged"}
+
+        async def drain(self, *, release_transients=False):
+            pass
 
         async def close(self):
             pass
@@ -611,6 +617,9 @@ def test_pending_capture_returns_before_cpu_work_and_preserves_completion_barrie
             if fail_write:
                 raise OSError("TQ rejected capture")
             return {"disposition": "staged", "served_tokens": served_tokens}
+
+        async def drain(self, *, release_transients=False):
+            pass
 
         async def close(self):
             pass
@@ -789,3 +798,64 @@ def test_nixl_prefill_truncation_preserves_capture_prompt(backoff):
     # Re-admission must not truncate it twice.
     NixlBaseConnectorScheduler._truncate_request_for_prefill(scheduler, scheduled)
     assert scheduled.num_prompt_tokens == 11 - backoff
+
+
+@pytest.mark.parametrize("fail_cleanup", [False, True])
+def test_capture_drain_awaits_actor_cleanup_and_preserves_pending_receipts(
+    fail_cleanup,
+):
+    import asyncio
+    import threading
+
+    from vllm.v1.engine.capture_runtime import EngineCapture
+
+    entered, release = threading.Event(), threading.Event()
+
+    class Adapter:
+        async def finalize(self, *args):
+            return {"disposition": "staged", "staging_key": "record"}
+
+        async def drain(self, *, release_transients=False):
+            entered.set()
+            await asyncio.to_thread(release.wait)
+            if fail_cleanup:
+                raise OSError("actor cleanup failed")
+
+        async def close(self):
+            pass
+
+    runtime = EngineCapture()
+    runtime.adapter = Adapter()
+    runtime.result_url = "http://engine/result"
+    runtime._active.add("call")
+    runtime._metadata["call"] = {
+        "phase": "decode",
+        "rollout_id": "r",
+        "model_call_id": "c",
+    }
+    try:
+        receipt = runtime.finalize("call", 1, "prefill").result(5)
+        ticket = receipt["resolve_url"].rsplit("/", 1)[1]
+        drain = runtime.drain(release_transients=True)
+        assert entered.wait(5)
+        assert not drain.done()
+        with pytest.raises(RuntimeError, match="undrained"):
+            runtime.resume()
+        release.set()
+        if fail_cleanup:
+            with pytest.raises(OSError, match="actor cleanup failed"):
+                drain.result(5)
+            with pytest.raises(RuntimeError, match="failed capture"):
+                runtime.resume()
+        else:
+            assert drain.result(5) is True
+            runtime.resume()
+        assert runtime.resolve_result(ticket).result(5) == {
+            "disposition": "staged",
+            "staging_key": "record",
+        }
+        assert runtime.release_result(ticket).result(5)
+        assert not runtime.results
+    finally:
+        release.set()
+        runtime.close()

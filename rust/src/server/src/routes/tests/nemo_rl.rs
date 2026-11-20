@@ -97,6 +97,7 @@ async fn pd_refit_authenticates_and_resets_connector_before_acknowledging() {
                 ])),
                 ("reset_prefix_cache", json!([false, true]), json!(true)),
                 ("reset_encoder_cache", json!([]), json!(null)),
+                ("collective_rpc", json!(["pd_clear_aux_cache", null, [], null]), json!([true, true])),
             ] {
                 let msg = recv_engine_message(dealer).await;
                 let payload = decode_value(&msg[1]).unwrap();
@@ -163,6 +164,27 @@ async fn pd_refit_forwards_the_training_protocol_and_rejects_partial_updates() {
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
         (
+            json!({"operation": "drain_caches"}),
+            "collective_rpc",
+            json!(["pd_drain_caches", null, [], null]),
+            json!([true, true]),
+            StatusCode::OK,
+        ),
+        (
+            json!({"operation": "pause"}),
+            "drain_capture",
+            json!([]),
+            json!(false),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            json!({"operation": "resume"}),
+            "resume_capture",
+            json!([]),
+            json!(false),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
             json!({"operation": "pause"}),
             "pause_scheduler",
             json!(["wait", false]),
@@ -188,6 +210,7 @@ async fn pd_refit_forwards_the_training_protocol_and_rejects_partial_updates() {
                 let mut calls = vec![("collective_rpc", json!(["pd_capture_metadata", null, [], null]), metadata)];
                 if method == "pause_scheduler" || (method == "collective_rpc" && args[0] == "update_weights_from_collective") { calls.push(("drain_capture", json!([]), json!(true))); }
                 if method == "resume_scheduler" { calls.push(("resume_capture", json!([]), json!(true))); }
+                if method == "collective_rpc" && args[0] == "pd_drain_caches" { calls.push(("drain_capture", json!([true]), json!(true))); }
                 calls.push((method, args, result));
                 for (method, args, result) in calls {
                     let msg = recv_engine_message(dealer).await;

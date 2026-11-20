@@ -1838,9 +1838,11 @@ class EngineCoreProc(EngineCore):
             raise RuntimeError("engine capture is not configured")
         return self.capture_runtime.release_result(ticket)
 
-    def drain_capture(self) -> Future | bool:
-        """Drain capture before any policy mutation, including pending writes."""
-        return self.capture_runtime.drain() if self.capture_runtime else True
+    def drain_capture(self, release_transients: bool = False) -> Future | bool:
+        """Drain capture; reclaim fragments only after the fleet drain barrier."""
+        if self.capture_runtime is None:
+            return True
+        return self.capture_runtime.drain(release_transients=release_transients)
 
     def resume_capture(self) -> bool:
         if self.capture_runtime is not None:

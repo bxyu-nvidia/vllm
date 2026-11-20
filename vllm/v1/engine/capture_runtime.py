@@ -35,6 +35,8 @@ class CaptureAdapter(Protocol):
 
     def discard(self, request_id: str) -> None: ...
 
+    async def drain(self, *, release_transients: bool = False) -> None: ...
+
     async def close(self) -> None: ...
 
     def render_metrics(self) -> str: ...
@@ -53,6 +55,7 @@ class EngineCapture:
         self.result_url: str | None = None
         self._metadata: dict[str, dict[str, Any]] = {}
         self._closed_admission = False
+        self._drained = False
         self._admission_lock = threading.Lock()
         self._preparing: set[str] = set()
         self._active: set[str] = set()
@@ -294,21 +297,37 @@ class EngineCapture:
 
         self.loop.call_soon_threadsafe(finish)
 
-    def drain(self) -> Future:
-        """Close admission and wait for storage; unresolved calls block refit."""
+    def drain(self, *, release_transients: bool = False) -> Future:
+        """Drain storage and actor cleanup before refit.
+
+        Reclaim P/D fragments only after every engine has drained: another
+        engine may still need a fragment to complete its background write.
+        Completed receipts and training records survive both barriers.
+        """
         with self._admission_lock:
             self._closed_admission = True
+            self._drained = False
 
         async def drain() -> bool:
-            await asyncio.gather(*list(self.pending.values()))
-            await asyncio.gather(*list(self.writes.values()))
-            self._adapter()
-            with self._admission_lock:
-                if self._active:
-                    raise RuntimeError(
-                        f"cannot refit with {len(self._active)} unfinalized captures"
+            try:
+                for tasks in (self.pending, self.writes):
+                    await asyncio.gather(
+                        *(asyncio.shield(task) for task in list(tasks.values()))
                     )
-            return True
+                adapter = self._adapter()
+                with self._admission_lock:
+                    if self._active:
+                        raise RuntimeError(
+                            f"cannot refit with {len(self._active)} "
+                            "unfinalized captures"
+                        )
+                await adapter.drain(release_transients=release_transients)
+                with self._admission_lock:
+                    self._drained = True
+                return True
+            except Exception as error:
+                self.failure = error
+                raise
 
         return asyncio.run_coroutine_threadsafe(drain(), self.loop)
 
@@ -316,7 +335,7 @@ class EngineCapture:
         if self.failure is not None:
             raise RuntimeError("cannot resume failed capture") from self.failure
         with self._admission_lock:
-            if self._active:
+            if self._active or (self._closed_admission and not self._drained):
                 raise RuntimeError("cannot resume undrained capture")
             self._closed_admission = False
 

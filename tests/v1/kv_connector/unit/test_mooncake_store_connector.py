@@ -930,95 +930,51 @@ def test_reset_cache_scheduler_role_clears_local_state():
     assert conn._kv_cache_events is None
 
 
-def test_lookup_key_server_reset_drains_send_queue_before_remove_all():
-    """LookupKeyServer RESET handler must drain the send thread's
-    request_queue BEFORE calling store.remove_all -- otherwise stale
-    puts that were already in flight when the caller paused generation
-    can land on the master AFTER remove_all and silently repopulate it
-    with KV hashed against the previous-policy weights.
-    """
-    # Exercise the handler logic directly with mocks for the send thread
-    # and store. We assert (a) join() is called, (b) remove_all is called,
-    # and (c) join() comes BEFORE remove_all in the call order. The full
-    # LookupKeyServer is heavy (binds a real ZMQ REP socket), so we drive
-    # just the dispatch branch here via a stub equivalent.
-    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
-        protocol,
-    )
+@pytest.mark.parametrize("has_sender", [False, True])
+@pytest.mark.parametrize("failure", [None, "routes", "remove", "negative_status"])
+def test_store_reset_drains_kv_and_routes_before_invalidation(has_sender, failure):
+    # Call the real reset method: a late route put must not repopulate a reset
+    # namespace, and failure must not be reported as a successful invalidation.
+    instance = object.__new__(worker.MooncakeStoreWorker)
+    events = []
 
-    call_order: list[str] = []
+    def step(name):
+        def call(*args, **kwargs):
+            events.append(name)
+            if failure == name:
+                raise RuntimeError("injected " + name)
+            return -1 if failure == "negative_status" and name == "remove" else 0
 
-    fake_send_queue = MagicMock()
-    fake_send_queue.join.side_effect = lambda: call_order.append("join")
+        return call
 
-    fake_store = MagicMock()
-    fake_store.remove_all.side_effect = lambda force: call_order.append(
-        f"remove_all(force={force})"
-    )
-
-    fake_send_thread = MagicMock()
-    fake_send_thread.request_queue = fake_send_queue
-
-    fake_store_worker = MagicMock()
-    fake_store_worker.kv_send_thread = fake_send_thread
-    fake_store_worker.store = fake_store
-
-    fake_socket = MagicMock()
-    sent: list[bytes] = []
-    fake_socket.send.side_effect = lambda frame: sent.append(frame)
-
-    # Mirror the body of LookupKeyServer.process_request RESET_MSG branch.
-    # Keeping this inline (instead of importing the closure) keeps the
-    # test independent of the live thread lifecycle.
-    msg_type = protocol.RESET_MSG
-    if msg_type == protocol.RESET_MSG:
-        try:
-            if fake_store_worker.kv_send_thread is not None:
-                fake_store_worker.kv_send_thread.request_queue.join()
-            fake_store_worker.store.remove_all(force=True)
-            fake_socket.send(protocol.RESP_OK)
-        except Exception:
-            fake_socket.send(protocol.RESP_ERR)
-
-    # Drain must happen before remove_all.
-    assert call_order == ["join", "remove_all(force=True)"]
-    # Worker reported success.
-    assert sent == [protocol.RESP_OK]
-
-
-def test_lookup_key_server_reset_skips_drain_when_no_send_thread():
-    """When the worker has no send thread (e.g. consumer-only role
-    configurations), the RESET handler must still call remove_all
-    instead of dereferencing a None send thread.
-    """
-    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store import (
-        protocol,
-    )
-
-    call_order: list[str] = []
-    fake_store = MagicMock()
-    fake_store.remove_all.side_effect = lambda force: call_order.append("remove_all")
-
-    fake_store_worker = MagicMock()
-    fake_store_worker.kv_send_thread = None
-    fake_store_worker.store = fake_store
-
-    fake_socket = MagicMock()
-    sent: list[bytes] = []
-    fake_socket.send.side_effect = lambda frame: sent.append(frame)
-
-    msg_type = protocol.RESET_MSG
-    if msg_type == protocol.RESET_MSG:
-        try:
-            if fake_store_worker.kv_send_thread is not None:
-                fake_store_worker.kv_send_thread.request_queue.join()
-            fake_store_worker.store.remove_all(force=True)
-            fake_socket.send(protocol.RESP_OK)
-        except Exception:
-            fake_socket.send(protocol.RESP_ERR)
-
-    assert call_order == ["remove_all"]
-    assert sent == [protocol.RESP_OK]
+    instance.recv_request_queue = MagicMock()
+    instance.recv_request_queue.join.side_effect = step("receive")
+    instance.kv_send_thread = MagicMock() if has_sender else None
+    if has_sender:
+        instance.kv_send_thread.request_queue.join.side_effect = step("send")
+    instance.aux_store_writer = MagicMock()
+    instance.aux_store_writer.drain.side_effect = step("routes")
+    instance.aux_store = MagicMock()
+    instance.aux_store.clear.side_effect = step("local")
+    instance.store = MagicMock()
+    instance.store.remove_all.side_effect = step("remove")
+    expected = [
+        "receive",
+        *(["send"] if has_sender else []),
+        "routes",
+        "remove",
+        "local",
+    ]
+    if failure:
+        with pytest.raises(RuntimeError, match="injected|status -1"):
+            instance.reset_store()
+        last = "remove" if failure == "negative_status" else failure
+        assert events == expected[: expected.index(last) + 1]
+    else:
+        instance.reset_store()
+        instance.store.remove_all.assert_called_once_with(force=True)
+        assert events == expected
+    instance.store = None  # The test does not own a live transfer engine.
 
 
 def test_shutdown_closes_worker_store():

@@ -442,6 +442,20 @@ class AuxOutputWorkerConnector:
                 buffer.release_block(rows)
             buffer.discard(request_id)
 
+    def drain(self) -> None:
+        """Require consumed GPU snapshots and completed route publication."""
+        with self._lock:
+            if self._pending_outputs:
+                raise RuntimeError("cannot refit with auxiliary output in flight")
+            if self._store is not None:
+                self._store.drain()
+
+    def clear_cached_outputs(self) -> None:
+        """Clear routes alongside KV, preserving releases until the next step."""
+        self.drain()
+        if self._store is not None:
+            self._store.clear()
+
     def begin_step(self, metadata: AuxOutputConnectorMetadata | None) -> None:
         """Apply one scheduler step's request and block-hash updates.
 
@@ -474,7 +488,9 @@ class AuxOutputWorkerConnector:
                 self._requests.clear()
                 self._generation = metadata.generation
                 if self._shared_store is not None:
-                    self._shared_store.generation = metadata.generation
+                    assert self._store is not None
+                    self._store.drain()
+                    self._shared_store.clear()
             for request_id, emit_start in metadata.requests.items():
                 state = self._requests.setdefault(
                     request_id, _WorkerRequestState(emit_cursor=emit_start)

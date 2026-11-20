@@ -2333,6 +2333,27 @@ class MooncakeStoreWorker:
     def group_tp_replication_factors(self) -> tuple[int, ...]:
         return self._group_tp_replication_factors
 
+    def drain_cache_operations(self) -> None:
+        """Drain this worker before any fleet member resets shared KV/routes.
+
+        The caller must pause admission on the entire fleet first. Draining
+        only the rank handling RESET cannot prevent another rank's late puts.
+        """
+        self.recv_request_queue.join()
+        if self.kv_send_thread is not None:
+            self.kv_send_thread.request_queue.join()
+        if self.aux_store_writer is not None:
+            self.aux_store_writer.drain()
+
+    def reset_store(self) -> None:
+        """Invalidate shared KV/routes and this worker's local route copies."""
+        self.drain_cache_operations()
+        removed = self.store.remove_all(force=True)
+        if removed < 0:
+            raise RuntimeError(f"Mooncake remove_all failed with status {removed}")
+        if self.aux_store is not None:
+            self.aux_store.clear()
+
     def close(self) -> None:
         """Release the MooncakeDistributedStore handle on teardown.
 
@@ -2421,9 +2442,7 @@ class LookupKeyServer:
                         # otherwise stale puts can repopulate it post-reset.
                         # Safe across HMA: store.remove_all wipes the underlying
                         # flat key space, clearing every (group_id, hash) entry.
-                        if self.store_worker.kv_send_thread is not None:
-                            self.store_worker.kv_send_thread.request_queue.join()
-                        self.store_worker.store.remove_all(force=True)
+                        self.store_worker.reset_store()
                         logger.info("Mooncake store reset via remove_all succeeded.")
                         self.socket.send(RESP_OK)
                     except Exception as e:

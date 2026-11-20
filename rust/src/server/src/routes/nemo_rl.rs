@@ -212,6 +212,7 @@ enum RefitRequest {
         refit_timeout_s: f64,
     },
     Pause {},
+    DrainCaches {},
     Resume {},
     Reset {},
 }
@@ -245,6 +246,21 @@ fn check_acknowledgments(
     }
     if require_true && results.iter().flatten().any(|value| value != &Value::Bool(true)) {
         return Err(server_error!("PD refit failed on one or more GPU workers"));
+    }
+    Ok(())
+}
+
+async fn capture_barrier(
+    client: &EngineCoreClient,
+    method: &str,
+    args: Value,
+) -> Result<(), ApiError> {
+    let results: Vec<bool> = client
+        .call_utility(method, args)
+        .await
+        .map_err(|error| utility_call_error(method, error))?;
+    if results.len() != client.engine_count() || results.iter().any(|result| !result) {
+        return Err(server_error!("PD {method} failed on one or more engines"));
     }
     Ok(())
 }
@@ -292,10 +308,7 @@ async fn refit(
                     Some("refit_timeout_s"),
                 ));
             }
-            client
-                .call_utility::<bool, _>("drain_capture", ())
-                .await
-                .map_err(|error| utility_call_error("drain_capture", error))?;
+            capture_barrier(client, "drain_capture", json!([])).await?;
             collective(
                 client,
                 workers,
@@ -306,10 +319,7 @@ async fn refit(
             .await?;
         }
         RefitRequest::Pause {} => {
-            client
-                .call_utility::<bool, _>("drain_capture", ())
-                .await
-                .map_err(|error| utility_call_error("drain_capture", error))?;
+            capture_barrier(client, "drain_capture", json!([])).await?;
             client
                 .pause_scheduler(
                     vllm_engine_core_client::protocol::utility::PauseMode::Wait,
@@ -318,11 +328,12 @@ async fn refit(
                 .await
                 .map_err(|error| utility_call_error("pause_scheduler", error))?;
         }
+        RefitRequest::DrainCaches {} => {
+            capture_barrier(client, "drain_capture", json!([true])).await?;
+            collective(client, workers, "pd_drain_caches", json!([]), true).await?;
+        }
         RefitRequest::Resume {} => {
-            client
-                .call_utility::<bool, _>("resume_capture", ())
-                .await
-                .map_err(|error| utility_call_error("resume_capture", error))?;
+            capture_barrier(client, "resume_capture", json!([])).await?;
             client
                 .resume_scheduler()
                 .await
@@ -342,6 +353,7 @@ async fn refit(
                 .call_utility::<(), _>("reset_encoder_cache", ())
                 .await
                 .map_err(|error| utility_call_error("reset_encoder_cache", error))?;
+            collective(client, workers, "pd_clear_aux_cache", json!([]), true).await?;
         }
     }
     Ok(Json(json!({"ok": true})))

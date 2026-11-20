@@ -2116,7 +2116,7 @@ def test_route_publication_failure_preserves_local_capture():
         store.close()
 
 
-def test_worker_automatically_shares_mooncake_client_and_resets_namespace(monkeypatch):
+def test_worker_local_reset_preserves_shared_mooncake_namespace(monkeypatch):
     from vllm.distributed.aux_output_connector import worker as worker_module
 
     data: dict[str, bytes] = {}
@@ -2189,8 +2189,19 @@ def test_worker_automatically_shares_mooncake_client_and_resets_namespace(monkey
         assert kv_worker.aux_store_writer is consumer._store
         old_keys = consumer._shared_store.keys(hashes)
         consumer.begin_step(_metadata(1, [], {}).metadata)
-        assert consumer._shared_store.keys(hashes) != old_keys
+        assert consumer._shared_store.keys(hashes) == old_keys
         assert all(key in data for key in old_keys)
+        # A different local reset count must still resolve the producer's KV
+        # and its matching routes; local copies were discarded by the reset.
+        assert not consumer._shared_store._lru
+        assert consumer._store.get_concatenated(old_keys) == rows[:8].tobytes()
+        consumer.drain()
+        data.clear()  # The coordinated hard reset clears the shared KV/store.
+        consumer.clear_cached_outputs()
+        with pytest.raises(BlockObjectStoreError, match="missing"):
+            consumer._store.get_concatenated(old_keys)
+        # A delayed request release after invalidation must remain valid.
+        consumer.begin_step(_metadata(2, [], {}).metadata)
     finally:
         for worker in workers:
             worker.close()
@@ -2241,3 +2252,50 @@ def test_capture_handoff_accumulates_partial_block_across_steps(first_sample):
         assert not worker._buffer._owned_slots
     finally:
         worker.close()
+
+
+def test_background_store_drain_is_a_publication_barrier():
+    from concurrent.futures import ThreadPoolExecutor
+
+    started, release = threading.Event(), threading.Event()
+    underlying = Mock()
+
+    def put(*args, **kwargs):
+        started.set()
+        assert release.wait(5)
+
+    underlying.put.side_effect = put
+    store = BackgroundBlockObjectStore(underlying, max_pending_batches=1)
+    pool = ThreadPoolExecutor(1)
+    try:
+        store.put([BlockObject("key", b"payload")])
+        assert started.wait(5)
+        drain = pool.submit(store.drain)
+        assert not drain.done()
+        underlying.clear.assert_not_called()
+        release.set()
+        drain.result(5)
+        store.clear()
+        underlying.clear.assert_called_once_with()
+    finally:
+        release.set()
+        store.close()
+        pool.shutdown()
+
+
+def test_route_cache_reset_preserves_delayed_release_and_replaces_payload():
+    store = _make_shared_route_store({})
+    try:
+        store.put([BlockObject("a", b"aa")], retain_keys=["a"])
+        store.reserve_prefetch("r")
+        store.prefetch("r", ["a"])
+        store.clear()
+        assert not store._prefetches
+        assert not store._lru
+        # The request's metadata release follows the scheduler generation bump.
+        store.put([], release_keys=["a"])
+        assert not store._references
+        store.put([BlockObject("a", b"bb")])
+        assert store.get_concatenated(["a"]) == b"bb"
+    finally:
+        store.close()

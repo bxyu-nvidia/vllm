@@ -37,12 +37,13 @@ class MooncakeBlockObjectStore(BlockObjectStore):
         self.client = client
         self.replicate_config = replicate_config
         self.namespace = namespace
-        self.generation = 0
         self._lock = RLock()
         self._prefetches: dict[str, tuple[str, ...]] = {}
 
     def keys(self, hashes: Sequence[bytes]) -> list[str]:
-        return routed_experts_keys(hashes, f"{self.namespace}/{self.generation}")
+        # Local prefix resets can differ between P/D engines. Shared routes
+        # follow the shared KV namespace, not an engine-local reset counter.
+        return routed_experts_keys(hashes, f"{self.namespace}/0")
 
     def put(
         self,
@@ -123,6 +124,12 @@ class MooncakeBlockObjectStore(BlockObjectStore):
         with self._lock:
             for request_id in request_ids:
                 self._release(self._prefetches.pop(request_id, ()))
+
+    def clear(self) -> None:
+        """Discard local copies after draining publishers and KV receivers."""
+        with self._lock:
+            self.release_prefetches(list(self._prefetches))
+            super().clear()
 
     def close(self) -> None:
         with self._lock:
