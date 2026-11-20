@@ -251,7 +251,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
 
     def process_weights_after_loading(self, layer: "RoutedExperts") -> None:
-        if layer.dwdp_manager is not None and layer.dwdp_manager.initialized:
+        if (
+            layer.dwdp_manager is not None
+            and layer.dwdp_manager.initialized
+            and not layer.dwdp_manager.refitting
+        ):
             raise RuntimeError("DWDP source weights are immutable after initialization")
         super().process_weights_after_loading(layer)
 

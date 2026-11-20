@@ -378,6 +378,13 @@ async fn harmony_assistant_event_stream(
                 }
 
                 if let Some(finished) = finished {
+                    if !finished.routed_experts.is_empty() {
+                        y.yield_ok(AssistantEvent::RoutedExperts {
+                            chunks: finished.routed_experts,
+                            dropped_tokens: finished.dropped_tokens,
+                        })
+                        .await;
+                    }
                     y.yield_ok(AssistantEvent::Done {
                         usage: finished.usage.into(),
                         finish_reason: finished.finish_reason,

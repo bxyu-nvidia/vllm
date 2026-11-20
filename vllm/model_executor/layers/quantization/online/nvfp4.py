@@ -205,7 +205,11 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
         return self.activation_quant_key == kNvfp4DynamicToken
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        if layer.dwdp_manager is not None and layer.dwdp_manager.initialized:
+        if (
+            layer.dwdp_manager is not None
+            and layer.dwdp_manager.initialized
+            and not layer.dwdp_manager.refitting
+        ):
             raise RuntimeError("Cannot reload immutable DWDP expert weights")
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
@@ -297,8 +301,17 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
             for index, name in enumerate(metadata_names, 4):
                 # Profiling starts only after manager initialization. Unit input
                 # scales also make the precomputed kernel transforms well-defined.
-                replicated[index].fill_(1.0)
+                if not layer.dwdp_manager.refitting:
+                    replicated[index].fill_(1.0)
                 replace_parameter(layer, name, replicated[index].view(-1))
+            if layer.dwdp_manager.refitting:
+                # Keep the kernel's resident views on the IPC-exported storage.
+                resident = layer.dwdp_manager.local_weights(layer.layer_name)
+                for name, tensor in zip(
+                    ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+                    resident[:4],
+                ):
+                    replace_parameter(layer, name, tensor)
             w13_scale_2 = layer.w13_weight_scale_2
             w2_scale_2 = layer.w2_weight_scale_2
 
@@ -323,6 +336,26 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
             self.moe_quant_config.g2_alphas.copy_(w2_scale_2)
 
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
+    def finalize_weight_reload(self, layer: RoutedExperts) -> None:
+        """Refresh derived tensors after storage restoration and DWDP replication."""
+        from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+            TrtLlmNvFp4ExpertsBase,
+        )
+
+        assert self.moe_quant_config is not None and self.moe_kernel is not None
+        experts = self.moe_kernel.fused_experts
+        if not isinstance(experts, TrtLlmNvFp4ExpertsBase):
+            raise NotImplementedError(
+                "Online NVFP4 refit requires FlashInfer Prims or TRTLLM experts"
+            )
+        quant = self.moe_quant_config
+        quant._w1.scale = layer.w13_weight_scale
+        quant._w2.scale = layer.w2_weight_scale
+        assert quant.g1_alphas is not None and quant.g2_alphas is not None
+        quant.g1_alphas.copy_(layer.w13_weight_scale_2)
+        quant.g2_alphas.copy_(layer.w2_weight_scale_2)
+        experts.refresh_after_weight_reload(layer)
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
         return make_nvfp4_moe_quant_config(

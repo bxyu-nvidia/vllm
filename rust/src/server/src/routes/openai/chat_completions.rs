@@ -63,6 +63,7 @@ pub async fn chat_completions(
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let stream = body.stream;
+    let engine_capture = body.nemo_rl_capture.is_some();
     let request_context = resolve_request_context(&headers, body.request_id.as_deref());
     let requested_model = body.model.as_deref().filter(|model| !model.is_empty());
     let lora_resolution = state.resolve_model_with_loras(requested_model).await;
@@ -101,7 +102,7 @@ pub async fn chat_completions(
 
         sse_response(sse_stream, api_server_options.sse_keep_alive_interval)
     } else {
-        let response = match collect_chat_completion(
+        let mut response = match collect_chat_completion(
             chat_stream,
             prepared.request_id,
             prepared.response_model,
@@ -116,8 +117,88 @@ pub async fn chat_completions(
             Err(error) => return error.into_response(),
         };
 
+        if engine_capture {
+            return match finalize_engine_capture(&state, &mut response).await {
+                Ok(receipt) => {
+                    let mut value =
+                        serde_json::to_value(response).expect("chat response is serializable");
+                    if let Some(coords) = receipt.get("ng_commit_coords") {
+                        value["ng_commit_coords"] = coords.clone();
+                    }
+                    Json(value).into_response()
+                }
+                Err(error) => error.into_response(),
+            };
+        }
         Json(response).into_response()
     }
+}
+
+async fn finalize_engine_capture(
+    state: &AppState,
+    response: &mut ChatCompletionResponse,
+) -> Result<Value, ApiError> {
+    // Exact training IDs are owned by Python; rendered IDs must not be exposed
+    // as if they were the aligned engine prompt.
+    response.prompt_token_ids = None;
+    for choice in &mut response.choices {
+        choice.token_ids = None;
+    }
+    let params = response
+        .kv_transfer_params
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| server_error!("engine capture output lacks coordination metadata"))?;
+    let context = params
+        .remove("__nemo_rl_capture")
+        .ok_or_else(|| server_error!("engine capture output lacks owner"))?;
+    let request_id = context["request_id"]
+        .as_str()
+        .ok_or_else(|| server_error!("invalid capture request ID"))?;
+    let engine = context["engine_index"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| server_error!("invalid capture engine index"))?;
+    let prefill = context["phase"] == "prefill";
+    let usage = response.usage.as_mut().ok_or_else(|| server_error!("capture requires usage"))?;
+    let count = if prefill {
+        0
+    } else {
+        usage.completion_tokens.unwrap_or(0)
+    };
+    let timing = vllm_metrics::METRICS.api_server.record_capture_finalize(if prefill {
+        "prefill"
+    } else {
+        "decode"
+    });
+    let receipt: Value = state
+        .engine_core_client()
+        .call_utility_on(
+            engine,
+            "finalize_capture",
+            (
+                request_id,
+                count,
+                context.get("prefill_key").and_then(Value::as_str),
+            ),
+        )
+        .await
+        .map_err(|error| crate::utils::utility_call_error("finalize_capture", error))?;
+    drop(timing);
+    if prefill {
+        params.insert("nemo_rl_prefill_key".into(), receipt["prefill_key"].clone());
+    }
+    // The Python engine aligned the prompt after Rust rendered it.
+    usage.prompt_tokens = context["prompt_tokens"]
+        .as_u64()
+        .ok_or_else(|| server_error!("invalid aligned prompt count"))?
+        as _;
+    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens.unwrap_or(0);
+    Ok(if prefill {
+        receipt
+    } else {
+        serde_json::json!({"ng_commit_coords": receipt})
+    })
 }
 
 async fn collect_chat_completion(
@@ -141,6 +222,7 @@ async fn collect_chat_completion(
         include_reasoning,
         echo,
         return_token_ids,
+        routed_experts_prompt_start,
         return_tokens_as_token_ids,
         is_named_tool_choice,
     }: ResponseOptions,
@@ -157,6 +239,8 @@ async fn collect_chat_completion(
         prompt_logprobs,
         logprobs,
         token_ids,
+        routed_experts,
+        dropped_tokens,
         usage,
         finish_reason,
         kv_transfer_params,
@@ -202,6 +286,17 @@ async fn collect_chat_completion(
     } else {
         None
     };
+    let routed_experts = if include_output_metadata {
+        super::completions::routed_experts::encode(
+            &routed_experts,
+            dropped_tokens,
+            prompt_token_ids.len(),
+            token_ids.len(),
+            routed_experts_prompt_start as usize,
+        )?
+    } else {
+        None
+    };
     let usage = Usage::from_token_usage(usage, enable_prompt_tokens_details);
 
     if enable_log_requests {
@@ -234,6 +329,7 @@ async fn collect_chat_completion(
             finish_reason: Some(finish_reason),
             stop_reason,
             token_ids: (return_token_ids && include_output_metadata).then_some(token_ids),
+            routed_experts,
         }],
         usage: Some(usage),
         system_fingerprint: None,
@@ -266,6 +362,7 @@ async fn chat_completion_chunk_stream(
         include_reasoning,
         echo,
         return_token_ids,
+        routed_experts_prompt_start,
         return_tokens_as_token_ids,
         is_named_tool_choice,
     }: ResponseOptions,
@@ -278,6 +375,8 @@ async fn chat_completion_chunk_stream(
         response_model,
     ));
     let mut saw_tool_calls = false;
+    let mut routed_experts = Vec::new();
+    let mut dropped_tokens = 0;
     // `LogprobsDelta` is emitted after all chat events for one decoded update.
     // If that update contains hidden reasoning, including delimiter-only block
     // starts or ends, omit its token metadata as well as its visible delta.
@@ -426,6 +525,13 @@ async fn chat_completion_chunk_stream(
             Ok(ChatEvent::ToolCallEnd { .. }) => {
                 debug!("ending current tool call");
             }
+            Ok(ChatEvent::RoutedExperts {
+                chunks,
+                dropped_tokens: dropped,
+            }) => {
+                routed_experts = chunks;
+                dropped_tokens = dropped;
+            }
             Ok(ChatEvent::Done {
                 usage: final_usage,
                 finish_reason,
@@ -461,7 +567,19 @@ async fn chat_completion_chunk_stream(
                     finish_reason,
                     saw_tool_calls && !is_named_tool_choice,
                 ) {
-                    Ok(chunk) => yield_chunk!(chunk),
+                    Ok(mut chunk) => {
+                        if include_reasoning {
+                            chunk.choices[0].routed_experts =
+                                super::completions::routed_experts::encode(
+                                    &routed_experts,
+                                    dropped_tokens,
+                                    final_usage.prompt_token_count,
+                                    final_usage.output_token_count,
+                                    routed_experts_prompt_start as usize,
+                                )?;
+                        }
+                        yield_chunk!(chunk);
+                    }
                     Err(error) => {
                         error!(
                             error = %error.to_error_response().error.message,

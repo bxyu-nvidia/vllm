@@ -48,6 +48,7 @@ pub(super) struct ResponseOptions {
     pub return_token_ids: bool,
     /// Whether to format logprob tokens as `token_id:{id}`.
     pub return_tokens_as_token_ids: bool,
+    pub routed_experts_prompt_start: u32,
 }
 
 /// Validate and lower one OpenAI completions request into the internal
@@ -132,6 +133,7 @@ pub(super) fn prepare_completion_request(
             prompt_logprobs,
             prompt_logprob_token_ids: None,
             prompt_logprob_start: None,
+            routed_experts_prompt_start: request.routed_experts_prompt_start,
             min_p: request.min_p,
             frequency_penalty: request.frequency_penalty,
             presence_penalty: request.presence_penalty,
@@ -184,6 +186,7 @@ pub(super) fn prepare_completion_request(
             include_prompt_logprobs,
             return_token_ids: request.return_token_ids.unwrap_or(false),
             return_tokens_as_token_ids: request.return_tokens_as_token_ids.unwrap_or(false),
+            routed_experts_prompt_start: request.routed_experts_prompt_start,
         },
         text_request,
     })

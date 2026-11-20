@@ -10,6 +10,7 @@ use tracing::{Level, debug, trace};
 use vllm_engine_core_client::AbortCause;
 use vllm_engine_core_client::protocol::output::StopReason;
 use vllm_engine_core_client::protocol::sampling_mask::SamplingMask;
+use vllm_engine_core_client::protocol::tensor::WireNdArray;
 use vllm_llm::{FinishReason, GenerateOutput, TokenUsage};
 use vllm_tokenizer::{DecodedText, DynTokenizer, IncrementalDecoder};
 
@@ -44,6 +45,10 @@ impl Default for TextDecodeOptions {
 /// Terminal metadata carried on the final [`DecodedTextEvent`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Finished {
+    /// Expert-route chunks, before any terminal stop-string token truncation.
+    pub routed_experts: Vec<WireNdArray>,
+    /// Number of speculative tokens discarded by frontend stop-string handling.
+    pub dropped_tokens: usize,
     pub usage: TokenUsage,
     pub finish_reason: FinishReason,
     /// Connector-specific KV transfer parameters for disaggregated serving.
@@ -126,6 +131,7 @@ pub async fn decoded_text_event_stream(
     let mut output_token_count: usize = 0;
     let mut sampled_logprobs: Option<DecodedLogprobs> = None;
     let mut sampling_mask: Option<SamplingMask> = None;
+    let mut routed_experts = Vec::new();
 
     while let Some(next) = raw_stream.next().await {
         let output = next?;
@@ -173,6 +179,7 @@ pub async fn decoded_text_event_stream(
         };
         let decoder = decoder.as_mut().unwrap();
 
+        routed_experts.extend(output.routed_experts);
         let kv_transfer_params = output.kv_transfer_params;
         let ec_transfer_params = output.ec_transfer_params;
         let mut finish_reason = output.finish_reason;
@@ -221,6 +228,9 @@ pub async fn decoded_text_event_stream(
         let mut new_logprobs = output.logprobs;
         let mut new_sampling_mask = output.sampling_mask;
 
+        let dropped_tokens = truncate_tokens_to
+            .map(|keep| new_token_ids.len().saturating_sub(keep))
+            .unwrap_or(0);
         // Trim tokens and logprobs if we matched stop string.
         if let Some(num_tokens) = truncate_tokens_to {
             new_token_ids.truncate(num_tokens);
@@ -308,6 +318,8 @@ pub async fn decoded_text_event_stream(
                     logprobs: sampled_logprobs,
                 },
                 finished: Some(Box::new(Finished {
+                    routed_experts,
+                    dropped_tokens,
                     usage: TokenUsage {
                         prompt_token_count,
                         output_token_count,
@@ -556,6 +568,8 @@ mod tests {
                         [visible(0xe4, 0), visible(0xbd, 0), visible(0xa0, 0)],
                         vec![0xbd, 0xa0],
                         Some(Finished {
+                            routed_experts: Vec::new(),
+                            dropped_tokens: 0,
                             usage: TokenUsage {
                                 prompt_token_count: 0,
                                 output_token_count: 3,
@@ -586,6 +600,8 @@ mod tests {
                         [visible(b'a' as u32, 0)],
                         ascii_tokens("a!"),
                         Some(Finished {
+                            routed_experts: Vec::new(),
+                            dropped_tokens: 0,
                             usage: TokenUsage {
                                 prompt_token_count: 0,
                                 output_token_count: 2,

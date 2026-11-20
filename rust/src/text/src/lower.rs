@@ -109,6 +109,7 @@ pub fn lower_sampling_params(
         prompt_logprobs,
         prompt_logprob_token_ids,
         prompt_logprob_start,
+        routed_experts_prompt_start,
         min_p,
         frequency_penalty,
         presence_penalty,
@@ -198,6 +199,7 @@ pub fn lower_sampling_params(
             sampling_limits.model_vocab_size,
         )?,
         prompt_logprob_start,
+        routed_experts_prompt_start,
         min_p,
         frequency_penalty,
         presence_penalty,
@@ -214,7 +216,6 @@ pub fn lower_sampling_params(
         logprob_token_ids,
         skip_reading_prefix_cache,
         extra_args: vllm_xargs,
-        routed_experts_prompt_start: 0,
         stream_interval,
     };
     validate_resolved_sampling_params(&params)?;

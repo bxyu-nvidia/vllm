@@ -1142,6 +1142,8 @@ class VllmConfig:
     def _verify_aux_output_compatibility(self) -> None:
         """Reject configurations unsupported by enabled auxiliary outputs."""
         if not self.aux_output_config.enabled:
+            if self.aux_output_config.use_capture_handoff:
+                raise ValueError("use_capture_handoff requires routed-experts capture.")
             return
         from vllm.platforms import current_platform
 
@@ -1193,9 +1195,16 @@ class VllmConfig:
                 "MooncakeConnector",
             ):
                 if kv_transfer_config.has_connector(connector_name):
+                    if (
+                        connector_name in ("NixlConnector", "NixlPullConnector")
+                        and self.aux_output_config.use_capture_handoff
+                    ):
+                        continue
                     raise ValueError(
                         "--enable-return-routed-experts is incompatible with "
-                        f"{connector_name}; PD auxiliary output is not supported."
+                        f"{connector_name}; NIXL pull P/D requires "
+                        "aux_output_config.use_capture_handoff and an engine "
+                        "capture adapter. Other P/D connectors are unsupported."
                     )
 
     def _verify_kv_transfer_compat(self) -> None:

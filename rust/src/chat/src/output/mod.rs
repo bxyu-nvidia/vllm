@@ -45,6 +45,11 @@ pub(crate) enum AssistantEvent {
         logprobs: Option<DecodedLogprobs>,
         token_ids: Vec<u32>,
     },
+    /// Expert routes from the complete generated stream, before stop-tail trimming.
+    RoutedExperts {
+        chunks: Vec<vllm_engine_core_client::protocol::tensor::WireNdArray>,
+        dropped_tokens: usize,
+    },
     /// The start of a new tool call, with its declared name and generated ID.
     ToolCallStart { id: String, name: String },
     /// A delta for the arguments of the currently open tool call. Must follow a

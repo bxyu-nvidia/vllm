@@ -17,6 +17,9 @@ from vllm.distributed.aux_output_connector.connector import (
     AuxRequestOutput,
     PackedBlockHashes,
 )
+from vllm.distributed.aux_output_connector.mooncake_store import (
+    MooncakeBlockObjectStore,
+)
 from vllm.distributed.aux_output_connector.routed_experts import (
     RoutedExpertsBuffer,
     materialize_routed_experts,
@@ -31,6 +34,9 @@ from vllm.distributed.aux_output_connector.store import (
 )
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
+)
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
 )
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
@@ -185,6 +191,8 @@ def _make_worker(
     )
     worker._requests = {}
     worker._generation = 0
+    worker._shared_store = None
+    worker._use_capture_handoff = False
     worker._step_metadata = None
     worker._pending_outputs = []
     worker._lock = threading.Lock()
@@ -427,6 +435,70 @@ def test_worker_ignores_cudagraph_query_padding():
     worker.close()
 
 
+def test_mtp_mixed_acceptance_keeps_only_target_routes() -> None:
+    """Five drafts per request, rejection rollback, batch reorder and graph padding.
+
+    Model math is omitted: this exercises the real snapshot, acceptance filtering,
+    request cursors and block buffering using identifiable target-route rows.
+    """
+    worker = _make_worker(3, max_num_batched_tokens=24)
+    capturer = RoutedExpertsCapturer.__new__(RoutedExpertsCapturer)
+    capturer.device_buffer = torch.empty((24, *_SHAPE), dtype=torch.int32)
+    capturer.output_dtype = torch.uint8
+    worker._capturer = capturer
+    logical = {
+        name: np.arange(12 * 6, dtype=np.uint8).reshape(12, *_SHAPE) + i * 75
+        for i, name in enumerate(("none", "some", "all"))
+    }
+    cursors = dict.fromkeys(logical, 0)
+    emitted: dict[str, list[np.ndarray]] = {name: [] for name in logical}
+    try:
+        for step, (names, accepted) in enumerate(
+            [(["none", "some", "all"], [0, 2, 5]), (["all", "none", "some"], [0, 5, 2])]
+        ):
+            # Rejected positions, graph padding and the subsequent draft forward
+            # use poison values absent from the accepted target rows.
+            capturer.device_buffer.fill_(250)
+            expected = {}
+            for index, (name, count) in enumerate(zip(names, accepted)):
+                start = cursors[name]
+                rows = logical[name][start : start + count + 1]
+                capturer.device_buffer[index * 6 : index * 6 + len(rows)] = (
+                    torch.from_numpy(rows)
+                )
+                expected[name] = rows.copy()
+            metadata = _metadata(
+                0,
+                [
+                    _request_metadata(name, step * 6, 6, cursors[name], [])
+                    for name in names
+                ],
+                {},
+            )
+            worker.begin_step(metadata.metadata)
+            pending = worker.prepare_output(
+                _input_batch(names, np.full(3, step * 6), np.array([0, 6, 12, 18, 24]))
+            )
+            assert pending is not None
+            # The target snapshot must remain stable across another forward.
+            capturer.device_buffer.fill_(251)
+            pending.enqueue_cpu_copy(np.array(accepted) + 1, 5 - np.array(accepted))
+            output = pending.process_output()
+            assert set(output) == set(names)
+            for name in names:
+                assert output[name].token_start == cursors[name]
+                np.testing.assert_array_equal(output[name].rows, expected[name])
+                emitted[name].append(output[name].rows.copy())
+                cursors[name] += len(expected[name])
+                assert worker._requests[name].capture_cursor == cursors[name]
+        for name in logical:
+            np.testing.assert_array_equal(
+                np.concatenate(emitted[name]), logical[name][: cursors[name]]
+            )
+    finally:
+        worker.close()
+
+
 def test_worker_rejects_scheduler_emit_cursor_ahead():
     worker = _make_worker(1)
     _begin_step(
@@ -588,6 +660,102 @@ def test_worker_data_plane_publishes_blocks_and_reuses_prefix():
     assert output is not None
     np.testing.assert_array_equal(output["second"].rows, logical)
     worker.close()
+
+
+@pytest.mark.parametrize("reuse_worker", [True, False], ids=["local", "remote"])
+def test_prefix_routes_are_available_only_on_the_worker_that_computed_them(
+    reuse_worker: bool,
+) -> None:
+    """Identical KV hashes do not move auxiliary rows to a different engine."""
+    producer = _make_worker(1)
+    consumer = producer if reuse_worker else _make_worker(1)
+    hashes = [b"a" * 32, b"b" * 32]
+    rows = np.arange(9 * np.prod(_SHAPE), dtype=_DTYPE).reshape(9, *_SHAPE)
+    try:
+        produced = _process_output(
+            producer,
+            _metadata(0, [_request_metadata("producer", 0, 8, 0, hashes)], {}),
+            rows[:8],
+            ["producer"],
+            np.array([0]),
+        )
+        np.testing.assert_array_equal(produced["producer"].rows, rows[:8])
+        _begin_step(producer, _metadata(0, [], {"producer": []}))
+
+        # KV reuse skips the first eight tokens, but this request still needs
+        # their routes. Only model execution is mocked by _process_output.
+        expected = (
+            nullcontext()
+            if reuse_worker
+            else pytest.raises(BlockObjectStoreError, match="does not exist")
+        )
+        with expected:
+            output = _process_output(
+                consumer,
+                _metadata(0, [_request_metadata("consumer", 8, 1, 0, hashes)], {}),
+                rows[8:],
+                ["consumer"],
+                np.array([0]),
+            )
+            np.testing.assert_array_equal(output["consumer"].rows, rows)
+    finally:
+        if consumer is not producer:
+            consumer.close()
+        producer.close()
+
+
+@pytest.mark.parametrize("boundary", [4, 5, 7, 8])
+@pytest.mark.parametrize("capture_handoff", [False, True])
+def test_pd_handoff_returns_suffix_without_caching_incomplete_blocks(
+    boundary: int,
+    capture_handoff: bool,
+) -> None:
+    """Only the capture handoff supports a cold, sub-block decode start."""
+    producer, consumer = _make_worker(1), _make_worker(1)
+    consumer._use_capture_handoff = capture_handoff
+    hashes = [b"a" * 32, b"b" * 32]
+    rows = np.arange(9 * np.prod(_SHAPE), dtype=_DTYPE).reshape(9, *_SHAPE)
+    try:
+        _process_output(
+            producer,
+            _metadata(0, [_request_metadata("prefill", 0, 9, 0, hashes)], {}),
+            rows,
+            ["prefill"],
+            np.array([0]),
+        )
+        _begin_step(producer, _metadata(0, [], {"prefill": []}))
+        expected = (
+            pytest.raises(AssertionError, match="capture is not contiguous")
+            if boundary % _BLOCK_SIZE and not capture_handoff
+            else nullcontext()
+        )
+        with expected:
+            output = _process_output(
+                consumer,
+                _metadata(
+                    0,
+                    [
+                        _request_metadata(
+                            "decode", boundary, 9 - boundary, boundary, hashes
+                        )
+                    ],
+                    {},
+                ),
+                rows[boundary:],
+                ["decode"],
+                np.array([0]),
+            )
+            assert output["decode"].token_start == boundary
+            np.testing.assert_array_equal(output["decode"].rows, rows[boundary:])
+            if boundary % _BLOCK_SIZE:
+                key = consumer._requests["decode"].aux_output_keys[
+                    boundary // _BLOCK_SIZE
+                ]
+                with pytest.raises(BlockObjectStoreError, match="does not exist"):
+                    consumer._store.get_concatenated([key])
+    finally:
+        producer.close()
+        consumer.close()
 
 
 def test_worker_matches_kv_eviction_order_after_requests_finish():
@@ -1865,3 +2033,269 @@ def test_scheduler_connector_reset_derives_emit_start_from_request():
     assert metadata.generation == 1
     assert metadata.requests[request.request_id] == 4
     assert list(metadata.block_hashes[request.request_id]) == [b"a" * 32]
+
+
+def _make_shared_route_store(data, *, num_blocks=2):
+    client = Mock()
+
+    def put_batch(keys, values, _config):
+        data.update(zip(keys, values, strict=True))
+        return 0
+
+    client.put_batch.side_effect = put_batch
+    client.get_batch.side_effect = lambda keys: [data.get(key, b"") for key in keys]
+    return MooncakeBlockObjectStore(
+        client=client,
+        replicate_config=None,
+        namespace="model-v1",
+        max_bytes=2 * num_blocks,
+        object_nbytes=2,
+    )
+
+
+def test_shared_routes_restore_after_local_eviction_in_requested_order():
+    data: dict[str, bytes] = {}
+    producer = _make_shared_route_store(data)
+    consumer = _make_shared_route_store(data)
+    try:
+        producer.put([BlockObject("a", b"aa"), BlockObject("b", b"bb")])
+        producer.put([BlockObject("c", b"cc")])
+        assert consumer.get_concatenated(["b", "a", "b"]) == b"bbaabb"
+        consumer.client.get_batch.assert_called_once_with(["b", "a"])
+        assert consumer.get_concatenated(["a"]) == b"aa"
+        assert consumer.client.get_batch.call_count == 1
+    finally:
+        producer.close()
+        consumer.close()
+
+
+def test_route_prefetch_pins_until_request_finishes_or_is_cancelled():
+    data = {"a": b"aa", "b": b"bb"}
+    store = _make_shared_route_store(data)
+    try:
+        store.reserve_prefetch("request")
+        store.prefetch("request", ["a", "b"])
+        data.clear()  # Remote eviction cannot invalidate an admitted KV load.
+        with pytest.raises(BlockObjectStoreError, match="cannot retain"):
+            store.put([BlockObject("c", b"cc")])
+        assert store.get_concatenated(["a", "b"]) == b"aabb"
+        store.release_prefetches(["request"])
+        store.put([BlockObject("c", b"cc")])
+        store.reserve_prefetch("cancelled")
+        store.release_prefetches(["cancelled"])
+        with pytest.raises(BlockObjectStoreError, match="cancelled"):
+            store.prefetch("cancelled", ["b"])
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("payload", [b"", b"x", b"oversized", None])
+def test_route_prefetch_rejects_missing_or_malformed_blocks_without_pin_leak(payload):
+    store = _make_shared_route_store({"a": payload}, num_blocks=1)
+    try:
+        store.reserve_prefetch("request")
+        with pytest.raises(
+            BlockObjectStoreError, match="missing or have an invalid size"
+        ):
+            store.prefetch("request", ["a"])
+        store.put([BlockObject("a", b"aa")])
+        store.put([BlockObject("b", b"bb")])  # Failed load left no pinned slot.
+        assert store.get_concatenated(["b"]) == b"bb"
+    finally:
+        store.close()
+
+
+def test_route_publication_failure_preserves_local_capture():
+    store = _make_shared_route_store({})
+    store.client.put_batch.side_effect = None
+    store.client.put_batch.return_value = -1
+    try:
+        store.put([BlockObject("a", b"aa")])
+        assert store.get_concatenated(["a"]) == b"aa"
+    finally:
+        store.close()
+
+
+def test_worker_local_reset_preserves_shared_mooncake_namespace(monkeypatch):
+    from vllm.distributed.aux_output_connector import worker as worker_module
+
+    data: dict[str, bytes] = {}
+    remote = _make_shared_route_store(data)
+    kv_worker = SimpleNamespace(
+        store=remote.client, store_replicate_config=None, aux_cache_prefix="deployment"
+    )
+    monkeypatch.setattr(worker_module, "_get_mooncake_worker", lambda: kv_worker)
+    monkeypatch.setattr(
+        worker_module, "get_tp_group", lambda: SimpleNamespace(is_first_rank=True)
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "RoutedExpertsCapturer",
+        lambda **kwargs: SimpleNamespace(
+            shape_per_token=_SHAPE, output_dtype_name="uint8"
+        ),
+    )
+    monkeypatch.setattr(
+        worker_module, "bind_routed_experts_capturer", lambda *args: None
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "resolve_kv_cache_block_sizes",
+        lambda *args: (_BLOCK_SIZE, _BLOCK_SIZE),
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="r3-model",
+            revision="checkpoint-1",
+            dtype="bfloat16",
+            quantization=None,
+        ),
+        aux_output_config=SimpleNamespace(max_bytes=1 << 20, use_capture_handoff=False),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=1),
+        max_concurrent_batches=2,
+    )
+    workers = []
+    try:
+        for _ in range(2):
+            workers.append(
+                AuxOutputWorkerConnector(
+                    vllm_config=config,
+                    model=torch.nn.Identity(),
+                    kv_cache_config=SimpleNamespace(num_blocks=8),
+                )
+            )
+        producer, consumer = workers
+        hashes = [b"a" * 32, b"b" * 32]
+        rows = np.arange(9 * np.prod(_SHAPE), dtype=_DTYPE).reshape(9, *_SHAPE)
+        _process_output(
+            producer,
+            _metadata(0, [_request_metadata("p", 0, 8, 0, hashes)], {}),
+            rows[:8],
+            ["p"],
+            np.array([0]),
+        )
+        # Waiting on the existing writer guarantees publication in this test;
+        # production lookup only advertises routes after publication completes.
+        producer._store.get_concatenated(producer._shared_store.keys(hashes))
+        restored = _process_output(
+            consumer,
+            _metadata(0, [_request_metadata("c", 8, 1, 0, hashes)], {}),
+            rows[8:],
+            ["c"],
+            np.array([0]),
+        )
+        np.testing.assert_array_equal(restored["c"].rows, rows)
+        assert kv_worker.aux_store is consumer._shared_store
+        assert kv_worker.aux_store_writer is consumer._store
+        old_keys = consumer._shared_store.keys(hashes)
+        consumer.begin_step(_metadata(1, [], {}).metadata)
+        assert consumer._shared_store.keys(hashes) == old_keys
+        assert all(key in data for key in old_keys)
+        # A different local reset count must still resolve the producer's KV
+        # and its matching routes; local copies were discarded by the reset.
+        assert not consumer._shared_store._lru
+        assert consumer._store.get_concatenated(old_keys) == rows[:8].tobytes()
+        consumer.drain()
+        data.clear()  # The coordinated hard reset clears the shared KV/store.
+        consumer.clear_cached_outputs()
+        with pytest.raises(BlockObjectStoreError, match="missing"):
+            consumer._store.get_concatenated(old_keys)
+        # A delayed request release after invalidation must remain valid.
+        consumer.begin_step(_metadata(2, [], {}).metadata)
+    finally:
+        for worker in workers:
+            worker.close()
+        remote.close()
+
+
+@pytest.mark.parametrize("first_sample", [False, True])
+def test_capture_handoff_accumulates_partial_block_across_steps(first_sample):
+    worker = _make_worker(1)
+    worker._use_capture_handoff = True
+    hashes = [bytes([i]) * 32 for i in range(4)]
+    rows = np.arange(15 * np.prod(_SHAPE), dtype=_DTYPE).reshape(15, *_SHAPE)
+    emitted = []
+    cursor = 5
+    try:
+        for start, end, sample, rejected in [
+            (5, 6, first_sample, 0),
+            (6, 12, False, 0),
+            (12, 15, True, 1),
+        ]:
+            output = _process_output(
+                worker,
+                _metadata(
+                    0,
+                    [_request_metadata("decode", start, end - start, cursor, hashes)],
+                    {},
+                ),
+                rows[start:end],
+                ["decode"],
+                np.array([rejected]),
+                np.array([int(sample)]),
+            )
+            if sample:
+                assert output["decode"].token_start == cursor
+                emitted.append(output["decode"].rows)
+                cursor += len(emitted[-1])
+            else:
+                assert output == {}
+        np.testing.assert_array_equal(np.concatenate(emitted), rows[5:14])
+        keys = worker._requests["decode"].aux_output_keys
+        with pytest.raises(BlockObjectStoreError, match="does not exist"):
+            worker._store.get_concatenated([keys[1]])
+        assert worker._store.get_concatenated([keys[2]]) == rows[8:12].tobytes()
+        assert worker._requests["decode"].leading_rows is None
+        _begin_step(worker, _metadata(0, [], {"decode": []}))
+        assert not worker._requests
+        assert not worker._buffer._requests
+        assert not worker._buffer._owned_slots
+    finally:
+        worker.close()
+
+
+def test_background_store_drain_is_a_publication_barrier():
+    from concurrent.futures import ThreadPoolExecutor
+
+    started, release = threading.Event(), threading.Event()
+    underlying = Mock()
+
+    def put(*args, **kwargs):
+        started.set()
+        assert release.wait(5)
+
+    underlying.put.side_effect = put
+    store = BackgroundBlockObjectStore(underlying, max_pending_batches=1)
+    pool = ThreadPoolExecutor(1)
+    try:
+        store.put([BlockObject("key", b"payload")])
+        assert started.wait(5)
+        drain = pool.submit(store.drain)
+        assert not drain.done()
+        underlying.clear.assert_not_called()
+        release.set()
+        drain.result(5)
+        store.clear()
+        underlying.clear.assert_called_once_with()
+    finally:
+        release.set()
+        store.close()
+        pool.shutdown()
+
+
+def test_route_cache_reset_preserves_delayed_release_and_replaces_payload():
+    store = _make_shared_route_store({})
+    try:
+        store.put([BlockObject("a", b"aa")], retain_keys=["a"])
+        store.reserve_prefetch("r")
+        store.prefetch("r", ["a"])
+        store.clear()
+        assert not store._prefetches
+        assert not store._lru
+        # The request's metadata release follows the scheduler generation bump.
+        store.put([], release_keys=["a"])
+        assert not store._references
+        store.put([BlockObject("a", b"bb")])
+        assert store.get_concatenated(["a"]) == b"bb"
+    finally:
+        store.close()

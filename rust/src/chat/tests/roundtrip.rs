@@ -1046,6 +1046,8 @@ fn decoded_completion_stream(
                 decoded: vllm_text::DecodedText::default(),
                 sampled: vllm_text::SampledDelta::default(),
                 finished: Some(Box::new(Finished {
+                    routed_experts: Vec::new(),
+                    dropped_tokens: 0,
                     usage: Default::default(),
                     finish_reason: FinishReason::stop_eos(),
                     kv_transfer_params: None,
@@ -1058,6 +1060,8 @@ fn decoded_completion_stream(
         let last_index = chunks.len() - 1;
         for (index, chunk) in chunks.into_iter().enumerate() {
             let finished = (index == last_index).then(|| Finished {
+                routed_experts: Vec::new(),
+                dropped_tokens: 0,
                 usage: Default::default(),
                 finish_reason: FinishReason::stop_eos(),
                 kv_transfer_params: None,

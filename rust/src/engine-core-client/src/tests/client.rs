@@ -2245,6 +2245,26 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
                 )
                 .await;
 
+                // Owner-specific finalization must not be broadcast to DP0.
+                let msg = recv_engine_message(dealer).await;
+                let payload = decode_value(&msg[1]);
+                let array = payload.as_array().unwrap();
+                assert_eq!(array[2], Value::from("finalize_capture"));
+                send_outputs(
+                    push,
+                    UtilityCallOutput {
+                        engine_index: 1,
+                        timestamp: 0.0,
+                        output: UtilityOutput {
+                            call_id: array[1].as_u64().unwrap().into(),
+                            failure_message: None,
+                            result: Some(utility_result_value(true)),
+                        },
+                    }
+                    .into(),
+                )
+                .await;
+
                 let add_2 = recv_engine_message(dealer).await;
                 assert_eq!(add_2[0].as_ref(), &[0x00]);
                 let request_2: EngineCoreRequest = rmp_serde::from_slice(&add_2[1]).unwrap();
@@ -2287,6 +2307,13 @@ async fn multi_engine_abort_is_grouped_and_utility_fans_out_to_all_engines() {
     .await;
 
     assert!(client.is_sleeping().await.unwrap());
+    assert!(
+        client
+            .call_utility_on::<bool, _>(1, "finalize_capture", ("req-owned", 2, "prefill"))
+            .await
+            .unwrap()
+    );
+    assert!(client.call_utility_on::<bool, _>(7, "finalize_capture", ()).await.is_err());
 
     let mut stream_1 = client.call(sample_request_with_id("req-1")).await.unwrap().into_outputs();
     let mut stream_2 = client.call(sample_request_with_id("req-2")).await.unwrap().into_outputs();

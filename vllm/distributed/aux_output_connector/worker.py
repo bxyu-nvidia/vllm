@@ -17,6 +17,9 @@ from vllm.distributed.aux_output_connector.connector import (
     AuxOutputConnectorMetadata,
     AuxRequestOutput,
 )
+from vllm.distributed.aux_output_connector.mooncake_store import (
+    MooncakeBlockObjectStore,
+)
 from vllm.distributed.aux_output_connector.routed_experts import (
     RoutedExpertsBuffer,
     materialize_routed_experts,
@@ -35,6 +38,9 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
+        MooncakeStoreWorker,
+    )
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -43,6 +49,9 @@ if TYPE_CHECKING:
 class _WorkerRequestState:
     aux_output_keys: list[str] = field(default_factory=list)
     pending_blocks: list[tuple[int, np.ndarray]] = field(default_factory=list)
+    # A NIXL handoff can begin inside a hash block. Keep only its locally
+    # computed suffix; never publish it as a complete reusable block.
+    leading_rows: AuxRequestOutput | None = None
     capture_cursor: int | None = None
     scheduled_cursor: int = 0
     emit_cursor: int = 0
@@ -96,10 +105,12 @@ class AuxOutputWorkerConnector:
         )
         bind_routed_experts_capturer(model, capturer)
         self._capturer = capturer
+        self._use_capture_handoff = vllm_config.aux_output_config.use_capture_handoff
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
         self._requests: dict[str, _WorkerRequestState] = {}
         self._generation = 0
+        self._shared_store: MooncakeBlockObjectStore | None = None
         self._step_metadata: AuxOutputConnectorMetadata | None = None
         # Steps whose asynchronous copy has not been consumed yet. The engine
         # consumes step outputs in order, so at most max_concurrent_batches
@@ -122,10 +133,42 @@ class AuxOutputWorkerConnector:
         max_bytes = vllm_config.aux_output_config.max_bytes
         if max_bytes is None:
             max_bytes = kv_cache_config.num_blocks * hashes_per_kv_block * block_nbytes
+        store: BlockObjectStore
+        mooncake_worker = _get_mooncake_worker()
+        if mooncake_worker is not None:
+            from vllm.config.utils import hash_factors
+
+            model_config = vllm_config.model_config
+            namespace = hash_factors(
+                {
+                    "format": "routed-experts-v1",
+                    "model": model_config.model,
+                    "revision": model_config.revision,
+                    "dtype": str(model_config.dtype),
+                    "quantization": model_config.quantization,
+                    "shape": shape_per_token,
+                    "route_dtype": dtype.name,
+                    "hash_block_size": hash_block_size,
+                    "cache_prefix": mooncake_worker.aux_cache_prefix,
+                }
+            )
+            store = MooncakeBlockObjectStore(
+                client=mooncake_worker.store,
+                replicate_config=mooncake_worker.store_replicate_config,
+                namespace=namespace,
+                max_bytes=max_bytes,
+                object_nbytes=block_nbytes,
+            )
+            self._shared_store = store
+            mooncake_worker.aux_store = store
+        else:
+            store = BlockObjectStore(max_bytes=max_bytes, object_nbytes=block_nbytes)
         self._store = BackgroundBlockObjectStore(
-            BlockObjectStore(max_bytes=max_bytes, object_nbytes=block_nbytes),
+            store,
             max_pending_batches=2 * vllm_config.scheduler_config.max_num_seqs,
         )
+        if mooncake_worker is not None:
+            mooncake_worker.aux_store_writer = self._store
         self._buffer = RoutedExpertsBuffer(
             dtype,
             shape_per_token,
@@ -244,7 +287,7 @@ class AuxOutputWorkerConnector:
 
             emit_start = state.emit_cursor
             # Complete blocks without keys remain pending until a hash update.
-            completed = buffer.capture(request_id, capture_start, rows)
+            completed = self._capture_rows(request_id, state, capture_start, rows)
             token_end = capture_start + len(rows)
             state.capture_cursor = token_end
             state.scheduled_cursor = token_start + request_num_tokens
@@ -264,28 +307,97 @@ class AuxOutputWorkerConnector:
 
         for request_id, emit_start, token_end in materialize_outputs:
             state = self._requests[request_id]
-            stored_end = (
-                min(token_end // block_size, len(state.aux_output_keys)) * block_size
-            )
-            if emit_start < stored_end:
-                first_block = emit_start // block_size
-                stored = materialize_routed_experts(
-                    store,
-                    state.aux_output_keys[first_block : stored_end // block_size],
-                    shape_per_token=buffer.shape_per_token,
-                    dtype=buffer.dtype,
-                )
-                local_start = emit_start % block_size
-                rows = stored[local_start : local_start + stored_end - emit_start]
-                if stored_end < token_end:
-                    rows = np.concatenate(
-                        (rows, buffer.read(request_id, stored_end, token_end))
+            parts = []
+            token_start = emit_start
+            leading = state.leading_rows
+            if leading is not None and emit_start < leading.token_start + len(
+                leading.rows
+            ):
+                if emit_start < leading.token_start:
+                    parts.append(
+                        self._read_rows(request_id, emit_start, leading.token_start)
                     )
-            else:
-                rows = buffer.read(request_id, emit_start, token_end)
-            outputs[request_id] = AuxRequestOutput(emit_start, rows)
+                    emit_start = leading.token_start
+                leading_end = min(token_end, leading.token_start + len(leading.rows))
+                parts.append(
+                    leading.rows[
+                        emit_start - leading.token_start : leading_end
+                        - leading.token_start
+                    ]
+                )
+                emit_start = leading_end
+            if emit_start < token_end:
+                parts.append(self._read_rows(request_id, emit_start, token_end))
+            outputs[request_id] = AuxRequestOutput(
+                token_start, parts[0] if len(parts) == 1 else np.concatenate(parts)
+            )
             state.emit_cursor = token_end
+        for request_id in outputs:
+            state = self._requests[request_id]
+            leading = state.leading_rows
+            if leading is not None:
+                block_end = (leading.token_start // block_size + 1) * block_size
+                if state.emit_cursor >= block_end:
+                    state.leading_rows = None
         return outputs
+
+    def _capture_rows(
+        self,
+        request_id: str,
+        state: _WorkerRequestState,
+        token_start: int,
+        rows: np.ndarray,
+    ) -> list[tuple[int, np.ndarray]]:
+        buffer = self._buffer
+        assert buffer is not None
+        if (
+            self._use_capture_handoff
+            and state.capture_cursor is None
+            and token_start % buffer.block_size
+        ):
+            state.leading_rows = AuxRequestOutput(token_start, rows[:0])
+        leading = state.leading_rows
+        count = 0
+        if leading is not None:
+            block_end = (
+                leading.token_start // buffer.block_size + 1
+            ) * buffer.block_size
+            count = max(0, min(block_end - token_start, len(rows)))
+            if count:
+                assert token_start == leading.token_start + len(leading.rows), (
+                    "auxiliary output handoff suffix is not contiguous"
+                )
+                leading.rows = np.concatenate((leading.rows, rows[:count]))
+        return buffer.capture(request_id, token_start + count, rows[count:])
+
+    def _read_rows(
+        self, request_id: str, token_start: int, token_end: int
+    ) -> np.ndarray:
+        buffer, store = self._buffer, self._store
+        assert buffer is not None and store is not None
+        state = self._requests[request_id]
+        block_size = buffer.block_size
+        emit_start = token_start
+        stored_end = (
+            min(token_end // block_size, len(state.aux_output_keys)) * block_size
+        )
+        if emit_start < stored_end:
+            first_block = emit_start // block_size
+            stored = materialize_routed_experts(
+                store,
+                state.aux_output_keys[first_block : stored_end // block_size],
+                shape_per_token=buffer.shape_per_token,
+                dtype=buffer.dtype,
+            )
+            local_start = emit_start % block_size
+            rows = stored[local_start : local_start + stored_end - emit_start]
+            if stored_end < token_end:
+                rows = np.concatenate(
+                    (rows, buffer.read(request_id, stored_end, token_end))
+                )
+        else:
+            rows = buffer.read(request_id, emit_start, token_end)
+        return rows
 
     def _publish_blocks(
         self,
@@ -330,6 +442,20 @@ class AuxOutputWorkerConnector:
                 buffer.release_block(rows)
             buffer.discard(request_id)
 
+    def drain(self) -> None:
+        """Require consumed GPU snapshots and completed route publication."""
+        with self._lock:
+            if self._pending_outputs:
+                raise RuntimeError("cannot refit with auxiliary output in flight")
+            if self._store is not None:
+                self._store.drain()
+
+    def clear_cached_outputs(self) -> None:
+        """Clear routes alongside KV, preserving releases until the next step."""
+        self.drain()
+        if self._store is not None:
+            self._store.clear()
+
     def begin_step(self, metadata: AuxOutputConnectorMetadata | None) -> None:
         """Apply one scheduler step's request and block-hash updates.
 
@@ -361,6 +487,10 @@ class AuxOutputWorkerConnector:
                 self._buffer.reset()
                 self._requests.clear()
                 self._generation = metadata.generation
+                if self._shared_store is not None:
+                    assert self._store is not None
+                    self._store.drain()
+                    self._shared_store.clear()
             for request_id, emit_start in metadata.requests.items():
                 state = self._requests.setdefault(
                     request_id, _WorkerRequestState(emit_cursor=emit_start)
@@ -377,7 +507,11 @@ class AuxOutputWorkerConnector:
             retained_keys: list[str] = []
             for request_id, block_hashes in metadata.block_hashes.items():
                 state = self._requests[request_id]
-                keys = routed_experts_keys(block_hashes, str(self._generation))
+                keys = (
+                    self._shared_store.keys(list(block_hashes))
+                    if self._shared_store is not None
+                    else routed_experts_keys(block_hashes, str(self._generation))
+                )
                 state.aux_output_keys.extend(keys)
                 retained_keys.extend(keys)
                 block_batches.append((state, []))
@@ -400,6 +534,36 @@ class AuxOutputWorkerConnector:
                     self._store.close()
                 finally:
                     self._store = None
+
+
+def _get_mooncake_worker() -> MooncakeStoreWorker | None:
+    from vllm.distributed.kv_transfer.kv_transfer_state import (
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+    )
+
+    if not has_kv_transfer_group():
+        return None
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import (
+        MooncakeStoreConnector,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiConnector,
+    )
+
+    pending = [get_kv_transfer_group()]
+    workers = []
+    while pending:
+        connector = pending.pop()
+        if isinstance(connector, MultiConnector):
+            pending.extend(connector.sub_connectors)
+        elif isinstance(connector, MooncakeStoreConnector):
+            workers.append(connector.connector_worker)
+    if len(workers) > 1:
+        raise ValueError(
+            "Expert-route storage requires a single MooncakeStoreConnector"
+        )
+    return workers[0] if workers else None
 
 
 def get_aux_output_connector(

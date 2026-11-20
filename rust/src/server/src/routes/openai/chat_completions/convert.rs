@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use crate::error::invalid_request;
 use itertools::Itertools as _;
 use vllm_chat::{
     AssistantContentBlock, AssistantToolCall, ChatContent, ChatContentPart,
@@ -54,6 +55,7 @@ pub(super) struct ResponseOptions {
     pub echo: Option<String>,
     /// Whether to include token IDs alongside generated text.
     pub return_token_ids: bool,
+    pub routed_experts_prompt_start: u32,
     /// Whether to format logprob tokens as `token_id:{id}`.
     pub return_tokens_as_token_ids: bool,
     /// Whether the request forces one named function tool.
@@ -66,11 +68,39 @@ pub(super) struct ResponseOptions {
 /// `lora_resolution.model_names` must be non-empty; the first entry is used as
 /// the base `model` field in responses when no LoRA adapter is selected.
 pub(super) fn prepare_chat_request(
-    request: ChatCompletionRequest,
+    mut request: ChatCompletionRequest,
     lora_resolution: &LoraModelResolution,
     ctx: ResolvedRequestContext,
 ) -> Result<PreparedRequest, ApiError> {
     validate::validate_request_compat(&request, &lora_resolution.model_names)?;
+    if request
+        .vllm_xargs
+        .as_ref()
+        .is_some_and(|args| args.contains_key(vllm_chat::CAPTURE_CONTEXT_KEY))
+    {
+        return Err(invalid_request!(
+            param = Some("vllm_xargs"),
+            "nemo_rl_capture is a reserved vllm_xargs key"
+        ));
+    }
+    let engine_capture = request.nemo_rl_capture.clone();
+    if engine_capture.is_some() && request.stream {
+        return Err(invalid_request!(
+            param = Some("stream"),
+            "engine capture requires stream=false"
+        ));
+    }
+    if let Some(context) = request.nemo_rl_capture.take() {
+        request.vllm_xargs.get_or_insert_default().insert(
+            vllm_chat::CAPTURE_CONTEXT_KEY.into(),
+            serde_json::to_value(context).map_err(|error| {
+                invalid_request!(
+                    param = Some("nemo_rl_capture"),
+                    "invalid capture context: {error}"
+                )
+            })?,
+        );
+    }
 
     let prompt_truncation = resolve_generation_prompt_truncation(
         request.truncate_prompt_tokens,
@@ -116,7 +146,7 @@ pub(super) fn prepare_chat_request(
             .as_ref()
             .and_then(|options| options.continuous_usage_stats)
             .unwrap_or(false);
-    let requested_logprobs = request.logprobs;
+    let requested_logprobs = request.logprobs && engine_capture.is_none();
     let is_named_tool_choice = matches!(&request.tool_choice, Some(ToolChoice::Function { .. }));
 
     // Auto-enable prompt logprobs for non-streaming echo, matching Python vLLM's
@@ -127,7 +157,10 @@ pub(super) fn prepare_chat_request(
         .or((request.echo && !request.stream).then_some(top_logprobs));
     let include_prompt_logprobs = prompt_logprobs.is_some();
     let logprob_token_ids = request.logprob_token_ids.filter(|ids| !ids.is_empty());
-    let logprobs = (request.logprobs && logprob_token_ids.is_none()).then_some(top_logprobs);
+    let logprobs = engine_capture
+        .as_ref()
+        .map(|context| context.top_logprobs as i32)
+        .or_else(|| (request.logprobs && logprob_token_ids.is_none()).then_some(top_logprobs));
     let output_top_logprobs = if logprob_token_ids.is_some() {
         -1
     } else {
@@ -155,6 +188,7 @@ pub(super) fn prepare_chat_request(
     let chat_request = ChatRequest {
         request_id: request_id.clone(),
         messages,
+        required_prefix_token_ids: request.required_prefix_token_ids,
         sampling_params: SamplingParams {
             temperature: request.temperature,
             watermarking: request.watermarking,
@@ -168,6 +202,7 @@ pub(super) fn prepare_chat_request(
             prompt_logprobs,
             prompt_logprob_token_ids: None,
             prompt_logprob_start: None,
+            routed_experts_prompt_start: request.routed_experts_prompt_start,
             min_p: request.min_p,
             frequency_penalty: request.frequency_penalty,
             presence_penalty: request.presence_penalty,
@@ -225,6 +260,7 @@ pub(super) fn prepare_chat_request(
             include_reasoning,
             echo,
             return_token_ids: request.return_token_ids.unwrap_or(false),
+            routed_experts_prompt_start: request.routed_experts_prompt_start,
             return_tokens_as_token_ids: request.return_tokens_as_token_ids.unwrap_or(false),
             is_named_tool_choice,
         },

@@ -78,6 +78,8 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.capture import validate_capture_handoff
+from vllm.v1.engine.capture_runtime import EngineCapture
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -139,6 +141,7 @@ class EngineCore:
         self.log_stats = log_stats
         # Opaque weight version supplied by the caller.
         self._weight_version = "default"
+        self.capture_runtime: EngineCapture | None = None
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -823,6 +826,8 @@ class EngineCore:
 
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
+        if self.capture_runtime is not None:
+            self.capture_runtime.close()
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1092,6 +1097,12 @@ class EngineCore:
         This function could be directly used in input processing thread to allow
         request initialization running in parallel with Model forward
         """
+        if self.vllm_config.aux_output_config.use_capture_handoff:
+            if self.capture_runtime is None:
+                raise RuntimeError(
+                    "use_capture_handoff requires a configured capture adapter"
+                )
+            validate_capture_handoff(request)
         # Note on thread safety: no race condition.
         # `mm_receiver_cache` is reset at the end of LLMEngine init,
         # and will only be accessed in the input processing thread afterwards.
@@ -1145,7 +1156,9 @@ class EngineCoreProc(EngineCore):
         engine_index: int = 0,
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
-        self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
+        self.output_queue = queue.Queue[
+            tuple[int, EngineCoreOutputs] | bytes | Callable[[], None]
+        ]()
         executor_fail_callback = lambda: self.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b"")
         )
@@ -1768,6 +1781,107 @@ class EngineCoreProc(EngineCore):
             for v, p in zip(args, arg_types)
         )
 
+    def configure_capture(self, factory: str, config: dict[str, Any]) -> Future:
+        """Install an engine-local capture adapter before admitting managed calls."""
+        if self.capture_runtime is not None:
+            raise RuntimeError("engine capture is already configured")
+        self.capture_runtime = EngineCapture()
+        config = {**config, "engine_index": self.engine_index}
+        if config.get("result_url"):
+            config["result_url"] = f"{config['result_url']}/{self.engine_index}"
+        return self.capture_runtime.configure(factory, config)
+
+    def get_capture_metrics(self) -> str:
+        """Snapshot capture counters without waiting for storage or GPU work."""
+        if self.capture_runtime is None:
+            raise RuntimeError("engine capture is not configured")
+        return self.capture_runtime.render_metrics()
+
+    def finalize_capture(
+        self, request_id: str, served_tokens: int, prefill_key: str | None = None
+    ) -> Future:
+        """Commit native data using the frontend's final served-token count."""
+        if self.capture_runtime is None:
+            raise RuntimeError("engine capture is not configured")
+        # Rust may stop on a string before the scheduler reaches EOS. Stop the
+        # request, then finalize after all queued native outputs are observed.
+        self.abort_requests([request_id])
+        future: Future = Future()
+
+        def finalize() -> None:
+            assert self.capture_runtime is not None
+            self.capture_runtime.finish(request_id)
+            pending = self.capture_runtime.finalize(
+                request_id, served_tokens, prefill_key
+            )
+
+            def done(result: Future) -> None:
+                try:
+                    future.set_result(result.result())
+                except Exception as error:
+                    future.set_exception(error)
+
+            pending.add_done_callback(done)
+
+        self.output_queue.put_nowait(finalize)
+        return future
+
+    def resolve_capture(self, ticket: str) -> Future:
+        """Resolve a pending receipt on its owning engine."""
+        if self.capture_runtime is None:
+            raise RuntimeError("engine capture is not configured")
+        return self.capture_runtime.resolve_result(ticket)
+
+    def release_capture(self, ticket: str) -> Future:
+        """Release receipt metadata after the ledger acknowledgment."""
+        if self.capture_runtime is None:
+            raise RuntimeError("engine capture is not configured")
+        return self.capture_runtime.release_result(ticket)
+
+    def drain_capture(self, release_transients: bool = False) -> Future | bool:
+        """Drain capture; reclaim fragments only after the fleet drain barrier."""
+        if self.capture_runtime is None:
+            return True
+        return self.capture_runtime.drain(release_transients=release_transients)
+
+    def resume_capture(self) -> bool:
+        if self.capture_runtime is not None:
+            self.capture_runtime.resume()
+        return True
+
+    def discard_capture(self, request_id: str) -> Future:
+        """Release an abandoned call without staging a successful training row."""
+        if self.capture_runtime is None:
+            raise RuntimeError("engine capture is not configured")
+        return self.capture_runtime.discard(request_id)
+
+    def _prepare_capture_request(self, request: EngineCoreRequest) -> None:
+        if self.capture_runtime is None:
+            raise RuntimeError("engine capture is not configured")
+        if request.mm_features or request.prompt_embeds is not None:
+            raise ValueError("engine capture supports text-only requests")
+        if self.vllm_config.model_config.logprobs_mode != "raw_logprobs":
+            raise ValueError("engine capture requires raw_logprobs")
+
+        def ready() -> None:
+            prompt = request.prompt_token_ids
+            if not prompt or len(prompt) >= self.vllm_config.model_config.max_model_len:
+                raise ValueError("aligned capture prompt exceeds max_model_len")
+            params = request.sampling_params
+            assert params is not None and params.max_tokens is not None
+            params.max_tokens = min(
+                params.max_tokens,
+                self.vllm_config.model_config.max_model_len - len(prompt),
+            )
+            # Capture is text-only. Grammar initialization is request-local and
+            # block hashing must see the exact parent, never the rendered history.
+            prepared = self.preprocess_add_request(request)
+            self.input_queue.put_nowait((EngineCoreRequestType.ADD, prepared))
+
+        self.capture_runtime.prepare(
+            request, ready, lambda: self._handle_request_preproc_error(request)
+        )
+
     def _send_engine_dead(self):
         """Send EngineDead status to the EngineCoreClient."""
         # Put ENGINE_CORE_DEAD in the queue.
@@ -1900,6 +2014,10 @@ class EngineCoreProc(EngineCore):
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
                         try:
+                            capture = req.capture_context
+                            if capture is not None:
+                                self._prepare_capture_request(req)
+                                continue
                             request = self.preprocess_add_request(req)
                         except MultiModalCacheMissError as e:
                             # P0/P1 shadow drift -- return a retryable signal (P0
@@ -1921,6 +2039,8 @@ class EngineCoreProc(EngineCore):
                         request = generic_decoder.decode(data_frames)
 
                         if request_type == EngineCoreRequestType.ABORT:
+                            if self.capture_runtime is not None:
+                                self.capture_runtime.abort_pending(request)
                             # Aborts are added to *both* queues, allows us to eagerly
                             # process aborts while also ensuring ordering in the input
                             # queue to avoid leaking requests. This is ok because
@@ -1966,6 +2086,9 @@ class EngineCoreProc(EngineCore):
 
             while True:
                 output = self.output_queue.get()
+                if callable(output):
+                    output()
+                    continue
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:
                     for socket in sockets:
                         socket.send(output)
@@ -1973,6 +2096,12 @@ class EngineCoreProc(EngineCore):
                 assert not isinstance(output, bytes)
                 client_index, outputs = output
                 outputs.engine_index = engine_index
+                if self.capture_runtime is not None:
+                    self.capture_runtime.observe_batch(outputs.outputs)
+                    for index, item in enumerate(outputs.outputs):
+                        outputs.outputs[index] = self.capture_runtime.wire_output(
+                            item, engine_index
+                        )
 
                 if client_index == -1:
                     # Don't reuse buffer for coordinator message

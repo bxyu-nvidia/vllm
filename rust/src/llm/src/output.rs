@@ -159,6 +159,8 @@ fn finish_reason_from_engine(
 /// <https://github.com/vllm-project/vllm/blob/bc2c0c86efb28e77677a3cfb8687e976914a313a/vllm/outputs.py#L85-L143>
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerateOutput {
+    /// Expert-route chunks in engine order, including prompt rows.
+    pub routed_experts: Vec<WireNdArray>,
     /// Unique ID of the request that produced this output.
     pub request_id: String,
     /// One-time prompt metadata emitted only on the first output for this
@@ -218,6 +220,7 @@ impl GenerateOutput {
             next.prompt_info.is_none(),
             "only the first output carries prompt info"
         );
+        self.routed_experts.extend(next.routed_experts);
         self.token_ids.extend(next.token_ids);
         if let Some(next_logprobs) = next.logprobs {
             match &mut self.logprobs {
@@ -249,6 +252,7 @@ impl GenerateOutput {
         finish_reason: Option<FinishReason>,
     ) -> Self {
         Self {
+            routed_experts: Vec::new(),
             request_id: String::new(),
             prompt_info: prompt_token_ids.map(|ids| {
                 Box::new(GeneratePromptInfo {
@@ -391,6 +395,7 @@ impl GenerateOutputStream {
         };
 
         let output = GenerateOutput {
+            routed_experts: raw.routed_experts.into_iter().map(|array| *array).collect(),
             request_id: raw.request_id,
             prompt_info: self.pending_prompt_info.take(),
             token_ids: raw.new_token_ids,

@@ -631,11 +631,48 @@ async fn test_models_with_engine_outputs_and_backend_inner(
                 let request: EngineCoreRequest =
                     rmp_serde::from_slice(&add[1]).expect("decode request");
                 check_request(&request);
-                send_outputs(
-                    push,
-                    engine_outputs_for_request(&request.request_id, output_specs),
-                )
-                .await;
+                let context = request
+                    .sampling_params
+                    .as_ref()
+                    .and_then(|p| p.extra_args.as_ref())
+                    .and_then(|a| a.get("nemo_rl_capture"));
+                let captured = context.is_some();
+                let mut outputs = engine_outputs_for_request(&request.request_id, output_specs);
+                if captured {
+                    for output in &mut outputs.as_request_batch_mut().unwrap().outputs {
+                        output.kv_transfer_params = Some(Box::new(json!({"__nemo_rl_capture": {
+                            "request_id": request.request_id, "engine_index": 0,
+                            "prompt_tokens": 123, "phase": context.unwrap()["phase"], "prefill_key": "prefill-ref"
+                        }})));
+                    }
+                }
+                send_outputs(push, outputs).await;
+                if captured {
+                    let msg = recv_engine_message(dealer).await;
+                    let payload = decode_value(&msg[1]).unwrap();
+                    let array = payload.as_array().unwrap();
+                    assert_eq!(array[2], Value::from("finalize_capture"));
+                    let count = if context.unwrap()["phase"] == "prefill" {
+                        0
+                    } else {
+                        3
+                    };
+                    assert_eq!(
+                        array[3],
+                        rmpv::ext::to_value(json!([request.request_id, count, "prefill-ref"]))
+                            .unwrap()
+                    );
+                    send_outputs(
+                        push,
+                        utility_outputs(
+                            array[1].as_u64().unwrap(),
+                            utility_result_value(
+                                json!({"prefill_key":"opaque-prefill", "disposition":"staged"}),
+                            ),
+                        ),
+                    )
+                    .await;
+                }
             })
         },
     ));
@@ -8418,4 +8455,261 @@ async fn profile_routes_are_hidden_when_profiling_is_disabled() {
     }
 
     engine_task.abort_and_join().await;
+}
+
+mod nemo_rl;
+
+#[derive(Clone)]
+struct PrefixChatBackend(FakeChatBackend);
+
+impl TextBackend for PrefixChatBackend {
+    fn tokenizer(&self) -> DynTokenizer {
+        self.0.tokenizer()
+    }
+    fn model_id(&self) -> &str {
+        self.0.model_id()
+    }
+    fn sampling_hints(&self) -> vllm_text::Result<vllm_text::backend::SamplingHints> {
+        Ok(vllm_text::backend::SamplingHints {
+            primary_eos_token_id: Some(u32::from(b'\n')),
+            ..Default::default()
+        })
+    }
+}
+
+impl ChatBackend for PrefixChatBackend {
+    fn chat_renderer(&self) -> DynChatRenderer {
+        self.0.chat_renderer()
+    }
+    fn new_chat_output_processor(
+        &self,
+        request: &mut ChatRequest,
+        options: NewChatOutputProcessorOptions<'_>,
+    ) -> vllm_chat::Result<DynChatOutputProcessor> {
+        self.0.new_chat_output_processor(request, options)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_prefix_alignment_preserves_engine_and_response_tokens() {
+    for (stream, phase, deferred) in [
+        (false, None, false),
+        (true, None, false),
+        (false, Some("prefill"), true),
+        (false, Some("decode"), true),
+    ] {
+        let prefix = bytes_to_token_ids(b"user: hi\nassistant:  EXACT  \n");
+        let rendered_prefix = bytes_to_token_ids(b"user: hi\nassistant: EXACT\n");
+        let mut expected = if deferred {
+            rendered_prefix.clone()
+        } else {
+            prefix.clone()
+        };
+        expected.extend(bytes_to_token_ids(b"user: next\nassistant:"));
+        let expected_engine = expected.clone();
+        let context = phase.map(|phase| json!({
+            "version": 1, "admission": {"model_call_id": "call-2", "prev_len": prefix.len(), "staging_chain": ["parent-key"]},
+            "weight_version": 7, "phase": phase, "top_logprobs": 0, "routed_experts": false,
+        }));
+        let context_engine = context.clone();
+        let suffix_start = if deferred {
+            rendered_prefix.len()
+        } else {
+            prefix.len()
+        };
+        let (chat, engine_task) = test_models_with_engine_outputs_and_backend_inner(
+            b"engine-prefix-alignment",
+            default_stream_output_specs(),
+            move |request| {
+                assert_eq!(request.prompt_token_ids, Some(expected_engine));
+                let args = request.sampling_params.as_ref().unwrap().extra_args.as_ref().unwrap();
+                assert_eq!(args["passthrough"], json!("preserved"));
+                if let Some(mut expected) = context_engine {
+                    expected["alignment"] = json!({"suffix_start": suffix_start, "turn_end_token_id": 10, "eos_token_ids": [10]});
+                    assert_eq!(args["nemo_rl_capture"], expected);
+                } else {
+                    assert!(!args.contains_key("nemo_rl_capture"));
+                }
+            },
+            Arc::new(PrefixChatBackend(FakeChatBackend::new())),
+        )
+        .await;
+        let mut app = build_router(Arc::new(AppState::new(
+            vec!["model".into()],
+            chat.with_prefix_token_alignment(true),
+        )));
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "model", "stream": stream, "return_token_ids": true,
+                            "messages": [
+                                {"role":"user", "content":"hi"},
+                                {"role":"assistant", "content":"EXACT"},
+                                {"role":"user", "content":"next"}
+                            ],
+                            "required_prefix_token_ids": if deferred { vec![] } else { prefix },
+                            "nemo_rl_capture": context,
+                            "vllm_xargs": {"passthrough": "preserved"},
+                            "max_completion_tokens": 8
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        if stream {
+            let text = std::str::from_utf8(&body).unwrap();
+            let chunks = sse_json_payloads(text);
+            assert_eq!(chunks[0]["prompt_token_ids"], json!(expected));
+            let generated: Vec<_> = chunks
+                .iter()
+                .flat_map(|chunk| {
+                    chunk["choices"][0]["token_ids"].as_array().into_iter().flatten().cloned()
+                })
+                .collect();
+            assert_eq!(generated, json!([104, 105, 33]).as_array().unwrap().clone());
+        } else {
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if deferred {
+                assert_eq!(body["usage"]["prompt_tokens"], 123);
+                assert!(body["kv_transfer_params"].get("__nemo_rl_capture").is_none());
+                if phase == Some("decode") {
+                    assert_eq!(body["ng_commit_coords"]["disposition"], "staged");
+                }
+            }
+            if deferred {
+                assert!(body["prompt_token_ids"].is_null());
+                assert!(body["choices"][0]["token_ids"].is_null());
+            } else {
+                assert_eq!(body["prompt_token_ids"], json!(expected));
+                assert_eq!(body["choices"][0]["token_ids"], json!([104, 105, 33]));
+            }
+        }
+        engine_task.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_prefix_alignment_rejects_disabled_and_unsafe_requests() {
+    for (enabled, extra, message) in [
+        (false, json!({}), "--enable-prefix-token-alignment"),
+        (true, json!({"truncate_prompt_tokens": 4}), "truncation"),
+        (
+            true,
+            json!({"required_prefix_token_ids": [10, 2], "messages": [{"role":"user","content":"hi"}]}),
+            "prior assistant",
+        ),
+        (
+            true,
+            json!({"messages": [{"role":"assistant","content":"old"}, {"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}]}),
+            "multimodal",
+        ),
+    ] {
+        let (chat, _engine_task) =
+            test_chat_with_engine_outputs(b"engine-prefix-invalid", vec![]).await;
+        let mut app = build_router(Arc::new(AppState::new(
+            vec!["model".into()],
+            chat.with_prefix_token_alignment(enabled),
+        )));
+        let mut body = json!({"model":"model", "messages":[{"role":"assistant","content":"old"},{"role":"user","content":"next"}], "required_prefix_token_ids":[10, 2]});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(
+            body["error"]["message"].as_str().unwrap().contains(message),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_capture_rejects_spoofed_boundaries_and_reserved_extra_args() {
+    let (chat, _engine_task) = test_chat_with_engine_outputs(b"capture-invalid", vec![]).await;
+    let mut app = build_router(Arc::new(AppState::new(
+        vec!["model".into()],
+        chat.with_prefix_token_alignment(true),
+    )));
+    let context = json!({"version":1,"admission":{"prev_len":0},"weight_version":7,"phase":"decode","top_logprobs":0,"routed_experts":false});
+    let mut spoofed = context.clone();
+    spoofed["alignment"] = json!({"suffix_start":0});
+    for extra in [
+        json!({"vllm_xargs":{"nemo_rl_capture":context}}),
+        json!({"nemo_rl_capture":spoofed}),
+        json!({"nemo_rl_capture":{"version":2,"admission":{"prev_len":0},"weight_version":7,"phase":"decode","top_logprobs":0,"routed_experts":false}}),
+    ] {
+        let mut body = json!({"model":"model","messages":[{"role":"user","content":"hi"}]});
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+    }
+}
+
+#[tokio::test]
+async fn chat_prefix_alignment_validates_final_context_length() {
+    let backend = Arc::new(PrefixChatBackend(FakeChatBackend::new()));
+    let mut app = build_render_router(Arc::new(RenderState {
+        model: "model".into(),
+        served_model_names: vec!["model".into()],
+        max_model_len: Some(64),
+        text: TextRequestProcessor::new(backend.clone(), 64),
+        chat: ChatRequestProcessor::render_only(backend).with_prefix_token_alignment(true),
+    }));
+    // The rendered history fits, but the exact model prefix does not.
+    let body = json!({
+        "model":"model", "messages":[{"role":"assistant","content":"x"},{"role":"user","content":"y"}],
+        "required_prefix_token_ids": vec![u32::from(b'x'); 64],
+        "max_completion_tokens": 1
+    });
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions/render")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("maximum context length"),
+        "{body}"
+    );
 }

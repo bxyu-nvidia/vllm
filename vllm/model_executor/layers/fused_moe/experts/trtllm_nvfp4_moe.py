@@ -149,6 +149,29 @@ class TrtLlmNvFp4ExpertsBase:
         # g1_scale_c = a13_scale * w13_scale_2 / a2_scale
         return self.quant_config.g1_alphas * self.quant_config.a2_gscale
 
+    def refresh_after_weight_reload(self, layer: torch.nn.Module) -> None:
+        """Refresh restored parameters without moving CUDA graph storage."""
+        self.g1_scale_c = layer.g1_scale_c
+        self.g1_scale_c.copy_(self._compute_g1_scale_c())
+        if self.gemm1_clamp_limit is not None:
+            self.gemm1_clamp_limit = layer.gemm1_clamp_limit
+            value = self._gemm1_clamp_limit_unfolded
+            assert value is not None
+            if not self.is_situ:
+                assert self.quant_config.g1_alphas is not None
+                value = value / self.quant_config.g1_alphas
+            self.gemm1_clamp_limit.copy_(value)
+        if self.gemm1_beta is not None:
+            self.gemm1_beta = layer.gemm1_beta
+            value = self._gemm1_beta_unfolded
+            assert value is not None
+            if not self.is_situ:
+                assert self.quant_config.g1_alphas is not None
+                value = value / self.quant_config.g1_alphas
+            self.gemm1_beta.copy_(value)
+        if self.gemm1_alpha is not None:
+            self.gemm1_alpha = layer.gemm1_alpha
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not is_weights_pre_processed():
             layer.w13_weight_scale_2.data.mul_(layer.w13_input_scale)

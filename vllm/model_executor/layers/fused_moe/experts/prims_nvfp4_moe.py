@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from torch.nn import Module
+
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
     TrtLlmNvFp4ExpertsModular,
@@ -31,6 +33,17 @@ class PrimsNvFp4Experts(TrtLlmNvFp4ExpertsModular):
             )
             self._resident_expert_offset = layer.dwdp_expert_range[0]
 
+    def refresh_after_weight_reload(self, layer: Module) -> None:
+        super().refresh_after_weight_reload(layer)
+        if layer.dwdp_manager is not None and layer.dwdp_manager.merge_free:
+            self._resident_weights = (
+                layer.w13_weight.detach(),
+                layer.w13_weight_scale.detach(),
+                layer.w2_weight.detach(),
+                layer.w2_weight_scale.detach(),
+            )
+        self._dwdp_scales_ready = True
+
     def _routed_moe(self, **kwargs):
         from flashinfer.fused_moe import prims_ts_fp4_block_scale_routed_moe
 
@@ -38,10 +51,14 @@ class PrimsNvFp4Experts(TrtLlmNvFp4ExpertsModular):
         if resident is not None and not self._dwdp_scales_ready:
             self.g1_scale_c.copy_(self._compute_g1_scale_c())
             if self.gemm1_clamp_limit is not None and not self.is_situ:
+                assert self._gemm1_clamp_limit_unfolded is not None
+                assert self.quant_config.g1_alphas is not None
                 self.gemm1_clamp_limit.copy_(
                     self._gemm1_clamp_limit_unfolded / self.quant_config.g1_alphas
                 )
             if self.gemm1_beta is not None and not self.is_situ:
+                assert self._gemm1_beta_unfolded is not None
+                assert self.quant_config.g1_alphas is not None
                 self.gemm1_beta.copy_(
                     self._gemm1_beta_unfolded / self.quant_config.g1_alphas
                 )

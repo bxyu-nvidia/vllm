@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.config import VllmConfig
+from vllm.config.aux_output import AuxOutputConfig
 from vllm.config.compilation import CompilationMode
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
@@ -358,7 +359,8 @@ def test_routed_experts_capturer_exposes_output_profile(
 def test_routed_experts_capturer_narrows_snapshot(output_dtype):
     capturer = _capturer_with_buffer(dtype=torch.int32)
     capturer.output_dtype = output_dtype
-    topk = torch.tensor([[1, 2], [254, 255]], dtype=torch.int64)
+    max_id = 255 if output_dtype == torch.uint8 else 511
+    topk = torch.tensor([[1, 2], [max_id - 1, max_id]], dtype=torch.int64)
     ctx = SimpleNamespace(dp_metadata=None)
     with patch(f"{_REC_MODULE}.get_forward_context", return_value=ctx):
         capturer.capture(layer_id=0, topk_ids=topk)
@@ -369,6 +371,10 @@ def test_routed_experts_capturer_narrows_snapshot(output_dtype):
     assert output.dtype == output_dtype
     assert output[:, 0, :].tolist() == topk.tolist()
     assert output.data_ptr() != capturer.device_buffer.data_ptr()
+    # MTP proposal / the next target forward must not overwrite the pending
+    # target snapshot while its D2H copy is in flight.
+    capturer.device_buffer.fill_(42)
+    assert output[:, 0, :].tolist() == topk.tolist()
 
 
 def test_routed_experts_capturer_dp_naive_concatenated_all_ranks():
@@ -496,7 +502,7 @@ def test_aux_output_worker_connector_binds_capture_on_non_output_rank(monkeypatc
     )
 
     config = SimpleNamespace(
-        aux_output_config=SimpleNamespace(enable_return_routed_experts=True),
+        aux_output_config=AuxOutputConfig(enable_return_routed_experts=True),
         kv_transfer_config=None,
         max_concurrent_batches=2,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=32),
@@ -542,7 +548,7 @@ def test_aux_output_worker_connector_default_capacity(monkeypatch):
     monkeypatch.setattr(aux_output_worker, "RoutedExpertsBuffer", Mock())
 
     config = SimpleNamespace(
-        aux_output_config=SimpleNamespace(max_bytes=None),
+        aux_output_config=AuxOutputConfig(),
         kv_transfer_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=True),
         scheduler_config=SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=32),
@@ -571,7 +577,7 @@ def test_v2_model_runner_accepts_routed_experts(monkeypatch):
             logits_processors=None,
             enable_prompt_embeds=False,
         ),
-        aux_output_config=SimpleNamespace(enable_return_routed_experts=True),
+        aux_output_config=AuxOutputConfig(enable_return_routed_experts=True),
         speculative_config=None,
         parallel_config=SimpleNamespace(
             prefill_context_parallel_size=1,

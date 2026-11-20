@@ -35,13 +35,6 @@ from vllm.model_executor.layers.fused_moe.prepare_finalize.passthrough import (
     PassThroughPrepareAndFinalize,
 )
 from vllm.platforms import current_platform
-from vllm.utils.import_utils import (
-    has_deep_ep,
-    has_deep_ep_v2,
-    has_moonep,
-    has_mori,
-    has_nixl_ep,
-)
 
 
 @dataclass(frozen=True)
@@ -100,30 +93,6 @@ def flashinfer_one_sided_dispatch_layout(
 
 logger = init_logger(__name__)
 
-if current_platform.is_cuda_alike():
-    if has_deep_ep():
-        from .prepare_finalize.deepep_ht import DeepEPHTPrepareAndFinalize
-        from .prepare_finalize.deepep_ll import (
-            DEEPEP_QUANT_BLOCK_SHAPE,
-            DeepEPLLPrepareAndFinalize,
-        )
-    if has_deep_ep_v2():
-        from .prepare_finalize.deepep_v2 import DeepEPV2PrepareAndFinalize
-    if has_mori():
-        from .prepare_finalize.mori import MoriPrepareAndFinalize
-    if has_nixl_ep():
-        from .prepare_finalize.nixl_ep import (
-            NIXL_EP_QUANT_BLOCK_SHAPE,
-            NixlEPPrepareAndFinalize,
-        )
-    if has_moonep():
-        from .prepare_finalize.moonep import (
-            MOONEP_DEFAULT_NUM_PREFETCH_SLOTS,
-            MOONEP_DEFAULT_NUM_SMS,
-            MOONEP_DEFAULT_TOKEN_PADDING,
-            MoonEPPrepareAndFinalize,
-        )
-
 
 def get_ep_all2all_manager(
     ep_group: GroupCoordinator | None = None,
@@ -157,21 +126,29 @@ def maybe_roundup_layer_hidden_size(
 
     """
     if moe_parallel_config.use_deepep_ht_kernels:
+        from .prepare_finalize.deepep_ht import DeepEPHTPrepareAndFinalize
+
         hidden_size = DeepEPHTPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size, act_dtype
         )
 
     if moe_parallel_config.use_deepep_ll_kernels:
+        from .prepare_finalize.deepep_ll import DeepEPLLPrepareAndFinalize
+
         hidden_size = DeepEPLLPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size
         )
 
     if moe_parallel_config.use_deepep_v2_kernels:
+        from .prepare_finalize.deepep_v2 import DeepEPV2PrepareAndFinalize
+
         hidden_size = DeepEPV2PrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size, act_dtype
         )
 
     if moe_parallel_config.use_nixl_ep_kernels:
+        from .prepare_finalize.nixl_ep import NixlEPPrepareAndFinalize
+
         hidden_size = NixlEPPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size
         )
@@ -228,6 +205,8 @@ def maybe_make_prepare_finalize(
     prepare_finalize: FusedMoEPrepareAndFinalize | None = None
 
     if moe.use_deepep_ht_kernels:
+        from .prepare_finalize.deepep_ht import DeepEPHTPrepareAndFinalize
+
         assert moe.dp_size == all2all_manager.dp_world_size
 
         all_to_all_args: dict[str, Any] = dict()
@@ -240,6 +219,11 @@ def maybe_make_prepare_finalize(
         )
 
     elif moe.use_deepep_ll_kernels:
+        from .prepare_finalize.deepep_ll import (
+            DEEPEP_QUANT_BLOCK_SHAPE,
+            DeepEPLLPrepareAndFinalize,
+        )
+
         assert quant_config is not None
         global_to_physical = physical_to_global = local_expert_global_ids = None
         if routing_tables is not None:
@@ -274,6 +258,8 @@ def maybe_make_prepare_finalize(
             local_expert_global_ids=local_expert_global_ids,
         )
     elif moe.use_deepep_v2_kernels:
+        from .prepare_finalize.deepep_v2 import DeepEPV2PrepareAndFinalize
+
         assert moe.dp_size == all2all_manager.dp_world_size
 
         use_fp8_dispatch = (
@@ -305,6 +291,13 @@ def maybe_make_prepare_finalize(
         )
 
     elif moe.use_moonep_kernels:
+        from .prepare_finalize.moonep import (
+            MOONEP_DEFAULT_NUM_PREFETCH_SLOTS,
+            MOONEP_DEFAULT_NUM_SMS,
+            MOONEP_DEFAULT_TOKEN_PADDING,
+            MoonEPPrepareAndFinalize,
+        )
+
         all_to_all_args = dict(
             max_num_tokens_per_dp_rank=moe.max_num_tokens,
             token_hidden_size=moe.hidden_dim,
@@ -327,6 +320,8 @@ def maybe_make_prepare_finalize(
         )
 
     elif moe.use_mori_kernels:
+        from .prepare_finalize.mori import MoriPrepareAndFinalize
+
         assert quant_config is not None
 
         # Note: We may want to use FP8 dispatch just to reduce
@@ -404,6 +399,11 @@ def maybe_make_prepare_finalize(
         )
 
     elif moe.use_nixl_ep_kernels:
+        from .prepare_finalize.nixl_ep import (
+            NIXL_EP_QUANT_BLOCK_SHAPE,
+            NixlEPPrepareAndFinalize,
+        )
+
         assert quant_config is not None
         global_to_physical = physical_to_global = local_expert_global_ids = None
         if routing_tables is not None:
