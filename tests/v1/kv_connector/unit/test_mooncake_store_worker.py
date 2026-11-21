@@ -2539,7 +2539,10 @@ def test_worker_is_hma_required_from_kv_cache_groups(
     assert store_worker._is_hma_required is expected_is_hma_required
 
 
-def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("capture_handoff", [False, True])
+def test_requester_worker_init_uses_positional_setup(
+    tmp_path, monkeypatch, capture_handoff
+):
     store = MagicMock()
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
@@ -2559,7 +2562,12 @@ def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
             },
         ),
     )
-    w = worker.MooncakeStoreWorker(_make_vllm_config(), _make_kv_cache_config())
+    config = _make_vllm_config()
+    config.aux_output_config = SimpleNamespace(
+        enabled=True, use_capture_handoff=capture_handoff
+    )
+    w = worker.MooncakeStoreWorker(config, _make_kv_cache_config())
+    assert w._aux_output_enabled is not capture_handoff
 
     assert not hasattr(w, "_isolate_offload_resources")
     assert store.setup.call_args.args == (
@@ -5301,3 +5309,14 @@ def test_mooncake_shutdown_drains_route_writer_before_closing_client():
     worker.close()
     worker.close()
     assert events == ["routes", "client"]
+
+
+def test_capture_handoff_kv_lookup_does_not_require_cached_routes():
+    # The RL path leaves aux_store unset and disables route requirements.
+    w = _make_bare_worker()
+    w._aux_output_enabled = False
+    w.aux_store = None
+    w.store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+    assert w.lookup(48, [b"a0", b"a1", b"a2"]).hit_length == 32
+    keys = w.store.batch_is_exist.call_args.args[0]
+    assert keys and all(not key.startswith("vllm-artifact/") for key in keys)

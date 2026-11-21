@@ -1112,6 +1112,9 @@ class EngineCore:
             )
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
+        if self.vllm_config.aux_output_config.use_capture_handoff:
+            assert req.sampling_params is not None
+            req.max_cache_hit_length = req.sampling_params.routed_experts_prompt_start
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For

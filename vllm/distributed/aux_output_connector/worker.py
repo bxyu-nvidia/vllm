@@ -49,9 +49,8 @@ if TYPE_CHECKING:
 class _WorkerRequestState:
     aux_output_keys: list[str] = field(default_factory=list)
     pending_blocks: list[tuple[int, np.ndarray]] = field(default_factory=list)
-    # A NIXL handoff can begin inside a hash block. Keep only its locally
-    # computed suffix; never publish it as a complete reusable block.
-    leading_rows: AuxRequestOutput | None = None
+    # Capture handoff owns only rows not yet delivered to the adapter.
+    handoff_rows: list[AuxRequestOutput] = field(default_factory=list)
     capture_cursor: int | None = None
     scheduled_cursor: int = 0
     emit_cursor: int = 0
@@ -120,7 +119,10 @@ class AuxOutputWorkerConnector:
         self._max_concurrent_batches = vllm_config.max_concurrent_batches
         # Every TP rank participates in capture collectives, but only the
         # executor output rank owns the auxiliary output data plane.
-        if not get_tp_group().is_first_rank:
+        self._is_output_rank = get_tp_group().is_first_rank
+        if not self._is_output_rank or self._use_capture_handoff:
+            # RL assembles prior-turn routes from TQ lineage. Do not allocate
+            # a KV-sized arena or register a shared route cache for this path.
             return
 
         shape_per_token = self._capturer.shape_per_token
@@ -180,7 +182,7 @@ class AuxOutputWorkerConnector:
 
     def prepare_output(self, input_batch: InputBatch) -> PendingAuxOutput | None:
         """Snapshot one step's R3 tensor for asynchronous CPU transfer."""
-        if self._buffer is None or self._step_metadata is None:
+        if not self._is_output_rank or self._step_metadata is None:
             return None
 
         request_ids = list(input_batch.req_ids)
@@ -222,15 +224,16 @@ class AuxOutputWorkerConnector:
                         teardown.append(request_id)
                         release_keys.extend(reversed(state.aux_output_keys))
             if teardown:
-                self._publish_blocks([], release_keys=release_keys)
+                if not self._use_capture_handoff:
+                    self._publish_blocks([], release_keys=release_keys)
                 self._teardown(teardown)
             return outputs
 
     def _commit_output(self, pending: PendingAuxOutput) -> dict[str, AuxRequestOutput]:
         buffer = self._buffer
         store = self._store
-        assert buffer is not None and store is not None
-        block_size = buffer.block_size
+        if not self._use_capture_handoff:
+            assert buffer is not None and store is not None
 
         routed_experts = pending.routed_experts
         num_sampled = pending.num_sampled
@@ -286,11 +289,22 @@ class AuxOutputWorkerConnector:
                 capture_start = capture_cursor
 
             emit_start = state.emit_cursor
-            # Complete blocks without keys remain pending until a hash update.
-            completed = self._capture_rows(request_id, state, capture_start, rows)
             token_end = capture_start + len(rows)
             state.capture_cursor = token_end
             state.scheduled_cursor = token_start + request_num_tokens
+            if self._use_capture_handoff:
+                start = max(emit_start, capture_start)
+                if start < token_end:
+                    state.handoff_rows.append(
+                        AuxRequestOutput(start, rows[start - capture_start :].copy())
+                    )
+                if sampled > 0 and emit_start <= token_end:
+                    outputs[request_id] = self._take_handoff_rows(
+                        state, token_end, rows
+                    )
+                continue
+            # Complete blocks without keys remain pending until a hash update.
+            completed = self._capture_rows(request_id, state, capture_start, rows)
             block_batches.append((state, completed))
 
             if sampled > 0 and emit_start <= token_end:
@@ -302,44 +316,46 @@ class AuxOutputWorkerConnector:
                 else:
                     materialize_outputs.append((request_id, emit_start, token_end))
 
+        if self._use_capture_handoff:
+            return outputs
+        assert buffer is not None
         # A consumer may reuse a block produced earlier in the same batch.
         self._publish_blocks(block_batches)
 
         for request_id, emit_start, token_end in materialize_outputs:
             state = self._requests[request_id]
-            parts = []
-            token_start = emit_start
-            leading = state.leading_rows
-            if leading is not None and emit_start < leading.token_start + len(
-                leading.rows
-            ):
-                if emit_start < leading.token_start:
-                    parts.append(
-                        self._read_rows(request_id, emit_start, leading.token_start)
-                    )
-                    emit_start = leading.token_start
-                leading_end = min(token_end, leading.token_start + len(leading.rows))
-                parts.append(
-                    leading.rows[
-                        emit_start - leading.token_start : leading_end
-                        - leading.token_start
-                    ]
-                )
-                emit_start = leading_end
-            if emit_start < token_end:
-                parts.append(self._read_rows(request_id, emit_start, token_end))
             outputs[request_id] = AuxRequestOutput(
-                token_start, parts[0] if len(parts) == 1 else np.concatenate(parts)
+                emit_start, self._read_rows(request_id, emit_start, token_end)
             )
             state.emit_cursor = token_end
-        for request_id in outputs:
-            state = self._requests[request_id]
-            leading = state.leading_rows
-            if leading is not None:
-                block_end = (leading.token_start // block_size + 1) * block_size
-                if state.emit_cursor >= block_end:
-                    state.leading_rows = None
         return outputs
+
+    @staticmethod
+    def _take_handoff_rows(
+        state: _WorkerRequestState, token_end: int, template: np.ndarray
+    ) -> AuxRequestOutput:
+        """Deliver new rows; training obtains the omitted parent prefix from TQ."""
+        cursor = state.emit_cursor
+        parts = []
+        for chunk in state.handoff_rows:
+            if cursor != chunk.token_start:
+                raise RuntimeError(
+                    "capture handoff has missing or overlapping routes at tokens "
+                    f"{cursor}:{chunk.token_start}; only the TQ-owned prefix may "
+                    "be omitted, never substituted with trainer routing"
+                )
+            parts.append(chunk.rows)
+            cursor = chunk.token_start + len(chunk.rows)
+        assert cursor == token_end, "capture handoff has no computed suffix"
+        rows = (
+            (parts[0] if len(parts) == 1 else np.concatenate(parts))
+            if parts
+            else template[:0].copy()
+        )
+        output = AuxRequestOutput(state.emit_cursor, rows)
+        state.handoff_rows.clear()
+        state.emit_cursor = token_end
+        return output
 
     def _capture_rows(
         self,
@@ -350,25 +366,7 @@ class AuxOutputWorkerConnector:
     ) -> list[tuple[int, np.ndarray]]:
         buffer = self._buffer
         assert buffer is not None
-        if (
-            self._use_capture_handoff
-            and state.capture_cursor is None
-            and token_start % buffer.block_size
-        ):
-            state.leading_rows = AuxRequestOutput(token_start, rows[:0])
-        leading = state.leading_rows
-        count = 0
-        if leading is not None:
-            block_end = (
-                leading.token_start // buffer.block_size + 1
-            ) * buffer.block_size
-            count = max(0, min(block_end - token_start, len(rows)))
-            if count:
-                assert token_start == leading.token_start + len(leading.rows), (
-                    "auxiliary output handoff suffix is not contiguous"
-                )
-                leading.rows = np.concatenate((leading.rows, rows[:count]))
-        return buffer.capture(request_id, token_start + count, rows[count:])
+        return buffer.capture(request_id, token_start, rows)
 
     def _read_rows(
         self, request_id: str, token_start: int, token_end: int
@@ -435,12 +433,12 @@ class AuxOutputWorkerConnector:
     def _teardown(self, request_ids: Iterable[str]) -> None:
         """Drop finished requests' temporary state after publishing key releases."""
         buffer = self._buffer
-        assert buffer is not None
         for request_id in request_ids:
             state = self._requests.pop(request_id)
-            for _, rows in state.pending_blocks:
-                buffer.release_block(rows)
-            buffer.discard(request_id)
+            if buffer is not None:
+                for _, rows in state.pending_blocks:
+                    buffer.release_block(rows)
+                buffer.discard(request_id)
 
     def drain(self) -> None:
         """Require consumed GPU snapshots and completed route publication."""
@@ -463,7 +461,7 @@ class AuxOutputWorkerConnector:
         deferred to that step's process_output.
         """
         self._step_metadata = metadata
-        if self._buffer is None or metadata is None:
+        if not self._is_output_rank or metadata is None:
             return
         assert not metadata.requests.keys() & metadata.finished_requests, (
             "auxiliary output request cannot run and finish in one step"
@@ -484,7 +482,8 @@ class AuxOutputWorkerConnector:
                     for state in self._requests.values()
                     for key in reversed(state.aux_output_keys)
                 )
-                self._buffer.reset()
+                if self._buffer is not None:
+                    self._buffer.reset()
                 self._requests.clear()
                 self._generation = metadata.generation
                 if self._shared_store is not None:
@@ -505,7 +504,8 @@ class AuxOutputWorkerConnector:
                 tuple[_WorkerRequestState, list[tuple[int, np.ndarray]]]
             ] = []
             retained_keys: list[str] = []
-            for request_id, block_hashes in metadata.block_hashes.items():
+            hashes = {} if self._use_capture_handoff else metadata.block_hashes
+            for request_id, block_hashes in hashes.items():
                 state = self._requests[request_id]
                 keys = (
                     self._shared_store.keys(list(block_hashes))
@@ -523,12 +523,14 @@ class AuxOutputWorkerConnector:
                     continue
                 finished_now.append(request_id)
                 release_keys.extend(reversed(state.aux_output_keys))
-            self._publish_blocks(block_batches, retained_keys, release_keys)
+            if not self._use_capture_handoff:
+                self._publish_blocks(block_batches, retained_keys, release_keys)
             self._teardown(finished_now)
 
     def close(self) -> None:
         with self._lock:
             self._pending_outputs.clear()
+            self._requests.clear()
             if self._store is not None:
                 try:
                     self._store.close()

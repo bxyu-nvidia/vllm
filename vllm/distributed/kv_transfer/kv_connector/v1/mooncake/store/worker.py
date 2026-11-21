@@ -1415,7 +1415,10 @@ class MooncakeStoreWorker:
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.aux_store: MooncakeBlockObjectStore | None = None
         self.aux_store_writer: BackgroundBlockObjectStore | None = None
-        self._aux_output_enabled = vllm_config.aux_output_config.enabled
+        self._aux_output_enabled = (
+            vllm_config.aux_output_config.enabled
+            and not vllm_config.aux_output_config.use_capture_handoff
+        )
         self.aux_cache_prefix = str(extra_config.get("cache_prefix", ""))
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
             extra_config.get("save_decode_cache", False)

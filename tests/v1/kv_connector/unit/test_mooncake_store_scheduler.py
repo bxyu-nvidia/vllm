@@ -561,6 +561,7 @@ def _make_pending_load_unfinished_request(
 ) -> None:
     request = SimpleNamespace(
         num_tokens=num_tokens,
+        max_cache_hit_length=None,
         num_prompt_tokens=num_tokens,
         block_hashes=block_hashes,
         num_output_placeholders=0,
@@ -948,6 +949,7 @@ def test_full_external_hit_keeps_kvpool_cached_tokens_block_aligned():
     request = SimpleNamespace(
         request_id="req-0",
         num_tokens=48,
+        max_cache_hit_length=None,
         block_hashes=[b"h0", b"h1", b"h2"],
     )
 
@@ -978,6 +980,7 @@ def test_full_external_hit_with_full_local_hit_skips_load():
     request = SimpleNamespace(
         request_id="req-0",
         num_tokens=48,
+        max_cache_hit_length=None,
         block_hashes=[b"h0", b"h1", b"h2"],
     )
 
@@ -1000,6 +1003,7 @@ def test_partial_hash_hit_block_aligned_local_loads_partial_tail():
     request = SimpleNamespace(
         request_id="req-0",
         num_tokens=32,
+        max_cache_hit_length=None,
         block_hashes=[b"h0", b"h1", b"h2", b"h3", b"h4", b"h5", b"h6", b"h7"],
     )
 
@@ -1025,6 +1029,7 @@ def test_partial_hash_hit_no_remote_gain_skips_load():
     request = SimpleNamespace(
         request_id="req-0",
         num_tokens=32,
+        max_cache_hit_length=None,
         block_hashes=[b"h0", b"h1", b"h2", b"h3", b"h4", b"h5", b"h6", b"h7"],
     )
 
@@ -1049,6 +1054,7 @@ def test_sub_block_prompt_looks_up_with_fine_grained():
     request = SimpleNamespace(
         request_id="req-0",
         num_tokens=12,
+        max_cache_hit_length=None,
         block_hashes=[b"h0", b"h1", b"h2"],
     )
 
@@ -1070,6 +1076,7 @@ def test_sub_block_prompt_not_looked_up_without_fine_grained():
     request = SimpleNamespace(
         request_id="req-0",
         num_tokens=12,
+        max_cache_hit_length=None,
         block_hashes=[b"h0", b"h1", b"h2"],
     )
 
@@ -1093,6 +1100,7 @@ def test_disabled_lookup_reports_no_hit_without_querying_client():
     request = SimpleNamespace(
         request_id="req-0",
         num_tokens=48,
+        max_cache_hit_length=None,
         block_hashes=[b"h0", b"h1", b"h2"],
     )
 
@@ -1764,3 +1772,31 @@ def test_worker_metadata_aggregates_completions_across_ranks():
         MooncakeStoreWorkerMetadata(completed_saves={1: 1, 2: 1})
     )
     assert merged.completed_saves == {1: 2, 2: 1}
+
+
+@pytest.mark.parametrize(
+    "limit,hit,lookup_tokens",
+    [
+        (None, 48, [64]),
+        (32, 32, [33]),
+        (0, 0, []),
+    ],
+)
+def test_capture_lookup_stops_at_tq_route_boundary(limit, hit, lookup_tokens):
+    scheduler = _make_bare_scheduler()
+    scheduler.load_async = True
+    scheduler.client = _StubLookupClient(hit_tokens=hit)
+    request = SimpleNamespace(
+        request_id="req-0",
+        num_tokens=64,
+        max_cache_hit_length=limit,
+        block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+    )
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (hit, hit > 0)
+    # The lookup itself must resolve the bounded Mamba state. Merely clipping
+    # an already-resolved hit could use the state for a different position.
+    assert scheduler.client.num_tokens == lookup_tokens
+    if hit:
+        assert scheduler.load_specs["req-0"].kvpool_cached_tokens == hit
+    else:
+        assert not scheduler.load_specs

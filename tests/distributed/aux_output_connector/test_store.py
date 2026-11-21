@@ -171,6 +171,7 @@ def _make_worker(
     max_num_batched_tokens: int | None = None,
     max_concurrent_batches: int = 2,
     max_store_blocks: int | None = None,
+    capture_handoff: bool = False,
 ) -> AuxOutputWorkerConnector:
     object_nbytes = _BLOCK_SIZE * int(np.prod(_SHAPE))
     store = _make_store(
@@ -192,7 +193,12 @@ def _make_worker(
     worker._requests = {}
     worker._generation = 0
     worker._shared_store = None
-    worker._use_capture_handoff = False
+    worker._use_capture_handoff = capture_handoff
+    worker._is_output_rank = True
+    if capture_handoff:
+        store.close()
+        worker._store = None
+        worker._buffer = None
     worker._step_metadata = None
     worker._pending_outputs = []
     worker._lock = threading.Lock()
@@ -239,6 +245,7 @@ def test_non_output_rank_skips_capture_snapshot():
     worker._buffer = None
     worker._capturer = Mock()
     worker._step_metadata = Mock()
+    worker._is_output_rank = False
     assert worker.prepare_output(_input_batch([], np.array([]), np.array([]))) is None
     worker._capturer.snapshot_routing_data.assert_not_called()
 
@@ -301,10 +308,13 @@ def test_next_step_does_not_consume_pending_output(monkeypatch):
     worker.close()
 
 
+@pytest.mark.parametrize("capture_handoff", [False, True])
 @pytest.mark.parametrize("num_pending", [1, 2])
-def test_finished_request_teardown_waits_for_pending_output(num_pending):
+def test_finished_request_teardown_waits_for_pending_output(
+    num_pending, capture_handoff
+):
     """Terminal cleanup waits for every outstanding output, not just the first."""
-    worker = _make_worker(1)
+    worker = _make_worker(1, capture_handoff=capture_handoff)
     rows = np.arange(4 * 3 * 2, dtype=np.uint8).reshape(4, *_SHAPE)
     worker._capturer = Mock()
     worker._capturer.snapshot_routing_data.return_value = torch.from_numpy(rows)
@@ -328,10 +338,12 @@ def test_finished_request_teardown_waits_for_pending_output(num_pending):
         np.testing.assert_array_equal(output["request"].rows, rows)
         if i + 1 < num_pending:
             assert "request" in worker._requests
-            assert worker._store._references
+            if not capture_handoff:
+                assert worker._store._references
     assert "request" not in worker._requests
     # The finished request's store keys must be released after commit.
-    assert not worker._store._references
+    if not capture_handoff:
+        assert not worker._store._references
     worker.close()
 
 
@@ -711,8 +723,8 @@ def test_pd_handoff_returns_suffix_without_caching_incomplete_blocks(
     capture_handoff: bool,
 ) -> None:
     """Only the capture handoff supports a cold, sub-block decode start."""
-    producer, consumer = _make_worker(1), _make_worker(1)
-    consumer._use_capture_handoff = capture_handoff
+    producer = _make_worker(1)
+    consumer = _make_worker(1, capture_handoff=capture_handoff)
     hashes = [b"a" * 32, b"b" * 32]
     rows = np.arange(9 * np.prod(_SHAPE), dtype=_DTYPE).reshape(9, *_SHAPE)
     try:
@@ -747,12 +759,10 @@ def test_pd_handoff_returns_suffix_without_caching_incomplete_blocks(
             )
             assert output["decode"].token_start == boundary
             np.testing.assert_array_equal(output["decode"].rows, rows[boundary:])
-            if boundary % _BLOCK_SIZE:
-                key = consumer._requests["decode"].aux_output_keys[
-                    boundary // _BLOCK_SIZE
-                ]
-                with pytest.raises(BlockObjectStoreError, match="does not exist"):
-                    consumer._store.get_concatenated([key])
+            if capture_handoff:
+                assert consumer._store is None
+                assert not consumer._requests["decode"].handoff_rows
+                assert not consumer._requests["decode"].aux_output_keys
     finally:
         producer.close()
         consumer.close()
@@ -808,8 +818,9 @@ def test_worker_matches_kv_eviction_order_after_requests_finish():
     worker.close()
 
 
-def test_worker_rejects_unbacked_capture_gap():
-    worker = _make_worker(1)
+@pytest.mark.parametrize("capture_handoff", [False, True])
+def test_worker_rejects_unbacked_capture_gap(capture_handoff):
+    worker = _make_worker(1, capture_handoff=capture_handoff)
     logical = np.arange(4 * 3 * 2, dtype=np.uint8).reshape(4, 3, 2)
     first = _metadata(
         0,
@@ -842,8 +853,9 @@ def test_worker_rejects_unbacked_capture_gap():
     worker.close()
 
 
-def test_worker_replays_rejected_speculative_gap():
-    worker = _make_worker(1)
+@pytest.mark.parametrize("capture_handoff", [False, True])
+def test_worker_replays_rejected_speculative_gap(capture_handoff):
+    worker = _make_worker(1, capture_handoff=capture_handoff)
     logical = np.arange(5 * 3 * 2, dtype=np.uint8).reshape(5, 3, 2)
     first = _metadata(
         0,
@@ -895,8 +907,9 @@ def test_worker_replays_rejected_speculative_gap():
     worker.close()
 
 
-def test_worker_rejects_overlapping_capture_rows():
-    worker = _make_worker(1)
+@pytest.mark.parametrize("capture_handoff", [False, True])
+def test_worker_rejects_overlapping_capture_rows(capture_handoff):
+    worker = _make_worker(1, capture_handoff=capture_handoff)
     logical = np.arange(4 * 3 * 2, dtype=np.uint8).reshape(4, 3, 2)
     first = _metadata(
         0,
@@ -2210,8 +2223,7 @@ def test_worker_local_reset_preserves_shared_mooncake_namespace(monkeypatch):
 
 @pytest.mark.parametrize("first_sample", [False, True])
 def test_capture_handoff_accumulates_partial_block_across_steps(first_sample):
-    worker = _make_worker(1)
-    worker._use_capture_handoff = True
+    worker = _make_worker(1, capture_handoff=True)
     hashes = [bytes([i]) * 32 for i in range(4)]
     rows = np.arange(15 * np.prod(_SHAPE), dtype=_DTYPE).reshape(15, *_SHAPE)
     emitted = []
@@ -2241,15 +2253,11 @@ def test_capture_handoff_accumulates_partial_block_across_steps(first_sample):
             else:
                 assert output == {}
         np.testing.assert_array_equal(np.concatenate(emitted), rows[5:14])
-        keys = worker._requests["decode"].aux_output_keys
-        with pytest.raises(BlockObjectStoreError, match="does not exist"):
-            worker._store.get_concatenated([keys[1]])
-        assert worker._store.get_concatenated([keys[2]]) == rows[8:12].tobytes()
-        assert worker._requests["decode"].leading_rows is None
+        assert not worker._requests["decode"].handoff_rows
+        assert not worker._requests["decode"].aux_output_keys
+        assert worker._store is None and worker._buffer is None
         _begin_step(worker, _metadata(0, [], {"decode": []}))
         assert not worker._requests
-        assert not worker._buffer._requests
-        assert not worker._buffer._owned_slots
     finally:
         worker.close()
 
@@ -2299,3 +2307,171 @@ def test_route_cache_reset_preserves_delayed_release_and_replaces_payload():
         assert store.get_concatenated(["a"]) == b"bb"
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("is_output_rank", [False, True])
+def test_capture_handoff_does_not_allocate_kv_sized_route_storage(
+    monkeypatch, is_output_rank
+):
+    from vllm.distributed.aux_output_connector import worker as module
+
+    monkeypatch.setattr(
+        module, "get_tp_group", lambda: SimpleNamespace(is_first_rank=is_output_rank)
+    )
+    monkeypatch.setattr(module, "bind_routed_experts_capturer", lambda *args: None)
+    capturer = Mock()
+    monkeypatch.setattr(module, "RoutedExpertsCapturer", lambda **kwargs: capturer)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("capture handoff must not create or connect a route cache")
+
+    for name in ("_get_mooncake_worker", "BlockObjectStore", "RoutedExpertsBuffer"):
+        monkeypatch.setattr(module, name, unexpected)
+    worker = AuxOutputWorkerConnector(
+        vllm_config=SimpleNamespace(
+            aux_output_config=SimpleNamespace(use_capture_handoff=True, max_bytes=None),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=2),
+            max_concurrent_batches=2,
+        ),
+        model=torch.nn.Identity(),
+        kv_cache_config=SimpleNamespace(num_blocks=1_000_000),
+    )
+    assert worker._store is None and worker._buffer is None
+    assert worker._shared_store is None
+    worker.clear_cached_outputs()
+    worker.close()
+
+
+@pytest.mark.parametrize("computed_start", [6, 10, 14])
+def test_capture_handoff_reuses_only_the_recorded_parent(computed_start):
+    worker = _make_worker(1, capture_handoff=True)
+    # Tokens before 10 already have routes in TQ. Recomputed parent rows are
+    # discarded; skipping any of the new suffix is an error, not a -1 fallback.
+    rows = np.arange(18, dtype=np.uint16).reshape((3, *_SHAPE)) + 40000
+    rows = np.tile(rows, (4, 1, 1))
+    try:
+        with (
+            pytest.raises(RuntimeError, match="missing or overlapping routes")
+            if computed_start > 10
+            else nullcontext()
+        ):
+            output = _process_output(
+                worker,
+                _metadata(
+                    0, [_request_metadata("r", computed_start, len(rows), 10, [])], {}
+                ),
+                rows,
+                ["r"],
+                np.array([0]),
+            )["r"]
+            assert output.token_start == 10
+            np.testing.assert_array_equal(output.rows, rows[10 - computed_start :])
+            assert output.rows.dtype == np.uint16
+            assert not worker._requests["r"].handoff_rows
+        assert not worker._requests["r"].aux_output_keys
+        _begin_step(worker, _metadata(0, [], {"r": []}))
+        assert not worker._requests
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize("handoff", [False, True])
+@pytest.mark.parametrize(
+    "phase,previous,remote,expected",
+    [
+        ("prefill", 0, 0, 0),
+        ("prefill", 33, 0, 32),
+        ("decode", 33, 48, 48),
+        ("decode", 33, 16, 32),
+    ],
+)
+def test_capture_preprocessing_limits_cache_reuse_to_recorded_routes(
+    handoff, phase, previous, remote, expected
+):
+    from vllm import SamplingParams
+    from vllm.v1.engine import EngineCoreRequest
+    from vllm.v1.engine.core import EngineCore
+
+    core = object.__new__(EngineCore)
+    core.vllm_config = SimpleNamespace(
+        aux_output_config=SimpleNamespace(use_capture_handoff=handoff)
+    )
+    core.capture_runtime = object()
+    core.mm_receiver_cache = None
+    core.request_block_hasher = None
+    context = dict(
+        version=1,
+        admission={"prev_len": previous},
+        weight_version=0,
+        phase=phase,
+        top_logprobs=0,
+        routed_experts=True,
+        prefill_key="prefill" if phase == "decode" else None,
+    )
+    request = EngineCoreRequest(
+        request_id="r",
+        external_req_id="r",
+        prompt_token_ids=list(range(65)),
+        mm_features=None,
+        pooling_params=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(
+            max_tokens=1,
+            routed_experts_prompt_start=expected,
+            extra_args={
+                "nemo_rl_capture": context,
+                "kv_transfer_params": {
+                    "do_remote_prefill": phase == "decode",
+                    "do_remote_decode": phase == "prefill",
+                    "remote_num_tokens": remote,
+                },
+            },
+        ),
+    )
+    prepared, _ = core.preprocess_add_request(request)
+    assert prepared.max_cache_hit_length == (expected if handoff else None)
+
+
+@pytest.mark.parametrize("finish", ["cancel", "reset", "close"])
+def test_capture_handoff_discards_unemitted_prefill_on_teardown(finish):
+    worker = _make_worker(1, capture_handoff=True)
+    rows = np.ones((5, *_SHAPE), dtype=_DTYPE)
+    try:
+        output = _process_output(
+            worker,
+            _metadata(0, [_request_metadata("r", 0, 5, 0, [])], {}),
+            rows,
+            ["r"],
+            np.array([0]),
+            np.array([0]),
+        )
+        assert not output and worker._requests["r"].handoff_rows
+        if finish == "cancel":
+            _begin_step(worker, _metadata(0, [], {"r": []}))
+        elif finish == "reset":
+            _begin_step(worker, _metadata(1, [], {}))
+        else:
+            worker.close()
+        assert not worker._requests
+    finally:
+        worker.close()
+
+
+def test_capture_handoff_metadata_has_no_reusable_block_hashes():
+    connector = AuxOutputSchedulerConnector(use_capture_handoff=True)
+    request = _SchedulerRequest("r", [b"a" * 32], 5)
+    scheduled = SimpleNamespace(num_scheduled_tokens={"r": 1})
+    metadata = connector.build_connector_meta(scheduled, {"r": request})
+    assert metadata.requests == {"r": 4}
+    assert not metadata.block_hashes
+    request.block_hashes.append(b"b" * 32)
+    # Hash-only updates must also be omitted for an unscheduled request.
+    scheduled.num_scheduled_tokens = {}
+    assert not connector.build_connector_meta(scheduled, {"r": request}).block_hashes
+    connector.request_finished(request)
+    metadata = connector.build_connector_meta(scheduled, {})
+    assert metadata.finished_requests == ("r",)
+    assert not metadata.block_hashes

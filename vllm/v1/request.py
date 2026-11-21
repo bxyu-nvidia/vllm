@@ -182,6 +182,9 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # Capture handoff has routes only for a known prefix in TQ. Cache
+        # lookups must not skip inference for the uncaptured suffix.
+        self.max_cache_hit_length: int | None = None
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related

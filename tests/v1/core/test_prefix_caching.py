@@ -6318,3 +6318,44 @@ def test_get_unhashed_block_ids_all_groups():
     )
 
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 4], []]
+
+
+@pytest.mark.parametrize("limit,expected", [(None, 64), (32, 32), (31, 16), (0, 0)])
+@pytest.mark.parametrize("with_connector", [False, True])
+def test_capture_cache_reuse_preserves_parent_but_recomputes_new_suffix(
+    limit, expected, with_connector
+):
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(16, 32),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    tokens = list(range(65))
+    original = make_request("original", tokens, 16, sha256)
+    assert manager.allocate_slots(original, 64) is not None
+    manager.free(original)
+    request = make_request("next", tokens, 16, sha256)
+    request.max_cache_hit_length = limit
+    result = (
+        manager.get_computed_blocks_for_connector(request)
+        if with_connector
+        else manager.get_computed_blocks(request)
+    )
+    assert result[1] == expected
+    assert len(result[0].blocks[0]) == expected // 16
+
+
+def test_capture_hybrid_connector_lookup_uses_recorded_route_boundary(monkeypatch):
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(16, 32, ["full", "mamba_align"]),
+        max_model_len=128,
+        enable_caching=True,
+        hash_block_size=16,
+    )
+    request = make_request("next", list(range(65)), 16, sha256)
+    request.max_cache_hit_length = 32
+    lookup = MagicMock(wraps=manager.coordinator.find_longest_cache_hit_per_group)
+    monkeypatch.setattr(manager.coordinator, "find_longest_cache_hit_per_group", lookup)
+    manager.get_computed_blocks_for_connector(request)
+    lookup.assert_called_once_with(request.block_hashes, 32)
