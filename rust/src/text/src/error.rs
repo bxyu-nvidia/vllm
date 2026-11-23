@@ -49,7 +49,7 @@ pub enum Error {
     #[error("text request stream `{request_id}` closed before terminal output")]
     StreamClosedBeforeTerminalOutput { request_id: String },
     #[error(transparent)]
-    Llm(#[from] LlmError),
+    Llm(LlmError),
     #[error(transparent)]
     EngineCore(#[from] EngineCoreError),
 }
@@ -79,6 +79,21 @@ impl Error {
                 EngineCoreError::InvalidDataParallelRank { .. },
             )) => true,
             _ => false,
+        }
+    }
+}
+
+impl From<LlmError> for Error {
+    fn from(error: LlmError) -> Self {
+        match error {
+            LlmError::EngineCoreClient(EngineCoreError::PromptTooLong {
+                max_model_len,
+                prompt_len,
+            }) => Self::PromptTooLong {
+                max_model_len,
+                prompt_len,
+            },
+            other => Self::Llm(other),
         }
     }
 }

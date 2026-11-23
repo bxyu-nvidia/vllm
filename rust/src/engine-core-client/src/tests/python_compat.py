@@ -117,6 +117,7 @@ class EngineCoreOutput(
     new_sampling_mask: object | None = None
     spec_decode_metrics: object | None = None
     prompt_token_id_logprobs: object | None = None
+    prompt_length_error: tuple[int, int] | None = None
 
 
 class ExtendedEngineCoreOutput(EngineCoreOutput):
@@ -559,3 +560,14 @@ print(msgspec.msgpack.encode(mooncake_stats).hex())
 print(msgspec.msgpack.encode(multi_connector_stats).hex())
 print(msgspec.msgpack.encode(ready_response).hex())
 print(extended_outputs_bytes.hex())
+
+print(
+    msgspec.msgpack.encode(
+        EngineCoreOutput(
+            request_id="too-long",
+            new_token_ids=[],
+            finish_reason=FinishReason.ERROR,
+            prompt_length_error=(262144, 262145),
+        )
+    ).hex()
+)

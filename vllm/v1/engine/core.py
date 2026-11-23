@@ -4,6 +4,7 @@ import gc
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 from collections import defaultdict, deque
@@ -31,6 +32,7 @@ from vllm.distributed.ec_transfer.ec_connector.encoder_output_width import (
     measure_encoder_output_widths,
 )
 from vllm.envs import enable_envs_cache
+from vllm.exceptions import PromptTooLongError
 from vllm.logger import configure_logging, init_logger
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
@@ -1868,8 +1870,13 @@ class EngineCoreProc(EngineCore):
 
         def ready() -> None:
             prompt = request.prompt_token_ids
-            if not prompt or len(prompt) >= self.vllm_config.model_config.max_model_len:
-                raise ValueError("aligned capture prompt exceeds max_model_len")
+            if not prompt:
+                raise ValueError("aligned capture prompt is empty")
+            if len(prompt) >= self.vllm_config.model_config.max_model_len:
+                raise PromptTooLongError(
+                    max_model_len=self.vllm_config.model_config.max_model_len,
+                    prompt_len=len(prompt),
+                )
             params = request.sampling_params
             assert params is not None and params.max_tokens is not None
             params.max_tokens = min(
@@ -2185,6 +2192,30 @@ class EngineCoreProc(EngineCore):
         """Log and return a request-scoped error response for exceptions raised
         from the add request preprocessing in the input socket processing thread.
         """
+        error = sys.exception()
+        if isinstance(error, PromptTooLongError):
+            logger.info("Rejected request %s: %s", request.request_id, error)
+            self.output_queue.put_nowait(
+                (
+                    request.client_index,
+                    EngineCoreOutputs(
+                        engine_index=self.engine_index,
+                        finished_requests={request.request_id},
+                        outputs=[
+                            EngineCoreOutput(
+                                request_id=request.request_id,
+                                new_token_ids=[],
+                                finish_reason=FinishReason.ERROR,
+                                prompt_length_error=(
+                                    error.max_model_len,
+                                    error.prompt_len,
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            )
+            return
         logger.exception(
             "Unexpected error pre-processing request %s", request.request_id
         )

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import torch
 
+from vllm.exceptions import PromptTooLongError
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -713,6 +714,17 @@ class OutputProcessor:
             if req_state is None:
                 # Ignore output for already-aborted request.
                 continue
+
+            if engine_core_output.prompt_length_error is not None:
+                max_model_len, prompt_len = engine_core_output.prompt_length_error
+                error = PromptTooLongError(
+                    max_model_len=max_model_len, prompt_len=prompt_len
+                )
+                self._finish_request(req_state)
+                if req_state.queue is not None:
+                    req_state.queue.put(error)
+                    continue
+                raise error
 
             # 1) Compute stats for this iteration.
             self._update_stats_from_output(

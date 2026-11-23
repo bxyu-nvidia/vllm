@@ -2798,6 +2798,14 @@ fn python_msgpack_fixtures_match_rust_encoding() {
         lines.next().expect("missing MultiConnector stats fixture line");
     let ready_response_hex = lines.next().expect("missing ready response fixture line");
     let extended_outputs_hex = lines.next().expect("missing extended outputs fixture line");
+    let length_error_hex = lines.next().expect("missing prompt length error fixture line");
+    let length_error: EngineCoreOutput =
+        rmp_serde::from_slice(&hex::decode(length_error_hex).unwrap()).unwrap();
+    assert_eq!(
+        length_error.finish_reason,
+        Some(EngineCoreFinishReason::Error)
+    );
+    assert_eq!(length_error.prompt_length_error, Some((262144, 262145)));
 
     let request_bytes = hex::decode(request_hex).unwrap();
     let multimodal_request_bytes = hex::decode(multimodal_request_hex).unwrap();
@@ -2919,6 +2927,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
                         new_sampling_mask: None,
                         spec_decode_metrics: None,
                         prompt_token_id_logprobs: None,
+                        prompt_length_error: None,
                     },
                 ],
                 scheduler_stats: None,

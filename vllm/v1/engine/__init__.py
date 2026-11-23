@@ -246,6 +246,10 @@ class EngineCoreOutput(
     # [num_scored_rows, num_token_ids]; appended last for array_like compatibility.
     prompt_token_id_logprobs: torch.Tensor | None = None
 
+    # (max_model_len, prompt_len) for post-alignment validation failures.
+    # Append-only: older frontends can still decode the ERROR finish reason.
+    prompt_length_error: tuple[int, int] | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None

@@ -19,6 +19,7 @@ from tests.v1.engine.utils import (
 )
 from vllm import PoolingParams
 from vllm.config.watermarking import WatermarkConfig
+from vllm.exceptions import PromptTooLongError
 from vllm.logprobs import FlatLogprobs, Logprob, PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
@@ -1872,3 +1873,44 @@ def test_weight_version_spans(output_kind: RequestOutputKind, steps, expected):
     final = queue.get_nowait()
     assert final is not None and final.finished
     assert final.outputs[0].weight_versions == [WeightVersionSpan(*s) for s in expected]
+
+
+@pytest.mark.skip_global_cleanup
+def test_async_prompt_length_error_is_request_scoped():
+    processor = OutputProcessor(tokenizer=None, log_stats=False)
+    queues = []
+    for request_id in ("too-long", "valid"):
+        request = EngineCoreRequest(
+            request_id=request_id,
+            external_req_id=request_id,
+            prompt_token_ids=[1],
+            mm_features=None,
+            sampling_params=SamplingParams(max_tokens=1),
+            pooling_params=None,
+            arrival_time=0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+        )
+        queue = RequestOutputCollector(RequestOutputKind.FINAL_ONLY, request_id)
+        processor.add_request(request, prompt=None, queue=queue)
+        queues.append(queue)
+    processor.process_outputs(
+        [
+            EngineCoreOutput(
+                request_id="too-long",
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                prompt_length_error=(4, 5),
+            ),
+            EngineCoreOutput(
+                request_id="valid",
+                new_token_ids=[2],
+                finish_reason=FinishReason.LENGTH,
+            ),
+        ]
+    )
+    with pytest.raises(PromptTooLongError, match="maximum context length is 4"):
+        queues[0].get_nowait()
+    assert queues[1].get_nowait().outputs[0].token_ids == [2]
+    assert not processor.request_states

@@ -56,6 +56,21 @@ class VLLMValidationError(VLLMClientError):
         return f"{base} ({', '.join(extras)})" if extras else base
 
 
+class PromptTooLongError(VLLMValidationError):
+    """A prompt leaves no space for generation within the model context."""
+
+    def __init__(self, *, max_model_len: int, prompt_len: int) -> None:
+        self.max_model_len = max_model_len
+        self.prompt_len = prompt_len
+        super().__init__(
+            f"This model's maximum context length is {max_model_len} tokens. "
+            f"However, your prompt contains {prompt_len} input tokens. "
+            "Please reduce the length of the input prompt.",
+            parameter="input_tokens",
+            value=prompt_len,
+        )
+
+
 class VLLMNotFoundError(VLLMClientError):
     """vLLM-specific NotFoundError."""
 

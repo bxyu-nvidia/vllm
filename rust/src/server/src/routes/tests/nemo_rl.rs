@@ -450,3 +450,94 @@ async fn pending_capture_result_and_release_target_the_owner() {
     }
     engine_task.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_prompt_too_long_returns_normal_400_and_keeps_serving() {
+    let (state, engine_task) =
+        test_admin_state_with_ready_and_engine_script(default_ready_response(), |dealer, push| {
+            boxed_test_future(async move {
+                for (length_error, finish) in [
+                    (Some((16, 16)), EngineCoreFinishReason::Error),
+                    (Some((16, 17)), EngineCoreFinishReason::Error),
+                    (None, EngineCoreFinishReason::Error),
+                    (None, EngineCoreFinishReason::Stop),
+                ] {
+                    let add = recv_engine_message(dealer).await;
+                    assert_eq!(add[0].as_ref(), &[0]);
+                    let request: EngineCoreRequest = rmp_serde::from_slice(&add[1]).unwrap();
+                    let mut output = request_output(&request.request_id, vec![], Some(finish));
+                    output.prompt_length_error = length_error;
+                    send_outputs(
+                        push,
+                        RequestBatchOutputs {
+                            outputs: vec![output],
+                            finished_requests: Some(BTreeSet::from([request.request_id])),
+                            ..Default::default()
+                        }
+                        .into(),
+                    )
+                    .await;
+                }
+            })
+        })
+        .await;
+    let mut state = Arc::try_unwrap(state).ok().unwrap();
+    state.chat = state.chat.with_prefix_token_alignment(true);
+    let mut app = build_router(Arc::new(state));
+    for (index, expected_status) in [
+        StatusCode::BAD_REQUEST,
+        StatusCode::BAD_REQUEST,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::OK,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut body = json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+        });
+        if index < 3 {
+            body["nemo_rl_capture"] = json!({
+                "version": 1, "admission": {"prev_len": 0},
+                "weight_version": 0, "phase": "prefill",
+                "top_logprobs": 0, "routed_experts": false,
+            });
+        }
+        let response = app
+            .call(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            expected_status,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        if index < 2 {
+            let expected = crate::error::chat_submit_error(
+                "failed to submit chat request",
+                vllm_chat::Error::Text(vllm_text::Error::PromptTooLong {
+                    max_model_len: 16,
+                    prompt_len: 16 + index as u32,
+                }),
+            )
+            .to_error_response();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+    }
+    engine_task.await.unwrap();
+}

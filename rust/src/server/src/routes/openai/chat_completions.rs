@@ -227,12 +227,10 @@ async fn collect_chat_completion(
         is_named_tool_choice,
     }: ResponseOptions,
 ) -> Result<ChatCompletionResponse, ApiError> {
-    let collected = stream.collect_message().await.map_err(|error| {
-        server_error!(
-            "failed to collect chat completion response: {}",
-            error.to_report_string()
-        )
-    })?;
+    let collected = stream
+        .collect_message()
+        .await
+        .map_err(|error| chat_submit_error("failed to collect chat completion response", error))?;
     let CollectedAssistantMessage {
         message,
         prompt_token_ids,

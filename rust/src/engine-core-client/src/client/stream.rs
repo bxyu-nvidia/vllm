@@ -175,6 +175,13 @@ impl Stream for EngineCoreOutputStream {
                         // come. Only the last output of a delivery can be terminal.
                         let output = delivery.last();
                         if output.finished() {
+                            if let Some((max_model_len, prompt_len)) = output.prompt_length_error {
+                                self.state = State::Finished;
+                                return Poll::Ready(Some(Err(Error::PromptTooLong {
+                                    max_model_len,
+                                    prompt_len,
+                                })));
+                            }
                             if output.finish_reason == Some(EngineCoreFinishReason::Error) {
                                 error!(
                                     self.request_id,

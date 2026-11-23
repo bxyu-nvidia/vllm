@@ -143,6 +143,9 @@ pub struct EngineCoreOutput {
     /// the first output of a request that asked for them.
     #[serde(default)]
     pub prompt_token_id_logprobs: Option<Box<WireNdArray>>,
+    /// `(max_model_len, prompt_len)` rejected after engine-side capture alignment.
+    #[serde(default)]
+    pub prompt_length_error: Option<(u32, u32)>,
 }
 
 /// Raw per-sequence speculative-decoding accumulator.
@@ -561,6 +564,7 @@ mod tests {
                             new_sampling_mask: None,
                             spec_decode_metrics: None,
                             prompt_token_id_logprobs: None,
+                            prompt_length_error: None,
                         },
                     ],
                     scheduler_stats: None,
