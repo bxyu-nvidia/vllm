@@ -19,6 +19,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     ReplaySSMModelContext,
     _ReplaySSMGroupContext,
+    _ReplaySSMMigrationTables,
 )
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.recoverssm_metadata import (
@@ -77,6 +78,16 @@ def test_replayssm_import_clears_stale_cursors_with_reordered_request_slots(comp
     group.block_table = torch.tensor([[4, 4], [1, 3]], device="cuda", dtype=torch.int32)
     group.ring_start = torch.full((5,), 9, device="cuda", dtype=torch.int32)
     group.num_committed = torch.full_like(group.ring_start, 5)
+    group.migration_tables = _ReplaySSMMigrationTables.create(
+        [
+            SimpleNamespace(
+                kv_cache=(),
+                replayssm_cache=(),
+                _replayssm_ring_start=group.ring_start,
+                _replayssm_prev_num_accepted=group.num_committed,
+            )
+        ]
+    )
     state._mamba_ctx = SimpleNamespace(replayssm=ReplaySSMModelContext([group]))
     state._get_mamba_group_info = Mock(
         return_value=([0], SimpleNamespace(block_size=16))
@@ -645,3 +656,118 @@ def test_separate_checkpoint_destinations_follow_batch_order_and_padding(
         0: [-1, 71] + ([-1] if padded else []),
         2: [91, -1] + ([-1] if padded else []),
     }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("conv_dim_first", [False, True], ids=["SD", "DS"])
+@pytest.mark.parametrize("capture", [False, True], ids=["eager", "cuda-graph"])
+def test_replayssm_migrates_latest_state_after_async_rejection(conv_dim_first, capture):
+    """Early allocation must not freeze state before the GPU crosses token 25728."""
+    # Every layer/state is contiguous within a slot but padded between slots.
+    # The padding stands for other layers in the block-major cache allocation.
+    shapes = [
+        (128, 8) if conv_dim_first else (8, 128),
+        (2, 64, 128),
+        (2, 20, 64),
+        (2, 20),
+        (1, 20, 128),
+    ]
+    dtypes = [
+        torch.bfloat16,
+        torch.float32,
+        torch.bfloat16,
+        torch.float32,
+        torch.bfloat16,
+    ]
+    backing = [
+        torch.full((6, 2, *s), -17, device="cuda", dtype=d)
+        for s, d in zip(shapes, dtypes)
+    ]
+    tensors = [t[:, 0] for t in backing]
+    for i, tensor in enumerate(tensors):
+        tensor[1].fill_(i + 1)
+        tensor[3].fill_(-99)  # stale/empty newly allocated destination
+    start = torch.tensor([0, 7, 2, 9, 0, 0], device="cuda", dtype=torch.int32)
+    committed = torch.tensor([0, 3, 1, 5, 0, 0], device="cuda", dtype=torch.int32)
+    mixer = SimpleNamespace(
+        kv_cache=tuple(tensors[:2]),
+        replayssm_cache=tuple(tensors[2:]),
+        _replayssm_ring_start=start,
+        _replayssm_prev_num_accepted=committed,
+        replayssm_buffer_len=16,
+        A=torch.zeros(2, device="cuda"),
+    )
+    group = _ReplaySSMGroupContext.create(
+        [mixer],
+        torch.tensor([[0, 0, 1, 3], [2, 4, 0, 0]], device="cuda", dtype=torch.int32),
+        "align",
+        8576,
+        2,
+    )
+    state = object.__new__(MambaHybridModelState)
+    state._align_mode = state._use_flashinfer_replayssm = True
+    state._mamba_state_idx_gpu = torch.tensor(
+        [0, -1, 2], device="cuda", dtype=torch.int32
+    )
+    state._mamba_src_col_gpu = torch.full_like(state._mamba_state_idx_gpu, -1)
+    state._mamba_src_off_gpu = torch.zeros_like(state._mamba_state_idx_gpu)
+    state.num_accepted_tokens_gpu = torch.tensor(
+        [1, 1, 3], device="cuda", dtype=torch.int32
+    )
+    state._mamba_ctx = SimpleNamespace(replayssm=ReplaySSMModelContext([group]))
+    state._get_mamba_group_info = Mock(
+        return_value=([0], SimpleNamespace(block_size=8576))
+    )
+    batch = SimpleNamespace(
+        num_reqs=2,
+        idx_mapping=torch.tensor([2, 0], device="cuda", dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 6, 12], device="cuda", dtype=torch.int32),
+    )
+    computed = torch.tensor([1000, 0, 25721], device="cuda", dtype=torch.int32)
+    all_tensors = [*tensors, start, committed]
+
+    def preprocess():
+        state.preprocess_state(batch, (), Mock(), computed)
+
+    if capture:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            preprocess()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            preprocess()
+        run = graph.replay
+    else:
+        run = preprocess
+
+    original = [t.clone() for t in all_tensors]
+    for position in (25721, 25722):
+        computed[2] = position
+        run()
+        assert state._mamba_state_idx_gpu.tolist() == [0, -1, 2]
+        for tensor, before in zip(all_tensors, original):
+            torch.testing.assert_close(tensor[3], before[3], rtol=0, atol=0)
+            tensor[1].add_(1)  # old block continues to evolve after allocation
+
+    latest = [t.clone() for t in all_tensors]
+    computed[2] = 25723
+    run()
+    assert state._mamba_state_idx_gpu.tolist() == [0, -1, 3]
+    assert state.num_accepted_tokens_gpu.tolist() == [1, 1, 3]
+    for tensor, before in zip(all_tensors, latest):
+        expected = before.clone()
+        expected[3] = before[1]
+        torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
+
+    # The next step must continue using its new live history, without recopying.
+    for tensor in all_tensors:
+        tensor[3].add_(1)
+    after_update = [t.clone() for t in all_tensors]
+    computed[2] = 25724
+    run()
+    for tensor, before in zip(all_tensors, after_update):
+        torch.testing.assert_close(tensor, before, rtol=0, atol=0)
+    for storage in backing:
+        assert (storage[:, 1] == -17).all()

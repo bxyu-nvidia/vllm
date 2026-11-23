@@ -306,7 +306,7 @@ def test_mamba_checkpoint_hash_maps_only_to_checkpoint_block(
     assert pool.get_cached_block(block_hash, [0]) == [checkpoint_block]
 
 
-def test_replayssm_queues_live_copy_for_new_state_block():
+def test_replayssm_defers_live_copy_until_worker_block_transition():
     spec = MambaSpec(
         block_size=4,
         shapes=((2,), (3,)),
@@ -330,13 +330,29 @@ def test_replayssm_queues_live_copy_for_new_state_block():
 
     manager.allocate_new_blocks("request", num_tokens=5, num_tokens_main_model=5)
     destination = manager.req_to_blocks["request"][-1]
-    assert manager.take_pending_cow_copies() == [(source, destination)]
-    assert source.ref_cnt == 2
-    assert destination.ref_cnt == 2
+    # The CPU can allocate across a boundary before the GPU reaches it.
+    # Rejection leaves the worker updating source, so copying now goes stale.
+    assert manager.take_pending_cow_copies() == []
+    assert source.ref_cnt == destination.ref_cnt == 1
+    manager.remove_skipped_blocks("request", processed_computed_tokens=3)
+    assert manager.req_to_blocks["request"][0] is source
+    # A later step reaches the boundary without allocating another block.
+    assert manager.allocate_new_blocks("request", 6, 6) == []
+    assert manager.take_pending_cow_copies() == []
+    assert manager.req_to_blocks["request"] == [source, destination]
+    manager.remove_skipped_blocks("request", processed_computed_tokens=5)
+    assert manager.req_to_blocks["request"][0].is_null
+    assert source.ref_cnt == 0
 
-    block_pool.free_blocks([source, destination])
-    assert source.ref_cnt == 1
-    assert destination.ref_cnt == 1
+    # A new prefix-cache owner still bootstraps from its canonical hit.
+    cached = block_pool.get_new_blocks(1)[0]
+    manager.req_to_blocks["hit"] = [cached]
+    manager.allocate_new_blocks("hit", num_tokens=5, num_tokens_main_model=5)
+    hit_destination = manager.req_to_blocks["hit"][-1]
+    assert manager.take_pending_cow_copies() == [(cached, hit_destination)]
+    assert cached.ref_cnt == hit_destination.ref_cnt == 2
+    block_pool.free_blocks([cached, hit_destination])
+    assert cached.ref_cnt == hit_destination.ref_cnt == 1
 
 
 def get_sliding_window_manager(

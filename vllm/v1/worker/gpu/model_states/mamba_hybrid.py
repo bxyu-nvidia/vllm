@@ -201,9 +201,9 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         """Prepare each request's Mamba slot before the forward.
 
-        ReplaySSM live state has already moved through the scheduler block-copy
-        path, so this phase only resets a fresh slot's cursors. Baseline Mamba
-        retains the fused state pre-copy. Dummy DP/profiling runs skip this.
+        Migrate using the GPU-corrected position, not the scheduler's optimistic
+        allocation boundary. ReplaySSM moves its full live history; a new owner
+        instead resets the cursors of its imported canonical state.
         """
         if not self._align_mode:
             return
@@ -236,6 +236,12 @@ class MambaHybridModelState(DefaultModelState):
 
         if replayssm is not None:
             replayssm.reset_new_slots(
+                idx_mapping=input_batch.idx_mapping,
+                src_cols=self._mamba_src_col_gpu,
+                dst_cols=self._mamba_state_idx_gpu,
+                num_reqs=num_reqs,
+            )
+            replayssm.migrate_live_slots(
                 idx_mapping=input_batch.idx_mapping,
                 src_cols=self._mamba_src_col_gpu,
                 dst_cols=self._mamba_state_idx_gpu,

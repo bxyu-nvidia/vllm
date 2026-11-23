@@ -15,6 +15,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     TritonSSUBackend,
     _postprocess_replayssm_kernel,
     _ReplaySSMGroupContext,
+    _ReplaySSMMigrationTables,
     get_mamba_ssu_backend,
     initialize_mamba_ssu_backend,
     selective_state_update,
@@ -643,3 +644,28 @@ def test_replayssm_mixer_selects_mtp_layout(
     else:
         assert kernel.call_args.kwargs["cu_seqlens"] is query_start_loc_d
     assert kernel.call_args.kwargs["max_seqlen"] == expected_max_seqlen
+
+
+def test_replayssm_migration_tables_keep_padded_slots_and_shared_trackers():
+    """Migration copies tensor payloads, not whole overlaid cache allocations."""
+    backing = torch.zeros(4, 3, 17, dtype=torch.bfloat16)
+    start = torch.zeros(4, dtype=torch.int32)
+    committed = torch.zeros_like(start)
+    mixers = [
+        SimpleNamespace(
+            kv_cache=(backing[:, layer],),
+            replayssm_cache=(),
+            _replayssm_ring_start=start,
+            _replayssm_prev_num_accepted=committed,
+        )
+        for layer in (0, 1)
+    ]
+    tables = _ReplaySSMMigrationTables.create(mixers)
+    assert tables.state_ptrs.tolist() == [
+        backing[:, 0].data_ptr(),
+        start.data_ptr(),
+        committed.data_ptr(),
+        backing[:, 1].data_ptr(),
+    ]
+    assert tables.slot_strides.tolist() == [102, 4, 4, 102]
+    assert tables.slot_sizes.tolist() == [34, 4, 4, 34]

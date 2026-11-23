@@ -1546,8 +1546,8 @@ def preprocess_mamba(
             )
 
         fused.src_col.np[:num_reqs] = -1
-        # ReplaySSM reset consumes only source/destination columns. token_bias
-        # belongs to the generic pre-copy kernel, which ReplaySSM does not call.
+        # ReplaySSM moves the full live slot without shifting convolution state.
+        # Its existing accepted-token offset still applies after migration.
         if fused.ctx.replayssm is None:
             fused.token_bias.np[:num_reqs] = 0
 
@@ -1584,9 +1584,8 @@ def preprocess_mamba(
                 # Scheduling pauses retain their live owner and its cursors.
                 fused.src_col.np[i] = prev_state_idx if has_live_state else -1
 
-        # Baseline Mamba migrates canonical state when ownership crosses a
-        # column. ReplaySSM receives that ownership move through scheduler block
-        # copies and uses src/dst only to reset genuinely fresh ring slots.
+        # Baseline Mamba shifts the canonical state. ReplaySSM instead copies
+        # the full live slot and preserves the convolution acceptance offset.
         if (
             prev_state_idx != -1
             and prev_state_idx != curr_state_idx
@@ -1616,6 +1615,12 @@ def preprocess_mamba(
         fused.src_col.copy_to_gpu(num_reqs)
         if fused.ctx.replayssm is not None:
             fused.ctx.replayssm.reset_new_slots(
+                idx_mapping=None,
+                src_cols=fused.src_col.gpu,
+                dst_cols=fused.state_idx.gpu,
+                num_reqs=num_reqs,
+            )
+            fused.ctx.replayssm.migrate_live_slots(
                 idx_mapping=None,
                 src_cols=fused.src_col.gpu,
                 dst_cols=fused.state_idx.gpu,
