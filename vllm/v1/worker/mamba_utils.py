@@ -842,6 +842,7 @@ class MambaSpecDecodeGPUContext:
     is_prefilling_buf: CpuGpuBuffer | None = None
     is_prefill_tail_buf: CpuGpuBuffer | None = None
     precopy_src_col_buf: CpuGpuBuffer | None = None
+    initial_state_col_buf: CpuGpuBuffer | None = None
     precopy_token_bias_buf: CpuGpuBuffer | None = None
 
     # Flag to track if metadata has been populated
@@ -941,6 +942,7 @@ class MambaSpecDecodeGPUContext:
             is_prefilling_buf=make_buffer(max_num_reqs, dtype=torch.bool),
             is_prefill_tail_buf=make_buffer(max_num_reqs, dtype=torch.bool),
             precopy_src_col_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            initial_state_col_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             precopy_token_bias_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             is_initialized=False,
             replayssm=None,
@@ -1583,6 +1585,8 @@ def preprocess_mamba(
                 # loads do not populate the replay rings or their cursors.
                 # Scheduling pauses retain their live owner and its cursors.
                 fused.src_col.np[i] = prev_state_idx if has_live_state else -1
+                assert fused.ctx.initial_state_col_buf is not None
+                fused.ctx.initial_state_col_buf.np[i] = prev_state_idx
 
         # Baseline Mamba shifts the canonical state. ReplaySSM instead copies
         # the full live slot and preserves the convolution acceptance offset.
@@ -1614,13 +1618,16 @@ def preprocess_mamba(
         fused.state_idx.copy_to_gpu(num_reqs)
         fused.src_col.copy_to_gpu(num_reqs)
         if fused.ctx.replayssm is not None:
-            fused.ctx.replayssm.reset_new_slots(
+            assert fused.ctx.initial_state_col_buf is not None
+            fused.ctx.initial_state_col_buf.copy_to_gpu(num_reqs)
+            fused.ctx.replayssm.migrate_live_slots(
                 idx_mapping=None,
                 src_cols=fused.src_col.gpu,
                 dst_cols=fused.state_idx.gpu,
+                initial_state_cols=fused.ctx.initial_state_col_buf.gpu,
                 num_reqs=num_reqs,
             )
-            fused.ctx.replayssm.migrate_live_slots(
+            fused.ctx.replayssm.reset_new_slots(
                 idx_mapping=None,
                 src_cols=fused.src_col.gpu,
                 dst_cols=fused.state_idx.gpu,

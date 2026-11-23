@@ -26,6 +26,9 @@ from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
 )
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.gpu.model_states import mamba_hybrid
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
     MambaHybridModelState,
@@ -51,17 +54,48 @@ def test_add_request_seeds_state_with_scoped_block_size(
     state._use_flashinfer_replayssm = use_flashinfer_replayssm
     state.num_accepted_tokens_gpu = torch.full((2,), 9, dtype=torch.int32)
     state._mamba_state_idx_gpu = torch.full((2,), -1, dtype=torch.int32)
+    state._mamba_initial_state_idx_gpu = torch.full((2,), -1, dtype=torch.int32)
 
     state.add_request(1, Mock(num_computed_tokens=17))
 
     assert state.num_accepted_tokens_gpu.tolist() == [9, 1]
     assert state._mamba_state_idx_gpu.tolist() == [-1, expected_state_idx]
+    assert state._mamba_initial_state_idx_gpu.tolist() == [
+        -1,
+        2 if use_flashinfer_replayssm else -1,
+    ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("computed", [15, 16, 17])
-def test_replayssm_import_clears_stale_cursors_with_reordered_request_slots(computed):
-    """A new/resumed owner resets only its destination; paused owners keep replay."""
+@pytest.mark.parametrize("computed", [0, 15, 16, 17, 32])
+@pytest.mark.parametrize("scheduled", [1, 25], ids=["decode-tail", "prefill-chunk"])
+def test_replayssm_import_clears_stale_cursors_with_reordered_request_slots(
+    computed, scheduled
+):
+    """Async KV loads bootstrap canonical state; paused owners retain replay."""
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((4,), (8,)),
+        dtypes=(torch.float32,) * 2,
+        replayssm_shapes=((4,), (4,), (4,)),
+        replayssm_dtypes=(torch.float32,) * 3,
+        mamba_cache_mode="align",
+    )
+    manager = MambaManager(
+        spec,
+        BlockPool(num_gpu_blocks=5, enable_caching=True, hash_block_size=16),
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=16,
+    )
+    # The connector reserves blocks while WAITING_FOR_REMOTE_KVS, without a
+    # forward. Admission later can cross into another block without a CPU copy.
+    manager.allocate_new_blocks("remote", computed, computed)
+    source = manager.req_to_blocks["remote"][-1].block_id if computed else None
+    manager.allocate_new_blocks("remote", computed + scheduled, computed + scheduled)
+    assert manager.take_pending_cow_copies() == []
+    blocks = [b.block_id for b in manager.req_to_blocks["remote"]]
+    destination = blocks[-1]
     state = object.__new__(MambaHybridModelState)
     state.rope_state = state.prompt_embeds_state = None
     state.cache_config = SimpleNamespace(mamba_block_size=16)
@@ -74,14 +108,22 @@ def test_replayssm_import_clears_stale_cursors_with_reordered_request_slots(comp
     )
     state._mamba_src_col_gpu = torch.full_like(state._mamba_state_idx_gpu, -1)
     state._mamba_src_off_gpu = torch.zeros_like(state._mamba_state_idx_gpu)
+    state._mamba_initial_state_idx_gpu = torch.full_like(state._mamba_state_idx_gpu, -1)
     group = object.__new__(_ReplaySSMGroupContext)
-    group.block_table = torch.tensor([[4, 4], [1, 3]], device="cuda", dtype=torch.int32)
+    group.block_table = torch.tensor(
+        [[4] * len(blocks), blocks], device="cuda", dtype=torch.int32
+    )
+    canonical = [torch.full((5, width), -99.0, device="cuda") for width in (4, 8)]
+    if source is not None:
+        for i, tensor in enumerate(canonical):
+            tensor[source].fill_(i + 42.0)
+    before = [t.clone() for t in canonical]
     group.ring_start = torch.full((5,), 9, device="cuda", dtype=torch.int32)
     group.num_committed = torch.full_like(group.ring_start, 5)
     group.migration_tables = _ReplaySSMMigrationTables.create(
         [
             SimpleNamespace(
-                kv_cache=(),
+                kv_cache=tuple(canonical),
                 replayssm_cache=(),
                 _replayssm_ring_start=group.ring_start,
                 _replayssm_prev_num_accepted=group.num_committed,
@@ -98,20 +140,31 @@ def test_replayssm_import_clears_stale_cursors_with_reordered_request_slots(comp
         SimpleNamespace(
             num_reqs=2,
             idx_mapping=torch.tensor([2, 1], device="cuda", dtype=torch.int32),
-            query_start_loc=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+            query_start_loc=torch.tensor(
+                [0, 1, 1 + scheduled], device="cuda", dtype=torch.int32
+            ),
         ),
         (),
         Mock(),
         torch.full((4,), computed, device="cuda", dtype=torch.int32),
     )
 
-    destination = 1 if computed == 15 else 3
+    for tensor, original in zip(canonical, before):
+        expected = original.clone()
+        if source is not None:
+            expected[destination] = original[source]
+        torch.testing.assert_close(tensor, expected, rtol=0, atol=0)
     expected_start = [9] * 5
     expected_committed = [5] * 5
     expected_start[destination] = expected_committed[destination] = 0
     assert group.ring_start.tolist() == expected_start
     assert group.num_committed.tolist() == expected_committed
-    assert state._mamba_state_idx_gpu.tolist() == [0, computed // 16, computed // 16, 9]
+    assert state._mamba_state_idx_gpu.tolist() == [
+        0,
+        (computed + scheduled - 1) // 16,
+        computed // 16,
+        9,
+    ]
     assert state.num_accepted_tokens_gpu.tolist() == [3, 1, 3, 3]
 
 
@@ -709,6 +762,7 @@ def test_replayssm_migrates_latest_state_after_async_rejection(conv_dim_first, c
     state._mamba_state_idx_gpu = torch.tensor(
         [0, -1, 2], device="cuda", dtype=torch.int32
     )
+    state._mamba_initial_state_idx_gpu = torch.full_like(state._mamba_state_idx_gpu, -1)
     state._mamba_src_col_gpu = torch.full_like(state._mamba_state_idx_gpu, -1)
     state._mamba_src_off_gpu = torch.zeros_like(state._mamba_state_idx_gpu)
     state.num_accepted_tokens_gpu = torch.tensor(

@@ -111,6 +111,9 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
+            self._mamba_initial_state_idx_gpu = torch.full(
+                (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
+            )
             self._mamba_src_col_gpu = torch.full(
                 (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
             )
@@ -129,14 +132,15 @@ class MambaHybridModelState(DefaultModelState):
             # smaller block (e.g. DFlash) pulls it below mamba_block_size.
             mamba_block_size = self.cache_config.mamba_block_size
             assert mamba_block_size is not None
-            # ReplaySSM's scheduler copies the canonical checkpoint into the
-            # live slot. Mark new/resumed ownership so preprocess resets the
-            # slot's cursors: remote transfers do not populate replay history.
-            state_idx = (
-                -1
-                if self._use_flashinfer_replayssm
-                else (new_req_data.num_computed_tokens - 1) // mamba_block_size
-            )
+            initial_state_idx = (
+                new_req_data.num_computed_tokens - 1
+            ) // mamba_block_size
+            if self._use_flashinfer_replayssm:
+                self._mamba_initial_state_idx_gpu[req_index].fill_(initial_state_idx)
+            # Imported checkpoints contain canonical state, not replay history.
+            # Keep the source column separately from the live-owner sentinel so
+            # the first forward both migrates the checkpoint and resets cursors.
+            state_idx = -1 if self._use_flashinfer_replayssm else initial_state_idx
             self._mamba_state_idx_gpu[req_index].fill_(state_idx)
 
     def _get_mamba_group_info(
@@ -235,13 +239,14 @@ class MambaHybridModelState(DefaultModelState):
         )
 
         if replayssm is not None:
-            replayssm.reset_new_slots(
+            replayssm.migrate_live_slots(
                 idx_mapping=input_batch.idx_mapping,
                 src_cols=self._mamba_src_col_gpu,
                 dst_cols=self._mamba_state_idx_gpu,
+                initial_state_cols=self._mamba_initial_state_idx_gpu,
                 num_reqs=num_reqs,
             )
-            replayssm.migrate_live_slots(
+            replayssm.reset_new_slots(
                 idx_mapping=input_batch.idx_mapping,
                 src_cols=self._mamba_src_col_gpu,
                 dst_cols=self._mamba_state_idx_gpu,

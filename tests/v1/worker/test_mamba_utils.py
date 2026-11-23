@@ -842,13 +842,14 @@ def test_stage_replayssm_prefill_classification(
 
 
 @pytest.mark.parametrize("ownership", ["new", "resumed", "continuing", "paused"])
-@pytest.mark.parametrize("computed", [15, 16])
+@pytest.mark.parametrize("computed", [0, 15, 16, 17, 32])
 def test_replayssm_import_resets_cursors_but_preserves_live_owners(ownership, computed):
     """A canonical cache hit has no replay history, even in a recycled slot."""
     device = torch.device("cpu")
     ctx = _make_staging_ctx(1, device)
     ctx.mamba_state_idx_buf = _MockCpuGpuBuffer(1, torch.int32, device)
     ctx.precopy_src_col_buf = _MockCpuGpuBuffer(1, torch.int32, device)
+    ctx.initial_state_col_buf = _MockCpuGpuBuffer(1, torch.int32, device)
     ctx.precopy_token_bias_buf = _MockCpuGpuBuffer(1, torch.int32, device)
     ctx.is_initialized = True
     state_idx = {} if ownership == "new" else {"req": (computed - 1) // 16}
@@ -881,6 +882,13 @@ def test_replayssm_import_resets_cursors_but_preserves_live_owners(ownership, co
     )
     assert call["src_cols"].item() == expected_source
     assert call["dst_cols"].item() == computed // 16
+    migration = ctx.replayssm.migrate_live_slots.call_args.kwargs
+    assert migration["initial_state_cols"].item() == (computed - 1) // 16
+    # Reset after copying so stale imported cursor bytes cannot become live.
+    assert [c[0] for c in ctx.replayssm.mock_calls] == [
+        "migrate_live_slots",
+        "reset_new_slots",
+    ]
 
 
 def test_gpu_context_ignores_auxiliary_cache_tensors() -> None:

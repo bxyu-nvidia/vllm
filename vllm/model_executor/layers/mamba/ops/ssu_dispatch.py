@@ -96,6 +96,7 @@ def _migrate_replayssm_slots_kernel(
     idx_mapping,
     src_cols,
     dst_cols,
+    initial_state_cols,
     block_table,
     state_ptrs,
     slot_strides,
@@ -107,7 +108,7 @@ def _migrate_replayssm_slots_kernel(
     COPY_TILES: tl.constexpr,
     NUM_TENSORS: tl.constexpr,
 ):
-    """Copy the complete live slot at the worker's actual block transition."""
+    """Copy live history or bootstrap from an imported canonical checkpoint."""
     batch_idx = tl.program_id(0)
     tile_idx = tl.program_id(1)
     req_idx = batch_idx
@@ -116,6 +117,8 @@ def _migrate_replayssm_slots_kernel(
         if req_idx < 0:
             return
     src_col = tl.load(src_cols + req_idx)
+    if src_col < 0:
+        src_col = tl.load(initial_state_cols + req_idx)
     dst_col = tl.load(dst_cols + req_idx)
     if src_col < 0 or dst_col < 0 or src_col == dst_col:
         return
@@ -500,12 +503,15 @@ class _ReplaySSMGroupContext:
         idx_mapping: torch.Tensor | None,
         src_cols: torch.Tensor,
         dst_cols: torch.Tensor,
+        initial_state_cols: torch.Tensor,
         num_reqs: int,
     ) -> None:
-        """Move live history after rejection correction, before the next forward.
+        """Move state at the worker's actual block transition.
 
-        Keep replay cursors and the convolution acceptance offset unchanged:
-        this moves a live slot, not a canonical prefix checkpoint.
+        New owners bootstrap from their imported checkpoint column; async KV
+        loading may have reserved blocks without executing a forward or a
+        scheduler copy. Call reset_new_slots afterwards to discard imported
+        replay cursors. Continuing owners preserve their full live history.
         """
         if num_reqs == 0:
             return
@@ -514,6 +520,7 @@ class _ReplaySSMGroupContext:
             idx_mapping,
             src_cols,
             dst_cols,
+            initial_state_cols,
             self.block_table,
             *tables,
             self.block_table.stride(0),
