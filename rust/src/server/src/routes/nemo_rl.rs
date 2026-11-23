@@ -196,6 +196,14 @@ async fn capture_metadata(State(state): State<Arc<AppState>>) -> Result<Json<Val
     })))
 }
 
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum RefitPauseMode {
+    #[default]
+    Drain,
+    Keep,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum RefitRequest {
@@ -212,9 +220,17 @@ enum RefitRequest {
     },
     Update {
         refit_timeout_s: f64,
+        #[serde(default)]
+        pause_mode: RefitPauseMode,
     },
-    Pause {},
-    DrainCaches {},
+    Pause {
+        #[serde(default)]
+        pause_mode: RefitPauseMode,
+    },
+    DrainCaches {
+        #[serde(default)]
+        pause_mode: RefitPauseMode,
+    },
     Resume {},
     Reset {},
 }
@@ -337,17 +353,25 @@ async fn refit(
             )
             .await?;
         }
-        RefitRequest::Update { refit_timeout_s } => {
+        RefitRequest::Update {
+            refit_timeout_s,
+            pause_mode,
+        } => {
             if !refit_timeout_s.is_finite() || refit_timeout_s <= 0.0 {
                 return Err(ApiError::invalid_request(
                     "refit_timeout_s must be positive and finite",
                     Some("refit_timeout_s"),
                 ));
             }
+            let barrier = if pause_mode == RefitPauseMode::Keep {
+                "suspend_capture"
+            } else {
+                "drain_capture"
+            };
             time_refit_phase(
                 &mut timings,
-                "drain_capture",
-                capture_barrier(client, "drain_capture", json!([])),
+                barrier,
+                capture_barrier(client, barrier, json!([])),
             )
             .await?;
             time_refit_phase(
@@ -363,31 +387,58 @@ async fn refit(
             )
             .await?;
         }
-        RefitRequest::Pause {} => {
+        RefitRequest::Pause { pause_mode } => {
+            let keep = pause_mode == RefitPauseMode::Keep;
+            let barrier = if keep {
+                "pause_capture_admission"
+            } else {
+                "drain_capture"
+            };
             time_refit_phase(
                 &mut timings,
-                "drain_capture",
-                capture_barrier(client, "drain_capture", json!([])),
+                barrier,
+                capture_barrier(client, barrier, json!([])),
             )
             .await?;
             time_refit_phase(&mut timings, "pause_scheduler", async {
                 client
                     .pause_scheduler(
-                        vllm_engine_core_client::protocol::utility::PauseMode::Wait,
+                        if keep {
+                            vllm_engine_core_client::protocol::utility::PauseMode::Keep
+                        } else {
+                            vllm_engine_core_client::protocol::utility::PauseMode::Wait
+                        },
                         false,
                     )
                     .await
                     .map_err(|error| utility_call_error("pause_scheduler", error))
             })
             .await?;
+            if keep {
+                time_refit_phase(
+                    &mut timings,
+                    "suspend_capture",
+                    capture_barrier(client, "suspend_capture", json!([])),
+                )
+                .await?;
+            }
         }
-        RefitRequest::DrainCaches {} => {
-            time_refit_phase(
-                &mut timings,
-                "release_capture_transients",
-                capture_barrier(client, "drain_capture", json!([true])),
-            )
-            .await?;
+        RefitRequest::DrainCaches { pause_mode } => {
+            if pause_mode == RefitPauseMode::Keep {
+                time_refit_phase(
+                    &mut timings,
+                    "suspend_capture",
+                    capture_barrier(client, "suspend_capture", json!([])),
+                )
+                .await?;
+            } else {
+                time_refit_phase(
+                    &mut timings,
+                    "release_capture_transients",
+                    capture_barrier(client, "drain_capture", json!([true])),
+                )
+                .await?;
+            }
             time_refit_phase(
                 &mut timings,
                 "pd_drain_caches",
@@ -468,6 +519,18 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_value::<RefitRequest>(json!({"operation": "update"})).is_err());
+        assert!(
+            serde_json::from_value::<RefitRequest>(
+                json!({"operation": "pause", "pause_mode": "abort"})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<RefitRequest>(
+                json!({"operation": "reset", "pause_mode": "keep"})
+            )
+            .is_err()
+        );
         assert!(
             serde_json::from_value::<RefitRequest>(
                 json!({"operation": "reset", "reset_connector": false})

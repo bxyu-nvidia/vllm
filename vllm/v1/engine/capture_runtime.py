@@ -57,6 +57,8 @@ class EngineCapture:
         self.result_url: str | None = None
         self._metadata: dict[str, dict[str, Any]] = {}
         self._closed_admission = False
+        self._defer_admission = False
+        self._parked: dict[str, Callable[[], None]] = {}
         self._drained = False
         self._suspended = False
         self._barrier_pending = False
@@ -153,10 +155,18 @@ class EngineCapture:
             self.pending[request.request_id] = self.loop.create_task(prepare())
 
         with self._admission_lock:
-            if self._closed_admission:
+            if self._closed_admission and not self._defer_admission:
                 raise RuntimeError("engine capture is paused")
-            if request.request_id in self._active:
+            if request.request_id in self._active or request.request_id in self._parked:
                 raise ValueError("duplicate capture request")
+            if self._closed_admission:
+                if self._defer_admission and self.failure is None:
+                    # A P/D handoff can arrive after the receiving pool pauses.
+                    # Retain its original context without reading its fragment
+                    # or admitting GPU work until the fleet resumes.
+                    self._parked[request.request_id] = start
+                    return
+                raise RuntimeError("engine capture is paused")
             self._active.add(request.request_id)
             self._preparing.add(request.request_id)
             # Publish preparation before a concurrent suspension closes admission.
@@ -166,6 +176,8 @@ class EngineCapture:
         """Cancel unscheduled lookups; retain generated data for stop trimming."""
         with self._admission_lock:
             self._preparing.difference_update(request_ids)
+            for request_id in request_ids:
+                self._parked.pop(request_id, None)
 
         def abort() -> None:
             for request_id in request_ids:
@@ -313,6 +325,15 @@ class EngineCapture:
             preserve_calls=False, release_transients=release_transients
         )
 
+    def pause_admission(self) -> None:
+        """Park new preparations before a keep-pause stops GPU scheduling."""
+        if self.failure is not None:
+            raise RuntimeError("cannot pause failed capture") from self.failure
+        with self._admission_lock:
+            if self._closed_admission and not self._defer_admission:
+                raise RuntimeError("capture admission is already closed for a barrier")
+            self._closed_admission = self._defer_admission = True
+
     def suspend(self) -> Future:
         """Settle queued work while retaining unfinished calls and handoffs.
 
@@ -344,10 +365,10 @@ class EngineCapture:
                     await adapter.suspend()
                 else:
                     with self._admission_lock:
-                        if self._active:
+                        if self._active or self._parked:
+                            count = len(self._active) + len(self._parked)
                             raise RuntimeError(
-                                f"cannot refit with {len(self._active)} "
-                                "unfinalized captures"
+                                f"cannot refit with {count} unfinalized captures"
                             )
                     await adapter.drain(release_transients=release_transients)
                 # An output callback may have failed while awaiting I/O.
@@ -375,10 +396,19 @@ class EngineCapture:
                 and (self._active or (self._closed_admission and not self._drained))
             ):
                 raise RuntimeError("cannot resume undrained capture")
-            self._closed_admission = False
+            self._closed_admission = self._defer_admission = False
             self._drained = self._suspended = False
+            for request_id, start in self._parked.items():
+                self._active.add(request_id)
+                self._preparing.add(request_id)
+                self.loop.call_soon_threadsafe(start)
+            self._parked.clear()
 
     def discard(self, request_id: str) -> Future:
+        with self._admission_lock:
+            self._parked.pop(request_id, None)
+            self._preparing.discard(request_id)
+
         async def discard() -> None:
             if task := self.pending.get(request_id):
                 task.cancel()
@@ -393,6 +423,9 @@ class EngineCapture:
         return asyncio.run_coroutine_threadsafe(discard(), self.loop)
 
     def close(self) -> None:
+        with self._admission_lock:
+            self._parked.clear()
+
         async def close() -> None:
             tasks = list(self.pending.values()) + list(self.writes.values())
             if self._barrier_task is not None:

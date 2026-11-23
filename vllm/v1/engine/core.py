@@ -1553,8 +1553,14 @@ class EngineCoreProc(EngineCore):
         """Returns true if the engine should be stepped."""
         return (
             self.engines_running
-            or self.scheduler.has_requests()
             or bool(self.batch_queue)
+            # Transfer cleanup must not keep a suspended pool stepping. Retain
+            # its requests/blocks and process completions after resume. Pending
+            # batches and DP consensus still have to settle before pause acks.
+            or (
+                self.scheduler.pause_state != PauseState.PAUSED_ALL
+                and self.scheduler.has_requests()
+            )
         )
 
     def is_running(self) -> bool:
@@ -1849,12 +1855,18 @@ class EngineCoreProc(EngineCore):
             return True
         return self.capture_runtime.drain(release_transients=release_transients)
 
+    def pause_capture_admission(self) -> bool:
+        """Retain late P/D handoffs while a keep-pause fences GPU execution."""
+        if self.capture_runtime is not None:
+            self.capture_runtime.pause_admission()
+        return True
+
     def suspend_capture(self) -> Future | bool:
         """Fence queued outputs after a keep-pause, retaining unfinished capture."""
+        if self.scheduler.pause_state != PauseState.PAUSED_ALL or self.has_work():
+            raise RuntimeError("pause_scheduler(mode='keep') must complete first")
         if self.capture_runtime is None:
             return True
-        if self.scheduler.pause_state != PauseState.PAUSED_ALL or self.batch_queue:
-            raise RuntimeError("pause_scheduler(mode='keep') must complete first")
         future: Future = Future()
 
         def suspend() -> None:

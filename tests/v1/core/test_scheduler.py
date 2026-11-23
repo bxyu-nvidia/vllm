@@ -8160,3 +8160,103 @@ def test_prefill_outcomes_preempted_request_counted_once(monkeypatch) -> None:
     assert stats.request_outcomes == {"kv_capacity": 1, "not_examined": 1}
     assert stats.unexamined_by_stop_reason == {"preemption": 1}
     assert stats.underfilled_outcome_steps == 0
+
+
+@pytest.mark.parametrize("in_flight", [False, True])
+@pytest.mark.parametrize("transfer", ["send", "receive", "push"])
+def test_keep_pause_preserves_transfer_blocks_and_processes_completion_on_resume(
+    transfer, in_flight
+):
+    from vllm.v1.engine.core import EngineCoreProc
+
+    scheduler = create_scheduler(use_kv_connector=True)
+    request = create_requests(num_requests=1, num_tokens=32)[0]
+    scheduler.add_request(request)
+    scheduler.kv_cache_manager.allocate_slots(request, 32)
+    blocks = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    assert blocks[0]
+    if transfer == "receive":
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    else:
+        scheduler.waiting.remove_request(request)
+        request.status = RequestStatus.FINISHED_STOPPED
+    scheduler.finished_req_ids.clear()
+    scheduler.connector.has_pending_push_work = Mock(return_value=transfer == "push")
+
+    core = object.__new__(EngineCoreProc)
+    core.scheduler = scheduler
+    core.model_executor = Mock()
+    core.batch_queue = [object()] if in_flight else None
+    core.engines_running = False
+    core._idle_state_callbacks = []
+    paused = core.pause_scheduler(mode="keep", clear_cache=False)
+    if in_flight:
+        assert isinstance(paused, Future) and not paused.done()
+        assert core.has_work()  # Retiring GPU batches cannot be skipped.
+        core.model_executor.collective_rpc.assert_not_called()
+        core.batch_queue.clear()
+        core._notify_idle_state_callbacks()
+        assert paused.result(0) is None
+    else:
+        assert paused is None
+    assert not core.has_work()
+    assert request.request_id in scheduler.requests
+    assert scheduler.kv_cache_manager.get_block_ids(request.request_id) == blocks
+    core.model_executor.collective_rpc.assert_called_once_with("synchronize_device")
+    core.resume_scheduler()
+    assert core.has_work()
+    if transfer == "receive":
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_recving={request.request_id})
+        )
+        assert request.request_id in scheduler.finished_recving_kv_req_ids
+        assert scheduler.kv_cache_manager.get_block_ids(request.request_id) == blocks
+    else:
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(finished_sending={request.request_id})
+        )
+        assert request.request_id not in scheduler.requests
+        assert not scheduler.kv_cache_manager.get_block_ids(request.request_id)[0]
+
+
+@pytest.mark.parametrize("partial_prefill", [False, True])
+def test_keep_pause_resumes_partial_prefill_and_decode_without_recomputation(
+    partial_prefill,
+):
+    from vllm.v1.engine.core import EngineCoreProc
+
+    scheduler = create_scheduler(max_num_batched_tokens=16)
+    request = create_requests(num_requests=1, num_tokens=32 if partial_prefill else 8)[
+        0
+    ]
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    scheduler.update_from_output(
+        first,
+        ModelRunnerOutput(
+            req_ids=[request.request_id],
+            req_id_to_index={request.request_id: 0},
+            sampled_token_ids=[[] if partial_prefill else [42]],
+        ),
+    )
+    tokens = request.num_computed_tokens
+    output = list(request.output_token_ids)
+    blocks = scheduler.kv_cache_manager.get_block_ids(request.request_id)
+    core = object.__new__(EngineCoreProc)
+    core.scheduler = scheduler
+    core.model_executor = Mock()
+    core.batch_queue = None
+    core.engines_running = False
+    core._idle_state_callbacks = []
+    assert core.pause_scheduler(mode="keep", clear_cache=False) is None
+    assert not core.has_work()
+    assert request in scheduler.running
+    assert scheduler.kv_cache_manager.get_block_ids(request.request_id) == blocks
+    assert request.num_computed_tokens == tokens
+    assert list(request.output_token_ids) == output
+    core.resume_scheduler()
+    resumed = scheduler.schedule()
+    assert not resumed.scheduled_new_reqs
+    assert resumed.num_scheduled_tokens[request.request_id] == (
+        16 if partial_prefill else 1
+    )

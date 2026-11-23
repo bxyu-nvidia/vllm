@@ -199,18 +199,72 @@ async fn pd_refit_forwards_the_training_protocol_and_rejects_partial_updates() {
             StatusCode::OK,
         ),
     ];
+    let mut cases = cases;
+    cases.extend([
+        (
+            json!({"operation": "pause", "pause_mode": "keep"}),
+            "suspend_capture",
+            json!([]),
+            json!(true),
+            StatusCode::OK,
+        ),
+        (
+            json!({"operation": "pause", "pause_mode": "keep"}),
+            "pause_capture_admission",
+            json!([]),
+            json!(false),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            json!({"operation": "pause", "pause_mode": "keep"}),
+            "suspend_capture",
+            json!([]),
+            json!(false),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            json!({"operation": "update", "pause_mode": "keep", "refit_timeout_s": 120.0}),
+            "collective_rpc",
+            json!(["update_weights_from_collective", null, [120.0, false], null]),
+            json!([true, true]),
+            StatusCode::OK,
+        ),
+        (
+            json!({"operation": "update", "pause_mode": "keep", "refit_timeout_s": 120.0}),
+            "suspend_capture",
+            json!([]),
+            json!(false),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ]);
+    cases.push((
+        json!({"operation": "drain_caches", "pause_mode": "keep"}),
+        "collective_rpc",
+        json!(["pd_drain_caches", null, [], null]),
+        json!([true, true]),
+        StatusCode::OK,
+    ));
     let engine_cases = cases.clone();
     let (state, engine_task) = test_admin_state_with_ready_and_engine_script(default_ready_response(), move |dealer, push| {
         boxed_test_future(async move {
-            for (_, method, args, result, _) in engine_cases {
+            for (body, method, args, result, _) in engine_cases {
                 let metadata = json!([
                     {"layer_ids": [1], "enabled": true, "max_logprobs": 32, "logprobs_mode": "raw_logprobs", "workers_per_engine": 2},
                     {"layer_ids": [1], "enabled": true, "max_logprobs": 32, "logprobs_mode": "raw_logprobs", "workers_per_engine": 2},
                 ]);
                 let mut calls = vec![("collective_rpc", json!(["pd_capture_metadata", null, [], null]), metadata)];
-                if method == "pause_scheduler" || (method == "collective_rpc" && args[0] == "update_weights_from_collective") { calls.push(("drain_capture", json!([]), json!(true))); }
+                let keep = body["pause_mode"] == "keep";
+                if body["operation"] == "pause" && keep && method == "suspend_capture" {
+                    calls.push(("pause_capture_admission", json!([]), json!(true)));
+                    calls.push(("pause_scheduler", json!(["keep", false]), json!(null)));
+                }
+                if method == "pause_scheduler" || (method == "collective_rpc" && args[0] == "update_weights_from_collective") {
+                    calls.push((if keep { "suspend_capture" } else { "drain_capture" }, json!([]), json!(true)));
+                }
                 if method == "resume_scheduler" { calls.push(("resume_capture", json!([]), json!(true))); }
-                if method == "collective_rpc" && args[0] == "pd_drain_caches" { calls.push(("drain_capture", json!([true]), json!(true))); }
+                if method == "collective_rpc" && args[0] == "pd_drain_caches" {
+                    calls.push((if keep { "suspend_capture" } else { "drain_capture" }, if keep { json!([]) } else { json!([true]) }, json!(true)));
+                }
                 calls.push((method, args, result));
                 for (method, args, result) in calls {
                     let msg = recv_engine_message(dealer).await;
@@ -246,12 +300,26 @@ async fn pd_refit_forwards_the_training_protocol_and_rejects_partial_updates() {
             let phases: &[&str] = match body["operation"].as_str().unwrap() {
                 "prepare" => &["pd_capture_metadata", "pd_prepare_refit"],
                 "init" => &["init_collective", "pd_capture_metadata"],
+                "drain_caches" if body["pause_mode"] == "keep" => {
+                    &["pd_capture_metadata", "pd_drain_caches", "suspend_capture"]
+                }
                 "drain_caches" => &[
                     "pd_capture_metadata",
                     "pd_drain_caches",
                     "release_capture_transients",
                 ],
+                "pause" if body["pause_mode"] == "keep" => &[
+                    "pause_capture_admission",
+                    "pause_scheduler",
+                    "pd_capture_metadata",
+                    "suspend_capture",
+                ],
                 "pause" => &["drain_capture", "pause_scheduler", "pd_capture_metadata"],
+                "update" => &[
+                    "pd_capture_metadata",
+                    "suspend_capture",
+                    "update_weights_from_collective",
+                ],
                 "resume" => &["pd_capture_metadata", "resume_capture", "resume_scheduler"],
                 unexpected => panic!("unexpected operation {unexpected}"),
             };

@@ -916,6 +916,7 @@ def test_capture_suspension_fences_outputs_and_retains_unfinished_calls(
     engine.output_queue = queue.Queue()
     engine.scheduler = SimpleNamespace(pause_state=PauseState.UNPAUSED)
     engine.batch_queue = []
+    engine.engines_running = False
     request = SimpleNamespace(
         request_id="r",
         prompt_token_ids=[1],
@@ -1025,3 +1026,90 @@ def test_incomplete_capture_barrier_never_authorizes_resume(operation):
     finally:
         if runtime.thread.is_alive():
             runtime.close()
+
+
+@pytest.mark.parametrize("cancel", [None, "abort", "discard"])
+def test_keep_pause_parks_late_handoff_until_resume(cancel):
+    import threading
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.capture_runtime import EngineCapture
+
+    prepared, added = threading.Event(), threading.Event()
+    calls = []
+    request = SimpleNamespace(
+        request_id="late-decode",
+        prompt_token_ids=[1, 2],
+        capture_context=SimpleNamespace(
+            phase="decode",
+            prefill_key="retained-fragment",
+            admission={"weight_version": 3},
+        ),
+    )
+
+    class Adapter:
+        async def prepare(self, incoming):
+            calls.append(incoming.capture_context)
+            prepared.set()
+
+        async def suspend(self):
+            pass
+
+        def discard(self, request_id):
+            pass
+
+        async def close(self):
+            pass
+
+    runtime = EngineCapture()
+    runtime.adapter = Adapter()
+    try:
+        runtime.pause_admission()
+        runtime.prepare(request, added.set, lambda: pytest.fail("prepare failed"))
+        assert not runtime.pending and not prepared.is_set()
+        with pytest.raises(ValueError, match="duplicate"):
+            runtime.prepare(request, added.set, lambda: None)
+        with pytest.raises(RuntimeError, match="undrained"):
+            runtime.resume()
+        assert runtime.suspend().result(5) is True
+        assert not calls and not added.is_set()
+        if cancel == "abort":
+            runtime.abort_pending([request.request_id])
+        elif cancel == "discard":
+            runtime.discard(request.request_id).result(5)
+        runtime.resume()
+        if cancel is None:
+            assert added.wait(5)
+            assert calls == [request.capture_context]
+            assert calls[0].admission["weight_version"] == 3
+            assert (
+                runtime._metadata[request.request_id]["prefill_key"]
+                == "retained-fragment"
+            )
+        else:
+            # A second barrier fences all queued callbacks, proving a cancelled
+            # handoff cannot publish ADD after resume.
+            assert runtime.suspend().result(5) is True
+            assert not calls and not added.is_set() and not runtime._active
+        assert not runtime._parked
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("pending_dp", [False, True])
+def test_keep_suspend_requires_gpu_and_dp_pause_even_without_capture(pending_dp):
+    from types import SimpleNamespace
+
+    from vllm.v1.core.sched.interface import PauseState
+    from vllm.v1.engine.core import EngineCoreProc
+
+    core = object.__new__(EngineCoreProc)
+    core.capture_runtime = None
+    core.scheduler = SimpleNamespace(pause_state=PauseState.PAUSED_ALL)
+    core.engines_running = pending_dp
+    core.batch_queue = [] if pending_dp else [object()]
+    with pytest.raises(RuntimeError, match="must complete first"):
+        core.suspend_capture()
+    core.engines_running = False
+    core.batch_queue.clear()
+    assert core.suspend_capture() is True
