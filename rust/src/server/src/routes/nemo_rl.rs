@@ -3,8 +3,10 @@
 
 //! Opt-in control protocol for NeMo-RL's managed prefill/decode fleet.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
@@ -265,23 +267,53 @@ async fn capture_barrier(
     Ok(())
 }
 
+async fn time_refit_phase<T>(
+    timings: &mut BTreeMap<&'static str, f64>,
+    phase: &'static str,
+    operation: impl Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
+    let started = Instant::now();
+    tracing::info!(phase, "[pd-refit] started");
+    let result = operation.await;
+    let elapsed = started.elapsed().as_secs_f64();
+    timings.insert(phase, elapsed);
+    tracing::info!(
+        phase,
+        elapsed_s = elapsed,
+        status = if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+        "[pd-refit] phase finished"
+    );
+    result
+}
+
 async fn refit(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RefitRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let client = state.engine_core_client();
-    let workers = metadata(client).await?.workers_per_engine;
+    let mut timings = BTreeMap::new();
+    let workers = time_refit_phase(&mut timings, "pd_capture_metadata", metadata(client))
+        .await?
+        .workers_per_engine;
     match request {
         RefitRequest::Prepare {
             entries,
             mtp_from_refit,
         } => {
-            collective(
-                client,
-                workers,
+            time_refit_phase(
+                &mut timings,
                 "pd_prepare_refit",
-                json!([entries, mtp_from_refit]),
-                true,
+                collective(
+                    client,
+                    workers,
+                    "pd_prepare_refit",
+                    json!([entries, mtp_from_refit]),
+                    true,
+                ),
             )
             .await?;
         }
@@ -292,12 +324,16 @@ async fn refit(
             world_size,
             train_world_size,
         } => {
-            collective(
-                client,
-                workers,
+            time_refit_phase(
+                &mut timings,
                 "init_collective",
-                json!([rank_prefix, ip, port, world_size, train_world_size]),
-                false,
+                collective(
+                    client,
+                    workers,
+                    "init_collective",
+                    json!([rank_prefix, ip, port, world_size, train_world_size]),
+                    false,
+                ),
             )
             .await?;
         }
@@ -308,55 +344,102 @@ async fn refit(
                     Some("refit_timeout_s"),
                 ));
             }
-            capture_barrier(client, "drain_capture", json!([])).await?;
-            collective(
-                client,
-                workers,
+            time_refit_phase(
+                &mut timings,
+                "drain_capture",
+                capture_barrier(client, "drain_capture", json!([])),
+            )
+            .await?;
+            time_refit_phase(
+                &mut timings,
                 "update_weights_from_collective",
-                json!([refit_timeout_s, false]),
-                true,
+                collective(
+                    client,
+                    workers,
+                    "update_weights_from_collective",
+                    json!([refit_timeout_s, false]),
+                    true,
+                ),
             )
             .await?;
         }
         RefitRequest::Pause {} => {
-            capture_barrier(client, "drain_capture", json!([])).await?;
-            client
-                .pause_scheduler(
-                    vllm_engine_core_client::protocol::utility::PauseMode::Wait,
-                    false,
-                )
-                .await
-                .map_err(|error| utility_call_error("pause_scheduler", error))?;
+            time_refit_phase(
+                &mut timings,
+                "drain_capture",
+                capture_barrier(client, "drain_capture", json!([])),
+            )
+            .await?;
+            time_refit_phase(&mut timings, "pause_scheduler", async {
+                client
+                    .pause_scheduler(
+                        vllm_engine_core_client::protocol::utility::PauseMode::Wait,
+                        false,
+                    )
+                    .await
+                    .map_err(|error| utility_call_error("pause_scheduler", error))
+            })
+            .await?;
         }
         RefitRequest::DrainCaches {} => {
-            capture_barrier(client, "drain_capture", json!([true])).await?;
-            collective(client, workers, "pd_drain_caches", json!([]), true).await?;
+            time_refit_phase(
+                &mut timings,
+                "release_capture_transients",
+                capture_barrier(client, "drain_capture", json!([true])),
+            )
+            .await?;
+            time_refit_phase(
+                &mut timings,
+                "pd_drain_caches",
+                collective(client, workers, "pd_drain_caches", json!([]), true),
+            )
+            .await?;
         }
         RefitRequest::Resume {} => {
-            capture_barrier(client, "resume_capture", json!([])).await?;
-            client
-                .resume_scheduler()
-                .await
-                .map_err(|error| utility_call_error("resume_scheduler", error))?;
+            time_refit_phase(
+                &mut timings,
+                "resume_capture",
+                capture_barrier(client, "resume_capture", json!([])),
+            )
+            .await?;
+            time_refit_phase(&mut timings, "resume_scheduler", async {
+                client
+                    .resume_scheduler()
+                    .await
+                    .map_err(|error| utility_call_error("resume_scheduler", error))
+            })
+            .await?;
         }
         RefitRequest::Reset {} => {
-            if !client
-                .reset_prefix_cache(false, true)
-                .await
-                .map_err(|error| utility_call_error("reset_prefix_cache", error))?
-            {
-                return Err(server_error!(
-                    "PD cache invalidation failed; weights must not resume serving"
-                ));
-            }
-            client
-                .call_utility::<(), _>("reset_encoder_cache", ())
-                .await
-                .map_err(|error| utility_call_error("reset_encoder_cache", error))?;
-            collective(client, workers, "pd_clear_aux_cache", json!([]), true).await?;
+            time_refit_phase(&mut timings, "reset_prefix_cache", async {
+                if !client
+                    .reset_prefix_cache(false, true)
+                    .await
+                    .map_err(|error| utility_call_error("reset_prefix_cache", error))?
+                {
+                    return Err(server_error!(
+                        "PD cache invalidation failed; weights must not resume serving"
+                    ));
+                }
+                Ok(())
+            })
+            .await?;
+            time_refit_phase(&mut timings, "reset_encoder_cache", async {
+                client
+                    .call_utility::<(), _>("reset_encoder_cache", ())
+                    .await
+                    .map_err(|error| utility_call_error("reset_encoder_cache", error))
+            })
+            .await?;
+            time_refit_phase(
+                &mut timings,
+                "pd_clear_aux_cache",
+                collective(client, workers, "pd_clear_aux_cache", json!([]), true),
+            )
+            .await?;
         }
     }
-    Ok(Json(json!({"ok": true})))
+    Ok(Json(json!({"ok": true, "timings_s": timings})))
 }
 
 #[cfg(test)]

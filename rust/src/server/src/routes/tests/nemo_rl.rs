@@ -238,6 +238,31 @@ async fn pd_refit_forwards_the_training_protocol_and_rejects_partial_updates() {
             .await
             .unwrap();
         assert_eq!(response.status(), expected);
+        if expected == StatusCode::OK {
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(result["ok"], json!(true));
+            let timings = result["timings_s"].as_object().unwrap();
+            let phases: &[&str] = match body["operation"].as_str().unwrap() {
+                "prepare" => &["pd_capture_metadata", "pd_prepare_refit"],
+                "init" => &["init_collective", "pd_capture_metadata"],
+                "drain_caches" => &[
+                    "pd_capture_metadata",
+                    "pd_drain_caches",
+                    "release_capture_transients",
+                ],
+                "pause" => &["drain_capture", "pause_scheduler", "pd_capture_metadata"],
+                "resume" => &["pd_capture_metadata", "resume_capture", "resume_scheduler"],
+                unexpected => panic!("unexpected operation {unexpected}"),
+            };
+            assert_eq!(
+                timings.keys().map(String::as_str).collect::<Vec<_>>(),
+                phases
+            );
+            assert!(
+                timings.values().all(|v| v.as_f64().is_some_and(|t| t.is_finite() && t >= 0.0))
+            );
+        }
     }
     engine_task.finish().await;
 }
