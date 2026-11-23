@@ -597,8 +597,10 @@ def test_engine_capture_batch_preserves_outputs_before_finish_and_finalize(fail_
 
 
 @pytest.mark.parametrize("fail_write", [False, True])
+@pytest.mark.parametrize("suspend", [False, True])
 def test_pending_capture_returns_before_cpu_work_and_preserves_completion_barriers(
     fail_write,
+    suspend,
 ):
     import asyncio
     import threading
@@ -617,6 +619,9 @@ def test_pending_capture_returns_before_cpu_work_and_preserves_completion_barrie
             if fail_write:
                 raise OSError("TQ rejected capture")
             return {"disposition": "staged", "served_tokens": served_tokens}
+
+        async def suspend(self):
+            pass
 
         async def drain(self, *, release_transients=False):
             pass
@@ -643,7 +648,7 @@ def test_pending_capture_returns_before_cpu_work_and_preserves_completion_barrie
         cancelled_reader = runtime.resolve_result(ticket)
         assert cancelled_reader.cancel()
         reader = runtime.resolve_result(ticket)
-        drain = runtime.drain()
+        drain = runtime.suspend() if suspend else runtime.drain()
         assert not reader.done() and not drain.done()
         with pytest.raises(ValueError, match="pending capture"):
             runtime.release_result(ticket).result(5)
@@ -859,3 +864,164 @@ def test_capture_drain_awaits_actor_cleanup_and_preserves_pending_receipts(
     finally:
         release.set()
         runtime.close()
+
+
+@pytest.mark.parametrize("barrier_failure", [None, "storage", "cancel"])
+def test_capture_suspension_fences_outputs_and_retains_unfinished_calls(
+    barrier_failure,
+):
+    import asyncio
+    import queue
+    import threading
+    from types import SimpleNamespace
+
+    from vllm.v1.core.sched.interface import PauseState
+    from vllm.v1.engine import EngineCoreOutput
+    from vllm.v1.engine.capture_runtime import EngineCapture
+    from vllm.v1.engine.core import EngineCoreProc
+
+    preparing, added, entered = (threading.Event() for _ in range(3))
+    release_prepare, release_storage = threading.Event(), threading.Event()
+    tokens = []
+    events = []
+
+    class Adapter:
+        async def prepare(self, request):
+            preparing.set()
+            await asyncio.to_thread(release_prepare.wait)
+
+        def observe(self, output):
+            tokens.extend(output.new_token_ids)
+
+        async def suspend(self):
+            entered.set()
+            await asyncio.to_thread(release_storage.wait)
+            if barrier_failure == "storage":
+                raise OSError("storage flush failed")
+
+        def finish(self, request_id):
+            events.append("finish")
+
+        async def finalize(self, request_id, served_tokens, prefill_key):
+            events.append("finalize")
+            return {"tokens": list(tokens)}
+
+        async def close(self):
+            pass
+
+    runtime = EngineCapture()
+    runtime.adapter = Adapter()
+    engine = EngineCoreProc.__new__(EngineCoreProc)
+    engine.capture_runtime = runtime
+    engine.output_queue = queue.Queue()
+    engine.scheduler = SimpleNamespace(pause_state=PauseState.UNPAUSED)
+    engine.batch_queue = []
+    request = SimpleNamespace(
+        request_id="r",
+        prompt_token_ids=[1],
+        capture_context=SimpleNamespace(phase="decode", prefill_key="handoff"),
+    )
+    try:
+        runtime.prepare(request, added.set, lambda: pytest.fail("prepare failed"))
+        assert preparing.wait(5)
+        with pytest.raises(RuntimeError, match="keep"):
+            engine.suspend_capture()
+        engine.scheduler.pause_state = PauseState.PAUSED_ALL
+        engine.batch_queue = [object()]
+        with pytest.raises(RuntimeError, match="keep"):
+            engine.suspend_capture()
+        engine.batch_queue.clear()
+        suspended = engine.suspend_capture()
+        assert not suspended.done()
+        # Simulate the output thread reaching the fence.
+        engine.output_queue.get_nowait()()
+        with pytest.raises(RuntimeError, match="paused"):
+            runtime.prepare(request, added.set, lambda: None)
+        with pytest.raises(RuntimeError, match="undrained"):
+            runtime.resume()
+        assert not entered.is_set()  # Prepare must settle before actor flushing.
+        release_prepare.set()
+        assert added.wait(5) and entered.wait(5)
+        if barrier_failure == "cancel":
+            # The utility future cannot cancel an already-running storage fence.
+            assert not suspended.cancel()
+        release_storage.set()
+        if barrier_failure == "storage":
+            with pytest.raises(OSError, match="storage flush failed"):
+                suspended.result(5)
+            with pytest.raises(RuntimeError, match="failed capture"):
+                runtime.resume()
+            assert not events
+            return
+        assert suspended.result(5) is True
+        assert runtime._metadata["r"]["prefill_key"] == "handoff"
+        runtime.resume()
+
+        for token in (2, 3):
+            engine.output_queue.put_nowait(
+                lambda token=token: runtime.observe(EngineCoreOutput("r", [token]))
+            )
+            suspended = engine.suspend_capture()
+            assert not suspended.done()
+            engine.output_queue.get_nowait()()  # Output before the fence.
+            engine.output_queue.get_nowait()()  # Capture suspension fence.
+            assert suspended.result(5) is True
+            assert tokens == list(range(2, token + 1))
+            assert not events  # Suspension must never finish/finalize the call.
+            runtime.resume()
+        runtime.finish("r")
+        assert runtime.finalize("r", 2, "handoff").result(5) == {"tokens": [2, 3]}
+        assert events == ["finish", "finalize"]
+    finally:
+        release_prepare.set()
+        release_storage.set()
+        runtime.close()
+
+
+@pytest.mark.parametrize("operation", ["drain", "cancel", "close"])
+def test_incomplete_capture_barrier_never_authorizes_resume(operation):
+    import asyncio
+    import threading
+
+    from vllm.v1.engine.capture_runtime import EngineCapture
+
+    entered, cancelled = threading.Event(), threading.Event()
+
+    class Adapter:
+        async def suspend(self):
+            if operation == "drain":
+                return
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        async def close(self):
+            pass
+
+    runtime = EngineCapture()
+    runtime.adapter = Adapter()
+    runtime._active.add("unfinished")
+    try:
+        if operation != "drain":
+            suspended = runtime.suspend()
+            assert entered.wait(5)
+            with pytest.raises(RuntimeError, match="barrier is already pending"):
+                runtime.drain()
+            if operation == "close":
+                runtime.close()
+                assert not runtime.thread.is_alive()
+            else:
+                assert suspended.cancel()
+            assert cancelled.wait(5)
+        else:
+            # A full drain must remain strict even after a successful suspension.
+            assert runtime.suspend().result(5) is True
+            with pytest.raises(RuntimeError, match="unfinalized"):
+                runtime.drain().result(5)
+        with pytest.raises(RuntimeError, match="failed capture"):
+            runtime.resume()
+    finally:
+        if runtime.thread.is_alive():
+            runtime.close()

@@ -35,6 +35,8 @@ class CaptureAdapter(Protocol):
 
     def discard(self, request_id: str) -> None: ...
 
+    async def suspend(self) -> None: ...
+
     async def drain(self, *, release_transients: bool = False) -> None: ...
 
     async def close(self) -> None: ...
@@ -56,6 +58,9 @@ class EngineCapture:
         self._metadata: dict[str, dict[str, Any]] = {}
         self._closed_admission = False
         self._drained = False
+        self._suspended = False
+        self._barrier_pending = False
+        self._barrier_task: asyncio.Task | None = None
         self._admission_lock = threading.Lock()
         self._preparing: set[str] = set()
         self._active: set[str] = set()
@@ -99,14 +104,6 @@ class EngineCapture:
         ready: Callable[[], None],
         failed: Callable[[], None],
     ) -> None:
-        with self._admission_lock:
-            if self._closed_admission:
-                raise RuntimeError("engine capture is paused")
-            if request.request_id in self._active:
-                raise ValueError("duplicate capture request")
-            self._active.add(request.request_id)
-            self._preparing.add(request.request_id)
-
         async def prepare() -> None:
             scheduled = False
             try:
@@ -155,7 +152,15 @@ class EngineCapture:
                     return
             self.pending[request.request_id] = self.loop.create_task(prepare())
 
-        self.loop.call_soon_threadsafe(start)
+        with self._admission_lock:
+            if self._closed_admission:
+                raise RuntimeError("engine capture is paused")
+            if request.request_id in self._active:
+                raise ValueError("duplicate capture request")
+            self._active.add(request.request_id)
+            self._preparing.add(request.request_id)
+            # Publish preparation before a concurrent suspension closes admission.
+            self.loop.call_soon_threadsafe(start)
 
     def abort_pending(self, request_ids: list[str]) -> None:
         """Cancel unscheduled lookups; retain generated data for stop trimming."""
@@ -304,40 +309,74 @@ class EngineCapture:
         engine may still need a fragment to complete its background write.
         Completed receipts and training records survive both barriers.
         """
-        with self._admission_lock:
-            self._closed_admission = True
-            self._drained = False
+        return self._quiesce(
+            preserve_calls=False, release_transients=release_transients
+        )
 
-        async def drain() -> bool:
+    def suspend(self) -> Future:
+        """Settle queued work while retaining unfinished calls and handoffs.
+
+        The caller must first pause GPU execution and fence the output queue.
+        Capture callbacks preceding that fence run before this barrier. No
+        finish/finalize is synthesized; owned partial outputs survive resume.
+        """
+        return self._quiesce(preserve_calls=True)
+
+    def _quiesce(
+        self, *, preserve_calls: bool, release_transients: bool = False
+    ) -> Future:
+        with self._admission_lock:
+            if self._barrier_pending:
+                raise RuntimeError("capture barrier is already pending")
+            self._closed_admission = True
+            self._drained = self._suspended = False
+            self._barrier_pending = True
+
+        async def quiesce() -> bool:
+            self._barrier_task = asyncio.current_task()
             try:
                 for tasks in (self.pending, self.writes):
                     await asyncio.gather(
                         *(asyncio.shield(task) for task in list(tasks.values()))
                     )
                 adapter = self._adapter()
+                if preserve_calls:
+                    await adapter.suspend()
+                else:
+                    with self._admission_lock:
+                        if self._active:
+                            raise RuntimeError(
+                                f"cannot refit with {len(self._active)} "
+                                "unfinalized captures"
+                            )
+                    await adapter.drain(release_transients=release_transients)
+                # An output callback may have failed while awaiting I/O.
+                self._adapter()
                 with self._admission_lock:
-                    if self._active:
-                        raise RuntimeError(
-                            f"cannot refit with {len(self._active)} "
-                            "unfinalized captures"
-                        )
-                await adapter.drain(release_transients=release_transients)
-                with self._admission_lock:
-                    self._drained = True
+                    self._drained = not preserve_calls
+                    self._suspended = preserve_calls
                 return True
-            except Exception as error:
+            except (Exception, asyncio.CancelledError) as error:
                 self.failure = error
                 raise
+            finally:
+                self._barrier_task = None
+                with self._admission_lock:
+                    self._barrier_pending = False
 
-        return asyncio.run_coroutine_threadsafe(drain(), self.loop)
+        return asyncio.run_coroutine_threadsafe(quiesce(), self.loop)
 
     def resume(self) -> None:
         if self.failure is not None:
             raise RuntimeError("cannot resume failed capture") from self.failure
         with self._admission_lock:
-            if self._active or (self._closed_admission and not self._drained):
+            if self._barrier_pending or (
+                not self._suspended
+                and (self._active or (self._closed_admission and not self._drained))
+            ):
                 raise RuntimeError("cannot resume undrained capture")
             self._closed_admission = False
+            self._drained = self._suspended = False
 
     def discard(self, request_id: str) -> Future:
         async def discard() -> None:
@@ -356,6 +395,8 @@ class EngineCapture:
     def close(self) -> None:
         async def close() -> None:
             tasks = list(self.pending.values()) + list(self.writes.values())
+            if self._barrier_task is not None:
+                tasks.append(self._barrier_task)
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)

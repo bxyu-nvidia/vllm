@@ -1849,6 +1849,34 @@ class EngineCoreProc(EngineCore):
             return True
         return self.capture_runtime.drain(release_transients=release_transients)
 
+    def suspend_capture(self) -> Future | bool:
+        """Fence queued outputs after a keep-pause, retaining unfinished capture."""
+        if self.capture_runtime is None:
+            return True
+        if self.scheduler.pause_state != PauseState.PAUSED_ALL or self.batch_queue:
+            raise RuntimeError("pause_scheduler(mode='keep') must complete first")
+        future: Future = Future()
+
+        def suspend() -> None:
+            # Cancellation of a utility caller must not cancel the storage fence.
+            if not future.set_running_or_notify_cancel():
+                return
+            assert self.capture_runtime is not None
+
+            def done(result: Future) -> None:
+                try:
+                    future.set_result(result.result())
+                except Exception as error:
+                    future.set_exception(error)
+
+            try:
+                self.capture_runtime.suspend().add_done_callback(done)
+            except Exception as error:
+                future.set_exception(error)
+
+        self.output_queue.put_nowait(suspend)
+        return future
+
     def resume_capture(self) -> bool:
         if self.capture_runtime is not None:
             self.capture_runtime.resume()
