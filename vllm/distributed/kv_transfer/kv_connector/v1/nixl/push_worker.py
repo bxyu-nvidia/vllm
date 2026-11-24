@@ -216,7 +216,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
             assert req_id not in self._reqs_to_send
         # Rebase scheduler-clock deadlines onto this worker's clock — see the
         # equivalent block in pull_worker.start_load_kv for the rationale.
-        now_local = time.perf_counter()
+        now_local = self._lease_time()
         for req_id, expiration_time in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
                 if metadata.scheduler_clock:

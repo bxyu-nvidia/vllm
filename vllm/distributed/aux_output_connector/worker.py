@@ -17,6 +17,9 @@ from vllm.distributed.aux_output_connector.connector import (
     AuxOutputConnectorMetadata,
     AuxRequestOutput,
 )
+from vllm.distributed.aux_output_connector.mooncake_store import (
+    MooncakeBlockObjectStore,
+)
 from vllm.distributed.aux_output_connector.routed_experts import (
     RoutedExpertsBuffer,
     materialize_routed_experts,
@@ -35,6 +38,9 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
 if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.worker import (
+        MooncakeStoreWorker,
+    )
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -43,6 +49,8 @@ if TYPE_CHECKING:
 class _WorkerRequestState:
     aux_output_keys: list[str] = field(default_factory=list)
     pending_blocks: list[tuple[int, np.ndarray]] = field(default_factory=list)
+    # Capture handoff owns only rows not yet delivered to the adapter.
+    handoff_rows: list[AuxRequestOutput] = field(default_factory=list)
     capture_cursor: int | None = None
     scheduled_cursor: int = 0
     emit_cursor: int = 0
@@ -96,10 +104,12 @@ class AuxOutputWorkerConnector:
         )
         bind_routed_experts_capturer(model, capturer)
         self._capturer = capturer
+        self._use_capture_handoff = vllm_config.aux_output_config.use_capture_handoff
         self._store: BackgroundBlockObjectStore | None = None
         self._buffer: RoutedExpertsBuffer | None = None
         self._requests: dict[str, _WorkerRequestState] = {}
         self._generation = 0
+        self._shared_store: MooncakeBlockObjectStore | None = None
         self._step_metadata: AuxOutputConnectorMetadata | None = None
         # Steps whose asynchronous copy has not been consumed yet. The engine
         # consumes step outputs in order, so at most max_concurrent_batches
@@ -109,7 +119,10 @@ class AuxOutputWorkerConnector:
         self._max_concurrent_batches = vllm_config.max_concurrent_batches
         # Every TP rank participates in capture collectives, but only the
         # executor output rank owns the auxiliary output data plane.
-        if not get_tp_group().is_first_rank:
+        self._is_output_rank = get_tp_group().is_first_rank
+        if not self._is_output_rank or self._use_capture_handoff:
+            # RL assembles prior-turn routes from TQ lineage. Do not allocate
+            # a KV-sized arena or register a shared route cache for this path.
             return
 
         shape_per_token = self._capturer.shape_per_token
@@ -122,10 +135,42 @@ class AuxOutputWorkerConnector:
         max_bytes = vllm_config.aux_output_config.max_bytes
         if max_bytes is None:
             max_bytes = kv_cache_config.num_blocks * hashes_per_kv_block * block_nbytes
+        store: BlockObjectStore
+        mooncake_worker = _get_mooncake_worker()
+        if mooncake_worker is not None:
+            from vllm.config.utils import hash_factors
+
+            model_config = vllm_config.model_config
+            namespace = hash_factors(
+                {
+                    "format": "routed-experts-v1",
+                    "model": model_config.model,
+                    "revision": model_config.revision,
+                    "dtype": str(model_config.dtype),
+                    "quantization": model_config.quantization,
+                    "shape": shape_per_token,
+                    "route_dtype": dtype.name,
+                    "hash_block_size": hash_block_size,
+                    "cache_prefix": mooncake_worker.aux_cache_prefix,
+                }
+            )
+            store = MooncakeBlockObjectStore(
+                client=mooncake_worker.store,
+                replicate_config=mooncake_worker.store_replicate_config,
+                namespace=namespace,
+                max_bytes=max_bytes,
+                object_nbytes=block_nbytes,
+            )
+            self._shared_store = store
+            mooncake_worker.aux_store = store
+        else:
+            store = BlockObjectStore(max_bytes=max_bytes, object_nbytes=block_nbytes)
         self._store = BackgroundBlockObjectStore(
-            BlockObjectStore(max_bytes=max_bytes, object_nbytes=block_nbytes),
+            store,
             max_pending_batches=2 * vllm_config.scheduler_config.max_num_seqs,
         )
+        if mooncake_worker is not None:
+            mooncake_worker.aux_store_writer = self._store
         self._buffer = RoutedExpertsBuffer(
             dtype,
             shape_per_token,
@@ -137,7 +182,7 @@ class AuxOutputWorkerConnector:
 
     def prepare_output(self, input_batch: InputBatch) -> PendingAuxOutput | None:
         """Snapshot one step's R3 tensor for asynchronous CPU transfer."""
-        if self._buffer is None or self._step_metadata is None:
+        if not self._is_output_rank or self._step_metadata is None:
             return None
 
         request_ids = list(input_batch.req_ids)
@@ -179,15 +224,16 @@ class AuxOutputWorkerConnector:
                         teardown.append(request_id)
                         release_keys.extend(reversed(state.aux_output_keys))
             if teardown:
-                self._publish_blocks([], release_keys=release_keys)
+                if not self._use_capture_handoff:
+                    self._publish_blocks([], release_keys=release_keys)
                 self._teardown(teardown)
             return outputs
 
     def _commit_output(self, pending: PendingAuxOutput) -> dict[str, AuxRequestOutput]:
         buffer = self._buffer
         store = self._store
-        assert buffer is not None and store is not None
-        block_size = buffer.block_size
+        if not self._use_capture_handoff:
+            assert buffer is not None and store is not None
 
         routed_experts = pending.routed_experts
         num_sampled = pending.num_sampled
@@ -243,11 +289,22 @@ class AuxOutputWorkerConnector:
                 capture_start = capture_cursor
 
             emit_start = state.emit_cursor
-            # Complete blocks without keys remain pending until a hash update.
-            completed = buffer.capture(request_id, capture_start, rows)
             token_end = capture_start + len(rows)
             state.capture_cursor = token_end
             state.scheduled_cursor = token_start + request_num_tokens
+            if self._use_capture_handoff:
+                start = max(emit_start, capture_start)
+                if start < token_end:
+                    state.handoff_rows.append(
+                        AuxRequestOutput(start, rows[start - capture_start :].copy())
+                    )
+                if sampled > 0 and emit_start <= token_end:
+                    outputs[request_id] = self._take_handoff_rows(
+                        state, token_end, rows
+                    )
+                continue
+            # Complete blocks without keys remain pending until a hash update.
+            completed = self._capture_rows(request_id, state, capture_start, rows)
             block_batches.append((state, completed))
 
             if sampled > 0 and emit_start <= token_end:
@@ -259,33 +316,86 @@ class AuxOutputWorkerConnector:
                 else:
                     materialize_outputs.append((request_id, emit_start, token_end))
 
+        if self._use_capture_handoff:
+            return outputs
+        assert buffer is not None
         # A consumer may reuse a block produced earlier in the same batch.
         self._publish_blocks(block_batches)
 
         for request_id, emit_start, token_end in materialize_outputs:
             state = self._requests[request_id]
-            stored_end = (
-                min(token_end // block_size, len(state.aux_output_keys)) * block_size
+            outputs[request_id] = AuxRequestOutput(
+                emit_start, self._read_rows(request_id, emit_start, token_end)
             )
-            if emit_start < stored_end:
-                first_block = emit_start // block_size
-                stored = materialize_routed_experts(
-                    store,
-                    state.aux_output_keys[first_block : stored_end // block_size],
-                    shape_per_token=buffer.shape_per_token,
-                    dtype=buffer.dtype,
-                )
-                local_start = emit_start % block_size
-                rows = stored[local_start : local_start + stored_end - emit_start]
-                if stored_end < token_end:
-                    rows = np.concatenate(
-                        (rows, buffer.read(request_id, stored_end, token_end))
-                    )
-            else:
-                rows = buffer.read(request_id, emit_start, token_end)
-            outputs[request_id] = AuxRequestOutput(emit_start, rows)
             state.emit_cursor = token_end
         return outputs
+
+    @staticmethod
+    def _take_handoff_rows(
+        state: _WorkerRequestState, token_end: int, template: np.ndarray
+    ) -> AuxRequestOutput:
+        """Deliver new rows; training obtains the omitted parent prefix from TQ."""
+        cursor = state.emit_cursor
+        parts = []
+        for chunk in state.handoff_rows:
+            if cursor != chunk.token_start:
+                raise RuntimeError(
+                    "capture handoff has missing or overlapping routes at tokens "
+                    f"{cursor}:{chunk.token_start}; only the TQ-owned prefix may "
+                    "be omitted, never substituted with trainer routing"
+                )
+            parts.append(chunk.rows)
+            cursor = chunk.token_start + len(chunk.rows)
+        assert cursor == token_end, "capture handoff has no computed suffix"
+        rows = (
+            (parts[0] if len(parts) == 1 else np.concatenate(parts))
+            if parts
+            else template[:0].copy()
+        )
+        output = AuxRequestOutput(state.emit_cursor, rows)
+        state.handoff_rows.clear()
+        state.emit_cursor = token_end
+        return output
+
+    def _capture_rows(
+        self,
+        request_id: str,
+        state: _WorkerRequestState,
+        token_start: int,
+        rows: np.ndarray,
+    ) -> list[tuple[int, np.ndarray]]:
+        buffer = self._buffer
+        assert buffer is not None
+        return buffer.capture(request_id, token_start, rows)
+
+    def _read_rows(
+        self, request_id: str, token_start: int, token_end: int
+    ) -> np.ndarray:
+        buffer, store = self._buffer, self._store
+        assert buffer is not None and store is not None
+        state = self._requests[request_id]
+        block_size = buffer.block_size
+        emit_start = token_start
+        stored_end = (
+            min(token_end // block_size, len(state.aux_output_keys)) * block_size
+        )
+        if emit_start < stored_end:
+            first_block = emit_start // block_size
+            stored = materialize_routed_experts(
+                store,
+                state.aux_output_keys[first_block : stored_end // block_size],
+                shape_per_token=buffer.shape_per_token,
+                dtype=buffer.dtype,
+            )
+            local_start = emit_start % block_size
+            rows = stored[local_start : local_start + stored_end - emit_start]
+            if stored_end < token_end:
+                rows = np.concatenate(
+                    (rows, buffer.read(request_id, stored_end, token_end))
+                )
+        else:
+            rows = buffer.read(request_id, emit_start, token_end)
+        return rows
 
     def _publish_blocks(
         self,
@@ -323,12 +433,26 @@ class AuxOutputWorkerConnector:
     def _teardown(self, request_ids: Iterable[str]) -> None:
         """Drop finished requests' temporary state after publishing key releases."""
         buffer = self._buffer
-        assert buffer is not None
         for request_id in request_ids:
             state = self._requests.pop(request_id)
-            for _, rows in state.pending_blocks:
-                buffer.release_block(rows)
-            buffer.discard(request_id)
+            if buffer is not None:
+                for _, rows in state.pending_blocks:
+                    buffer.release_block(rows)
+                buffer.discard(request_id)
+
+    def drain(self) -> None:
+        """Require consumed GPU snapshots and completed route publication."""
+        with self._lock:
+            if self._pending_outputs:
+                raise RuntimeError("cannot refit with auxiliary output in flight")
+            if self._store is not None:
+                self._store.drain()
+
+    def clear_cached_outputs(self) -> None:
+        """Clear routes alongside KV, preserving releases until the next step."""
+        self.drain()
+        if self._store is not None:
+            self._store.clear()
 
     def begin_step(self, metadata: AuxOutputConnectorMetadata | None) -> None:
         """Apply one scheduler step's request and block-hash updates.
@@ -337,7 +461,7 @@ class AuxOutputWorkerConnector:
         deferred to that step's process_output.
         """
         self._step_metadata = metadata
-        if self._buffer is None or metadata is None:
+        if not self._is_output_rank or metadata is None:
             return
         assert not metadata.requests.keys() & metadata.finished_requests, (
             "auxiliary output request cannot run and finish in one step"
@@ -358,9 +482,14 @@ class AuxOutputWorkerConnector:
                     for state in self._requests.values()
                     for key in reversed(state.aux_output_keys)
                 )
-                self._buffer.reset()
+                if self._buffer is not None:
+                    self._buffer.reset()
                 self._requests.clear()
                 self._generation = metadata.generation
+                if self._shared_store is not None:
+                    assert self._store is not None
+                    self._store.drain()
+                    self._shared_store.clear()
             for request_id, emit_start in metadata.requests.items():
                 state = self._requests.setdefault(
                     request_id, _WorkerRequestState(emit_cursor=emit_start)
@@ -375,9 +504,14 @@ class AuxOutputWorkerConnector:
                 tuple[_WorkerRequestState, list[tuple[int, np.ndarray]]]
             ] = []
             retained_keys: list[str] = []
-            for request_id, block_hashes in metadata.block_hashes.items():
+            hashes = {} if self._use_capture_handoff else metadata.block_hashes
+            for request_id, block_hashes in hashes.items():
                 state = self._requests[request_id]
-                keys = routed_experts_keys(block_hashes, str(self._generation))
+                keys = (
+                    self._shared_store.keys(list(block_hashes))
+                    if self._shared_store is not None
+                    else routed_experts_keys(block_hashes, str(self._generation))
+                )
                 state.aux_output_keys.extend(keys)
                 retained_keys.extend(keys)
                 block_batches.append((state, []))
@@ -389,17 +523,49 @@ class AuxOutputWorkerConnector:
                     continue
                 finished_now.append(request_id)
                 release_keys.extend(reversed(state.aux_output_keys))
-            self._publish_blocks(block_batches, retained_keys, release_keys)
+            if not self._use_capture_handoff:
+                self._publish_blocks(block_batches, retained_keys, release_keys)
             self._teardown(finished_now)
 
     def close(self) -> None:
         with self._lock:
             self._pending_outputs.clear()
+            self._requests.clear()
             if self._store is not None:
                 try:
                     self._store.close()
                 finally:
                     self._store = None
+
+
+def _get_mooncake_worker() -> MooncakeStoreWorker | None:
+    from vllm.distributed.kv_transfer.kv_transfer_state import (
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+    )
+
+    if not has_kv_transfer_group():
+        return None
+    from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector import (
+        MooncakeStoreConnector,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+        MultiConnector,
+    )
+
+    pending = [get_kv_transfer_group()]
+    workers = []
+    while pending:
+        connector = pending.pop()
+        if isinstance(connector, MultiConnector):
+            pending.extend(connector.sub_connectors)
+        elif isinstance(connector, MooncakeStoreConnector):
+            workers.append(connector.connector_worker)
+    if len(workers) > 1:
+        raise ValueError(
+            "Expert-route storage requires a single MooncakeStoreConnector"
+        )
+    return workers[0] if workers else None
 
 
 def get_aux_output_connector(

@@ -44,7 +44,8 @@ class AuxRequestOutput:
 class AuxOutputSchedulerConnector:
     """Build worker metadata without owning auxiliary output payloads or stores."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, use_capture_handoff: bool = False) -> None:
+        self._use_capture_handoff = use_capture_handoff
         # Number of hashes already sent to the worker for each active request.
         self._sent_hash_counts: dict[str, int] = {}
         # Terminal events are delivered with the next connector metadata.
@@ -62,10 +63,11 @@ class AuxOutputSchedulerConnector:
         for request_id in scheduler_output.num_scheduled_tokens:
             num_sent = self._sent_hash_counts.setdefault(request_id, 0)
             request = requests[request_id]
-            packed = self._pack_new_hashes(request.block_hashes, num_sent)
-            if packed is not None:
-                block_hashes_by_request[request_id] = packed
-            self._sent_hash_counts[request_id] = len(request.block_hashes)
+            if not self._use_capture_handoff:
+                packed = self._pack_new_hashes(request.block_hashes, num_sent)
+                if packed is not None:
+                    block_hashes_by_request[request_id] = packed
+                self._sent_hash_counts[request_id] = len(request.block_hashes)
             assert request.sampling_params is not None
             # A P/D prefiller may cut the prompt short of the requested start.
             scheduled_requests[request_id] = max(
@@ -77,7 +79,9 @@ class AuxOutputSchedulerConnector:
             )
         # A settled token can complete a hash block after the next async schedule
         # was built. Send a hash-only update if the request was not rescheduled.
-        if len(self._sent_hash_counts) != len(scheduled_requests):
+        if not self._use_capture_handoff and len(self._sent_hash_counts) != len(
+            scheduled_requests
+        ):
             for request_id, num_sent in self._sent_hash_counts.items():
                 if request_id in scheduled_requests:
                     continue
@@ -139,8 +143,10 @@ class AuxOutputSchedulerConnector:
         if num_sent is None:
             return
         # The next metadata delivers this terminal event to the worker.
-        self._finished_requests[request_id] = self._pack_new_hashes(
-            request.block_hashes, num_sent
+        self._finished_requests[request_id] = (
+            None
+            if self._use_capture_handoff
+            else self._pack_new_hashes(request.block_hashes, num_sent)
         )
 
     @staticmethod

@@ -216,12 +216,18 @@ class MooncakeStoreScheduler:
         align = (
             self._hash_block_size if self.enable_partial_hash_hits else self._block_size
         )
-        if request.num_tokens < align:
+        num_lookup_tokens = request.num_tokens
+        if request.max_cache_hit_length is not None:
+            # Lookup returns a hit strictly shorter than num_lookup_tokens and
+            # resolves Mamba state at that boundary. Do not truncate a returned
+            # hit afterward: a deeper state cannot restore an earlier prefix.
+            num_lookup_tokens = min(num_lookup_tokens, request.max_cache_hit_length + 1)
+        if num_lookup_tokens < align or request.max_cache_hit_length == 0:
             return 0, False
 
         lookup_result = self.client.lookup(
             request.request_id,
-            request.num_tokens,
+            num_lookup_tokens,
             request.block_hashes,
             non_block=self.lookup_async,
         )

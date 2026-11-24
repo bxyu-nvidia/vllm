@@ -320,6 +320,7 @@ def _make_vllm_config(
     cache_config.get_resolved_kv_cache_layout = lambda: kv_cache_layout
     return SimpleNamespace(
         model_config=_FakeModelConfig(),
+        aux_output_config=SimpleNamespace(enabled=False),
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=pipeline_parallel_size,
             rank=rank,
@@ -2538,7 +2539,10 @@ def test_worker_is_hma_required_from_kv_cache_groups(
     assert store_worker._is_hma_required is expected_is_hma_required
 
 
-def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("capture_handoff", [False, True])
+def test_requester_worker_init_uses_positional_setup(
+    tmp_path, monkeypatch, capture_handoff
+):
     store = MagicMock()
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
@@ -2558,7 +2562,12 @@ def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
             },
         ),
     )
-    w = worker.MooncakeStoreWorker(_make_vllm_config(), _make_kv_cache_config())
+    config = _make_vllm_config()
+    config.aux_output_config = SimpleNamespace(
+        enabled=True, use_capture_handoff=capture_handoff
+    )
+    w = worker.MooncakeStoreWorker(config, _make_kv_cache_config())
+    assert w._aux_output_enabled is not capture_handoff
 
     assert not hasattr(w, "_isolate_offload_resources")
     assert store.setup.call_args.args == (
@@ -3711,6 +3720,9 @@ def _make_bare_worker(
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
     worker._capacity_only = False
+    worker.aux_store = None
+    worker.aux_store_writer = None
+    worker._aux_output_enabled = False
     worker.block_size = block_size
     worker._is_hma_required = False
     worker.tp_rank = 0
@@ -5192,3 +5204,119 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+@pytest.mark.parametrize(
+    "route_hits,expected", [([1, 1, 1], 32), ([1, 0, 1], 16), ([0, 1, 1], 0)]
+)
+def test_lookup_requires_contiguous_expert_route_prefix(route_hits, expected):
+    from vllm.distributed.aux_output_connector.mooncake_store import (
+        MooncakeBlockObjectStore,
+    )
+
+    worker = _make_bare_worker()
+    worker._aux_output_enabled = True
+    worker.aux_store = MooncakeBlockObjectStore(
+        client=worker.store,
+        replicate_config=None,
+        namespace="r3-model",
+        max_bytes=128,
+        object_nbytes=2,
+    )
+    hashes = [b"a0", b"a1", b"a2"]
+    route_keys = worker.aux_store.keys(hashes)
+    present = {key for key, hit in zip(route_keys, route_hits) if hit}
+    worker.store.batch_is_exist.side_effect = lambda keys: [
+        int(not key.startswith("vllm-artifact/") or key in present) for key in keys
+    ]
+    try:
+        assert worker.lookup(48, hashes).hit_length == expected
+        assert worker.store.batch_is_exist.call_count == 1
+    finally:
+        worker.aux_store.close()
+
+
+@pytest.mark.parametrize("earlier_mamba_available,expected", [(True, 32), (False, 0)])
+def test_route_miss_rechecks_earlier_hybrid_kv_boundary(
+    earlier_mamba_available, expected
+):
+    from vllm.distributed.aux_output_connector.mooncake_store import (
+        MooncakeBlockObjectStore,
+    )
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        MambaSpec,
+    )
+
+    worker = _make_bare_worker()
+    worker._aux_output_enabled = True
+    worker.aux_store = MooncakeBlockObjectStore(
+        client=worker.store,
+        replicate_config=None,
+        namespace="r3-model",
+        max_bytes=128,
+        object_nbytes=2,
+    )
+    worker._kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["attention"],
+            FullAttentionSpec(
+                block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=32,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        ),
+    ]
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=i), size, hash_block_size=16
+        )
+        for i, size in enumerate([16, 32])
+    ]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups, scheduler_block_size=32, hash_block_size=16
+    )
+    _refresh_group_tp_replication_factors(worker)
+    hashes = [b"h0", b"h1", b"h2", b"h3"]
+    absent = {worker.aux_store.keys(hashes)[3]}
+    if not earlier_mamba_available:
+        absent.add(worker.token_dbs[1].key_for(hashes[1]))
+    worker.store.batch_is_exist.side_effect = lambda keys: [
+        int(key not in absent) for key in keys
+    ]
+    try:
+        # Route availability ends at 48; the valid Mamba checkpoint is at 32.
+        assert worker.lookup(65, hashes).hit_length == expected
+        assert worker.store.batch_is_exist.call_count == 1
+    finally:
+        worker.aux_store.close()
+
+
+def test_mooncake_shutdown_drains_route_writer_before_closing_client():
+    worker = _make_bare_worker()
+    events = []
+    worker.aux_store_writer = MagicMock()
+    worker.aux_store_writer.close.side_effect = lambda: events.append("routes")
+    worker.store.close.side_effect = lambda: events.append("client")
+    worker.close()
+    worker.close()
+    assert events == ["routes", "client"]
+
+
+def test_capture_handoff_kv_lookup_does_not_require_cached_routes():
+    # The RL path leaves aux_store unset and disables route requirements.
+    w = _make_bare_worker()
+    w._aux_output_enabled = False
+    w.aux_store = None
+    w.store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+    assert w.lookup(48, [b"a0", b"a1", b"a2"]).hit_length == 32
+    keys = w.store.batch_is_exist.call_args.args[0]
+    assert keys and all(not key.startswith("vllm-artifact/") for key in keys)

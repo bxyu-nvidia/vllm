@@ -299,6 +299,10 @@ class KVCacheManager:
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
         max_cache_hit_length = request.num_tokens - 1
+        if request.max_cache_hit_length is not None:
+            max_cache_hit_length = min(
+                max_cache_hit_length, request.max_cache_hit_length
+            )
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
@@ -360,8 +364,13 @@ class KVCacheManager:
             return self.empty_kv_cache_blocks, 0, 0, False
 
         fa_group_id = coordinator.full_attention_group_id
+        max_cache_hit_length = request.num_tokens - 1
+        if request.max_cache_hit_length is not None:
+            max_cache_hit_length = min(
+                max_cache_hit_length, request.max_cache_hit_length
+            )
         computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
-            request.block_hashes, request.num_tokens - 1
+            request.block_hashes, max_cache_hit_length
         )
         if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
             # A lagging group hit deeper than full attention means its

@@ -118,7 +118,7 @@ pub struct EngineCoreOutput {
     #[serde(default)]
     pub prefill_stats: Option<Box<PrefillStats>>,
     #[serde(default)]
-    pub routed_experts: Option<Box<OpaqueValue>>,
+    pub routed_experts: Option<Box<WireNdArray>>,
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
     #[serde(default)]
     pub num_nans_in_logits: u32,
@@ -143,6 +143,9 @@ pub struct EngineCoreOutput {
     /// the first output of a request that asked for them.
     #[serde(default)]
     pub prompt_token_id_logprobs: Option<Box<WireNdArray>>,
+    /// `(max_model_len, prompt_len)` rejected after engine-side capture alignment.
+    #[serde(default)]
+    pub prompt_length_error: Option<(u32, u32)>,
 }
 
 /// Raw per-sequence speculative-decoding accumulator.
@@ -190,6 +193,11 @@ impl EngineCoreOutput {
         self.new_sampling_mask = (self.new_sampling_mask.take())
             .map(|value| value.resolve(frames, "new_sampling_mask"))
             .transpose()?;
+        if let Some(value) = self.routed_experts.as_mut() {
+            value
+                .resolve_aux_frame(frames)
+                .map_err(|message| ext_value_decode!("routed_experts: {message}"))?;
+        }
         if let Some(value) = self.prompt_token_id_logprobs.as_mut() {
             value
                 .resolve_aux_frame(frames)
@@ -556,6 +564,7 @@ mod tests {
                             new_sampling_mask: None,
                             spec_decode_metrics: None,
                             prompt_token_id_logprobs: None,
+                            prompt_length_error: None,
                         },
                     ],
                     scheduler_stats: None,

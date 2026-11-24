@@ -718,10 +718,37 @@ impl EngineCoreClient {
         T: serde::de::DeserializeOwned,
         A: serde::Serialize + std::fmt::Debug,
     {
+        self.call_utility_selected(None, method, args).await
+    }
+
+    /// Target the engine that owns a request, including DP frontends.
+    pub async fn call_utility_on<T, A>(&self, engine_index: u32, method: &str, args: A) -> Result<T>
+    where
+        T: serde::de::DeserializeOwned,
+        A: serde::Serialize + std::fmt::Debug,
+    {
+        let mut values = self.call_utility_selected(Some(engine_index), method, args).await?;
+        values.pop().ok_or_else(|| Error::UtilityCallClosed {
+            method: method.into(),
+            call_id: 0,
+        })
+    }
+
+    async fn call_utility_selected<T, A>(
+        &self,
+        selected: Option<u32>,
+        method: &str,
+        args: A,
+    ) -> Result<Vec<T>>
+    where
+        T: serde::de::DeserializeOwned,
+        A: serde::Serialize + std::fmt::Debug,
+    {
         trace!(
             method,
             client_index = self.config.client_index,
             engine_count = self.engines.len(),
+            selected_engine = selected,
             "sending utility request"
         );
 
@@ -744,6 +771,9 @@ impl EngineCoreClient {
 
         let mut prepared_calls = Vec::with_capacity(self.engines.len());
         for engine in &self.engines {
+            if selected.is_some_and(|index| engine.engine_id.engine_index().unwrap_or(0) != index) {
+                continue;
+            }
             let (call_id, rx) = self.inner.allocate_and_register_utility_call()?;
             call_guard.call_ids.push(call_id);
             let request =

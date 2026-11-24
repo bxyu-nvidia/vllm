@@ -24,7 +24,6 @@ been registered but not fulfilled within a configurable timeout.
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
@@ -188,7 +187,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             "remote_pp_size": params.get("pp_size", 1),
         }
         self._push_registration_deadlines[request.request_id] = (
-            time.perf_counter() + self._push_registration_timeout
+            self._lease_time() + self._push_registration_timeout
         )
         # In push mode D doesn't know P's blocks; P determines them
         # from the registration. We still track the request as
@@ -267,7 +266,7 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
                 self._kv_lease_duration,
             )
             self._reqs_need_send[request.request_id] = (
-                time.perf_counter() + self._kv_lease_duration
+                self._lease_time() + self._kv_lease_duration
             )
 
             block_ids = self.get_exchange_clipped_blocks(block_ids)
@@ -293,6 +292,12 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
             transfer_mode=self._TRANSFER_MODE,
         )
 
+    def _extend_transfer_deadlines(self, start: float, duration: float) -> None:
+        super()._extend_transfer_deadlines(start, duration)
+        for req_id, deadline in self._push_registration_deadlines.items():
+            if deadline > start:
+                self._push_registration_deadlines[req_id] = deadline + duration
+
     def build_connector_meta(
         self,
         scheduler_output: SchedulerOutput,
@@ -305,14 +310,14 @@ class NixlPushConnectorScheduler(NixlBaseConnectorScheduler):
         # The corresponding request is already tracked via _reqs_need_recv;
         # the engine layer will eventually time it out via the lease, but we
         # at least drop the stale registration so we don't keep retrying.
-        now = time.perf_counter()
+        now = self._lease_time()
         # Deadlines are inserted in non-decreasing order (monotonic clock +
         # constant timeout, armed once per request), and dict insertion order
         # is preserved across key deletions, so we can stop at the first
         # not-yet-expired entry instead of scanning the whole dict.
         expired = []
         for rid, deadline in self._push_registration_deadlines.items():
-            if deadline > now:
+            if self._transfer_pause_started is not None or deadline > now:
                 break
             expired.append(rid)
         for rid in expired:

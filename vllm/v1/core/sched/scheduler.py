@@ -432,7 +432,9 @@ class Scheduler(SchedulerInterface):
             self.perf_metrics = ModelMetrics(vllm_config)
 
         self.aux_output_connector = (
-            AuxOutputSchedulerConnector()
+            AuxOutputSchedulerConnector(
+                use_capture_handoff=vllm_config.aux_output_config.use_capture_handoff
+            )
             if vllm_config.aux_output_config.enabled
             else None
         )

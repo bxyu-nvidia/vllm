@@ -371,6 +371,7 @@ class _StubWriterWorker(NixlPushConnectorWorker):
         w._has_packed_cache = False
         w._reqs_to_process = set()
         w._reqs_to_send = {}
+        w._transfer_pause_started = None
         w.consumer_notification_counts_by_req = defaultdict(int)
         w.tp_rank = 0
         w.pcp_rank = 0
@@ -2159,3 +2160,20 @@ def test_layer_handshake_rejects_unsupported_geometry(
     assert not worker.kv_caches_base_addr
     with pytest.raises(KeyError):
         worker.transfer_topo.get_engine_info(metadata.engine_id)
+
+
+def test_refit_pause_preserves_push_registration_watchdog(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(time, "perf_counter", lambda: now[0])
+    scheduler = make_nixl_push_scheduler()
+    scheduler._push_registration_deadlines = {"receive": 120.0}
+    scheduler.set_transfer_paused(True)
+    now[0] = 1100.0
+    scheduler.build_connector_meta(MagicMock())
+    assert scheduler._push_registration_deadlines == {"receive": 120.0}
+    scheduler.set_transfer_paused(False)
+    scheduler.build_connector_meta(MagicMock())
+    assert scheduler._push_registration_deadlines == {"receive": 1120.0}
+    now[0] = 1120.0
+    scheduler.build_connector_meta(MagicMock())
+    assert scheduler._push_registration_deadlines == {}

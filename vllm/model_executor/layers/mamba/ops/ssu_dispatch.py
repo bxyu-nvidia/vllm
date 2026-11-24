@@ -92,6 +92,58 @@ def _reset_new_replayssm_slots_kernel(
 
 
 @triton.jit
+def _migrate_replayssm_slots_kernel(
+    idx_mapping,
+    src_cols,
+    dst_cols,
+    initial_state_cols,
+    block_table,
+    state_ptrs,
+    slot_strides,
+    slot_sizes,
+    block_table_stride_req: tl.int64,
+    PAD_SLOT_ID: tl.constexpr,
+    HAS_IDX_MAPPING: tl.constexpr,
+    COPY_BLOCK_SIZE: tl.constexpr,
+    COPY_TILES: tl.constexpr,
+    NUM_TENSORS: tl.constexpr,
+):
+    """Copy live history or bootstrap from an imported canonical checkpoint."""
+    batch_idx = tl.program_id(0)
+    tile_idx = tl.program_id(1)
+    req_idx = batch_idx
+    if HAS_IDX_MAPPING:
+        req_idx = tl.load(idx_mapping + batch_idx)
+        if req_idx < 0:
+            return
+    src_col = tl.load(src_cols + req_idx)
+    if src_col < 0:
+        src_col = tl.load(initial_state_cols + req_idx)
+    dst_col = tl.load(dst_cols + req_idx)
+    if src_col < 0 or dst_col < 0 or src_col == dst_col:
+        return
+    src_slot = tl.load(block_table + batch_idx * block_table_stride_req + src_col)
+    dst_slot = tl.load(block_table + batch_idx * block_table_stride_req + dst_col)
+    if src_slot == PAD_SLOT_ID or dst_slot == PAD_SLOT_ID:
+        return
+    if src_slot == dst_slot:
+        return
+
+    # Most requests do not move. Only visit per-layer metadata after a move
+    # is known, instead of launching an idle CTA for every request/layer pair.
+    offsets = tile_idx * COPY_BLOCK_SIZE + tl.arange(0, COPY_BLOCK_SIZE)
+    for tensor_idx in range(NUM_TENSORS):
+        ptr = tl.load(state_ptrs + tensor_idx).to(tl.pointer_type(tl.uint8))
+        stride = tl.load(slot_strides + tensor_idx)
+        size = tl.load(slot_sizes + tensor_idx)
+        # Padding and other layers between slots must remain untouched.
+        for start in range(0, tl.cdiv(size, COPY_BLOCK_SIZE * COPY_TILES)):
+            pos = start * COPY_BLOCK_SIZE * COPY_TILES + offsets
+            values = tl.load(ptr + src_slot * stride + pos, mask=pos < size)
+            tl.store(ptr + dst_slot * stride + pos, values, mask=pos < size)
+
+
+@triton.jit
 def _postprocess_replayssm_kernel(
     idx_mapping,
     query_metadata,
@@ -280,6 +332,45 @@ def _compact_replayssm_requests_kernel(
     )
 
 
+class _ReplaySSMMigrationTables(NamedTuple):
+    state_ptrs: torch.Tensor
+    slot_strides: torch.Tensor
+    slot_sizes: torch.Tensor
+
+    @classmethod
+    def create(cls, mixers: list[Any]) -> "_ReplaySSMMigrationTables":
+        # Ring pools are block-major and overlaid between cache groups. Never
+        # copy a whole backing allocation or a neighboring layer's slice.
+        tensors: dict[int, torch.Tensor] = {}
+        for mixer in mixers:
+            for tensor in (
+                *mixer.kv_cache,
+                *mixer.replayssm_cache,
+                mixer._replayssm_ring_start,
+                mixer._replayssm_prev_num_accepted,
+            ):
+                if tensor.numel():
+                    if not tensor[0].is_contiguous():
+                        raise ValueError(
+                            "ReplaySSM migration requires contiguous slots"
+                        )
+                    tensors[tensor.data_ptr()] = tensor
+        states = list(tensors.values())
+        return cls(
+            _cuda_i64_ptrs(states),
+            torch.tensor(
+                [t.stride(0) * t.element_size() for t in states],
+                dtype=torch.int64,
+                device=states[0].device,
+            ),
+            torch.tensor(
+                [t[0].numel() * t.element_size() for t in states],
+                dtype=torch.int64,
+                device=states[0].device,
+            ),
+        )
+
+
 class _ReplaySSMMaterializeTables(NamedTuple):
     state_ptrs: torch.Tensor
     state_slot_strides: torch.Tensor
@@ -303,6 +394,7 @@ class _ReplaySSMGroupContext:
     ring_start: torch.Tensor
     num_committed: torch.Tensor
     materialize_tables: _ReplaySSMMaterializeTables
+    migration_tables: _ReplaySSMMigrationTables
     src_slots: torch.Tensor
     dst_slots: torch.Tensor
     plan_ring_start: torch.Tensor
@@ -334,6 +426,7 @@ class _ReplaySSMGroupContext:
             block_table=block_table,
             ring_start=first._replayssm_ring_start,
             num_committed=first._replayssm_prev_num_accepted,
+            migration_tables=_ReplaySSMMigrationTables.create(mixers),
             materialize_tables=_ReplaySSMMaterializeTables(
                 state_ptrs=_cuda_i64_ptrs([m.kv_cache[1] for m in mixers]),
                 state_slot_strides=_cuda_i64_slot_strides(
@@ -402,6 +495,40 @@ class _ReplaySSMGroupContext:
             self.block_table.stride(0),
             PAD_SLOT_ID=NULL_BLOCK_ID,
             HAS_IDX_MAPPING=idx_mapping is not None,
+        )
+
+    def migrate_live_slots(
+        self,
+        *,
+        idx_mapping: torch.Tensor | None,
+        src_cols: torch.Tensor,
+        dst_cols: torch.Tensor,
+        initial_state_cols: torch.Tensor,
+        num_reqs: int,
+    ) -> None:
+        """Move state at the worker's actual block transition.
+
+        New owners bootstrap from their imported checkpoint column; async KV
+        loading may have reserved blocks without executing a forward or a
+        scheduler copy. Call reset_new_slots afterwards to discard imported
+        replay cursors. Continuing owners preserve their full live history.
+        """
+        if num_reqs == 0:
+            return
+        tables = self.migration_tables
+        _migrate_replayssm_slots_kernel[(num_reqs, 8)](
+            idx_mapping,
+            src_cols,
+            dst_cols,
+            initial_state_cols,
+            self.block_table,
+            *tables,
+            self.block_table.stride(0),
+            PAD_SLOT_ID=NULL_BLOCK_ID,
+            HAS_IDX_MAPPING=idx_mapping is not None,
+            COPY_BLOCK_SIZE=1024,
+            COPY_TILES=8,
+            NUM_TENSORS=tables.state_ptrs.numel(),
         )
 
     def postprocess(
@@ -521,6 +648,10 @@ class ReplaySSMModelContext:
     def reset_new_slots(self, **kwargs: Any) -> None:
         for group in self.groups:
             group.reset_new_slots(**kwargs)
+
+    def migrate_live_slots(self, **kwargs: Any) -> None:
+        for group in self.groups:
+            group.migrate_live_slots(**kwargs)
 
     def postprocess(self, **kwargs: Any) -> None:
         for group in self.groups:

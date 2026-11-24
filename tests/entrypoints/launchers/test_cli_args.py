@@ -51,6 +51,14 @@ def test_cors_origins_require_explicit_opt_in(serve_parser):
     ).allowed_origins == ["http://trusted.example"]
 
 
+def test_prefix_token_alignment_is_forwarded_to_rust(serve_parser):
+    from vllm.entrypoints.serve.utils.api_utils import jsonify_non_default_args
+
+    args = serve_parser.parse_args(["--enable-prefix-token-alignment"])
+    assert jsonify_non_default_args(args)["enable_prefix_token_alignment"] is True
+    assert not serve_parser.parse_args([]).enable_prefix_token_alignment
+
+
 ### Test config parsing
 def test_config_arg_parsing(serve_parser, cli_config_file):
     args = serve_parser.parse_args([])

@@ -10,6 +10,7 @@ mod kv_event_sources;
 mod load;
 mod lora;
 mod metrics;
+mod nemo_rl;
 pub(crate) mod openai;
 mod pause;
 mod profile;
@@ -120,6 +121,12 @@ fn build_router_with_options(
         // vLLM specific endpoints
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize));
+
+    if let Ok(token) = std::env::var("NEMO_RL_PD_CONTROL_TOKEN")
+        && !token.is_empty()
+    {
+        router = router.merge(nemo_rl::router(&token));
+    }
 
     if scale_out_endpoints_enabled {
         router = router.route("/inference/v1/generate", post(inference::generate));

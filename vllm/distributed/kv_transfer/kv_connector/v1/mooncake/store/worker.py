@@ -33,6 +33,10 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.aux_output_connector.mooncake_store import (
+    MooncakeBlockObjectStore,
+)
+from vllm.distributed.aux_output_connector.store import BackgroundBlockObjectStore
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorTransferResults,
@@ -1061,6 +1065,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         request_queue: queue.Queue[Any] | None = None,
         group_participates: Sequence[bool] | None = None,
         is_hma_required: bool = False,
+        prepare_aux_output: Callable[[ReqMeta], None] | None = None,
     ):
         super().__init__(
             store,
@@ -1083,6 +1088,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         # With HMA the scheduler tracks a single merged group while block IDs
         # are only unique within a group, so failures are reported per request.
         self._is_hma_required = is_hma_required
+        self._prepare_aux_output = prepare_aux_output
         self._failed_requests: set[str] = set()
         self.disk_offload_buffer_budget_bytes = disk_offload_buffer_budget_bytes
         self.usable_disk_offload_buffer_budget_bytes = (
@@ -1174,6 +1180,22 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             addr_list.extend(g_addrs)
             size_list.extend(g_sizes)
             block_id_list.extend(g_block_ids)
+
+        if self._prepare_aux_output is not None:
+            try:
+                self._prepare_aux_output(req_meta)
+            except Exception:
+                # Report every destination block as invalid. The scheduler must
+                # recompute rather than admit KV with missing replay routes.
+                self._report_load_error(req_id, block_id_list)
+                logger.warning(
+                    "Skipping Mooncake KV load for %s: expert-route restore failed",
+                    req_id,
+                    exc_info=True,
+                )
+                self.set_finished_request(req_id)
+                self.request_queue.task_done()
+                return
 
         # Rotate aligned lists by tp_rank for load balancing.
         rotation = self.tp_rank % len(key_list)
@@ -1391,6 +1413,13 @@ class MooncakeStoreWorker:
         assert kv_role is not None
         self.kv_role = kv_role
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self.aux_store: MooncakeBlockObjectStore | None = None
+        self.aux_store_writer: BackgroundBlockObjectStore | None = None
+        self._aux_output_enabled = (
+            vllm_config.aux_output_config.enabled
+            and not vllm_config.aux_output_config.use_capture_handoff
+        )
+        self.aux_cache_prefix = str(extra_config.get("cache_prefix", ""))
         self.can_put = self.kv_role in ("kv_producer", "kv_both") or (
             extra_config.get("save_decode_cache", False)
         )
@@ -1923,6 +1952,9 @@ class MooncakeStoreWorker:
                     for group in self._kv_cache_groups
                 ],
                 is_hma_required=self._is_hma_required,
+                prepare_aux_output=self._prepare_aux_output
+                if self._aux_output_enabled and self.tp_rank == 0
+                else None,
             )
             recv_thread.name = f"KVCacheStoreRecvingThread-{i}"
             recv_thread.start()
@@ -1950,9 +1982,21 @@ class MooncakeStoreWorker:
                 continue
 
             load_spec.token_len = load_spec.kvpool_cached_tokens
+            if self.aux_store is not None:
+                self.aux_store.reserve_prefetch(request.req_id)
             self.recv_request_queue.put(request)
 
         assert self.load_async, "load_async must be True for better performance."
+
+    def _prepare_aux_output(self, request: ReqMeta) -> None:
+        if self.aux_store is None:
+            raise RuntimeError("Mooncake expert-route store is not initialized")
+        assert request.load_spec is not None
+        count = cdiv(request.load_spec.token_len, self.hash_block_size)
+        keys = self.aux_store.keys(request.block_hashes[:count])
+        if len(keys) != count:
+            raise RuntimeError("Missing block hashes for expert-route restore")
+        self.aux_store.prefetch(request.req_id, keys)
 
     def wait_for_save(self, metadata: MooncakeStoreConnectorMetadata):
         """Issue async stores with CUDA event synchronization.
@@ -1986,6 +2030,8 @@ class MooncakeStoreWorker:
         if self._capacity_only:
             return set(), set()
 
+        if self.aux_store is not None:
+            self.aux_store.release_prefetches(finished_req_ids | meta.preempted_req_ids)
         if self.can_put:
             self._close_ended_store_requests(finished_req_ids, meta)
 
@@ -2124,7 +2170,9 @@ class MooncakeStoreWorker:
                 unit_ids: range | list[int] = range(max_units)
                 group_hashes: Sequence[BlockHash] = block_hashes
             else:
-                lookup_mask = lookup_masks[g_idx]  # type: ignore[index]
+                # A route miss can shorten the hit to an earlier Mamba/SWA
+                # boundary. Query those KV candidates in the same RPC too.
+                lookup_mask = None if self._aux_output_enabled else lookup_masks[g_idx]  # type: ignore[index]
                 group_hashes = self.coord.block_hashes_for_spec(
                     block_hashes, self._kv_cache_groups[g_idx].kv_cache_spec
                 )
@@ -2151,9 +2199,22 @@ class MooncakeStoreWorker:
         if not candidate_keys:
             return MooncakeLookupResult(0)
 
+        route_keys: list[str] = []
+        if self._aux_output_enabled:
+            if self.aux_store is None:
+                return MooncakeLookupResult(0)
+            route_keys = self.aux_store.keys(
+                block_hashes[: token_len // self.hash_block_size]
+            )
+        kv_key_count = len(candidate_keys)
+        candidate_keys.extend(route_keys)
         lookup_start = time.perf_counter()
         try:
             res = self.store.batch_is_exist(candidate_keys)
+            if len(res) != len(candidate_keys):
+                raise RuntimeError(
+                    "Mooncake returned an invalid existence result count"
+                )
             self._record_kv_connector_operation(
                 "lookup_exists",
                 time.perf_counter() - lookup_start,
@@ -2180,6 +2241,18 @@ class MooncakeStoreWorker:
             if all(res[pos + j] == 1 for j in range(count)):
                 exists_set.add((g_idx, hash_bytes))
             pos += count
+
+        # Routes cover the entire reused prefix even when SWA/Mamba only need
+        # tail KV blocks. Re-run the coordinator below the first missing route
+        # so the resulting boundary remains valid for every KV group.
+        if route_keys:
+            route_hits = res[kv_key_count:]
+            first_missing = next(
+                (i for i, hit in enumerate(route_hits) if hit != 1), len(route_hits)
+            )
+            token_len = min(token_len, first_missing * self.hash_block_size)
+            if token_len <= 0:
+                return MooncakeLookupResult(0)
 
         cached_block_pool = ExternalCachedBlockPool(
             self.hash_block_size,
@@ -2263,6 +2336,27 @@ class MooncakeStoreWorker:
     def group_tp_replication_factors(self) -> tuple[int, ...]:
         return self._group_tp_replication_factors
 
+    def drain_cache_operations(self) -> None:
+        """Drain this worker before any fleet member resets shared KV/routes.
+
+        The caller must pause admission on the entire fleet first. Draining
+        only the rank handling RESET cannot prevent another rank's late puts.
+        """
+        self.recv_request_queue.join()
+        if self.kv_send_thread is not None:
+            self.kv_send_thread.request_queue.join()
+        if self.aux_store_writer is not None:
+            self.aux_store_writer.drain()
+
+    def reset_store(self) -> None:
+        """Invalidate shared KV/routes and this worker's local route copies."""
+        self.drain_cache_operations()
+        removed = self.store.remove_all(force=True)
+        if removed < 0:
+            raise RuntimeError(f"Mooncake remove_all failed with status {removed}")
+        if self.aux_store is not None:
+            self.aux_store.clear()
+
     def close(self) -> None:
         """Release the MooncakeDistributedStore handle on teardown.
 
@@ -2288,7 +2382,11 @@ class MooncakeStoreWorker:
                     thread.request_queue.unfinished_tasks,
                 )
         try:
-            store.close()
+            try:
+                if self.aux_store_writer is not None:
+                    self.aux_store_writer.close()
+            finally:
+                store.close()
         except Exception as e:
             logger.warning("Error closing MooncakeDistributedStore: %s", e)
 
@@ -2347,9 +2445,7 @@ class LookupKeyServer:
                         # otherwise stale puts can repopulate it post-reset.
                         # Safe across HMA: store.remove_all wipes the underlying
                         # flat key space, clearing every (group_id, hash) entry.
-                        if self.store_worker.kv_send_thread is not None:
-                            self.store_worker.kv_send_thread.request_queue.join()
-                        self.store_worker.store.remove_all(force=True)
+                        self.store_worker.reset_store()
                         logger.info("Mooncake store reset via remove_all succeeded.")
                         self.socket.send(RESP_OK)
                     except Exception as e:

@@ -834,6 +834,17 @@ class Worker(WorkerBase):
             )
         return {(pp_rank, tp_rank): metadata}
 
+    def set_kv_transfer_paused(self, paused: bool, check_only: bool = False) -> bool:
+        if has_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            if not connector.supports_transfer_pause:
+                raise NotImplementedError(
+                    "The worker KV connector does not support keep-refit transfers"
+                )
+            if not check_only:
+                connector.set_transfer_paused(paused)
+        return True
+
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()
 

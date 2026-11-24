@@ -113,6 +113,9 @@ class BaseFrontendArgs:
     """When `--max-logprobs` is specified, represents single tokens as
     strings of the form 'token_id:{token_id}' so that tokens that are not
     JSON-encodable can be identified."""
+    enable_prefix_token_alignment: bool = False
+    """Allow required_prefix_token_ids on the Rust frontend to preserve exact
+    token histories across chat turns. Currently supports text-only requests."""
     enable_auto_tool_choice: bool = False
     """Enable auto tool choice for supported models. Use `--tool-call-parser`
     to specify which parser to use."""

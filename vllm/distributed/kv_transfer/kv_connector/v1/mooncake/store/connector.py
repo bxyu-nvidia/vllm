@@ -280,6 +280,15 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
             request, block_ids, partial_tail_offloads
         )
 
+    @property
+    def supports_transfer_pause(self) -> bool:
+        return True
+
+    def set_transfer_paused(self, paused: bool) -> None:
+        # Store I/O owns its buffers until completion and has no scheduler-driven
+        # peer lease. Continue I/O while model execution is suspended.
+        pass
+
     def reset_cache(self) -> bool | None:
         """Reset the external Mooncake store on prefix-cache reset.
 

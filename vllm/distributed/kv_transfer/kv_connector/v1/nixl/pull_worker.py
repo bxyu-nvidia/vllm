@@ -109,7 +109,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # lengthens the lease, which is the safe direction. A cross-node
         # epoch gap larger than the TTL otherwise expires the lease on
         # arrival and the blocks are freed before D reads them.
-        now_local = time.perf_counter()
+        now_local = self._lease_time()
         for req_id, expiration_time in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
                 if metadata.scheduler_clock:

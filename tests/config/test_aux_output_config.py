@@ -157,3 +157,43 @@ def test_aux_output_guards_are_inactive_when_capture_is_disabled():
     config.aux_output_config = AuxOutputConfig()
 
     config._verify_aux_output_compatibility()
+
+
+@pytest.mark.parametrize("connector", ["NixlConnector", "NixlPullConnector"])
+@pytest.mark.parametrize("kv_role", ["kv_both", "kv_producer", "kv_consumer"])
+@pytest.mark.parametrize("multi", [False, True])
+def test_nixl_pull_aux_output_uses_explicit_capture_handoff(connector, kv_role, multi):
+    config = _config(connector=connector, kv_role=kv_role)
+    config.aux_output_config.use_capture_handoff = True
+    if multi:
+        config.kv_transfer_config = KVTransferConfig(
+            kv_connector="MultiConnector",
+            kv_role=kv_role,
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": connector, "kv_role": kv_role},
+                    {"kv_connector": "MooncakeStoreConnector", "kv_role": "kv_both"},
+                ]
+            },
+        )
+    VllmConfig._verify_aux_output_compatibility(config)
+
+
+@pytest.mark.parametrize(
+    "connector", ["NixlPushConnector", "MoRIIOConnector", "MooncakeConnector"]
+)
+def test_capture_handoff_does_not_enable_other_pd_transports(connector):
+    config = _config(connector=connector)
+    config.aux_output_config.use_capture_handoff = True
+    with pytest.raises(ValueError, match=f"incompatible with {connector}"):
+        VllmConfig._verify_aux_output_compatibility(config)
+
+
+def test_capture_handoff_requires_routes_but_does_not_change_graph():
+    config = _config()
+    before = config.aux_output_config.compute_hash()
+    config.aux_output_config.use_capture_handoff = True
+    assert config.aux_output_config.compute_hash() == before
+    config.aux_output_config.enable_return_routed_experts = False
+    with pytest.raises(ValueError, match="requires routed-experts capture"):
+        VllmConfig._verify_aux_output_compatibility(config)

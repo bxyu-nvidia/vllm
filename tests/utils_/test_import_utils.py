@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import subprocess
 import sys
+import textwrap
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -47,6 +49,33 @@ def test_placeholder_module_error_handling():
     with _raises_module_not_found():
         # Test conflict with internal __module attribute
         _ = placeholder_attr.module
+
+
+def test_moe_dispatch_does_not_import_unused_native_backends():
+    """Broken optional EP extensions must not be probed during generic startup."""
+    code = textwrap.dedent("""
+        import sys
+        from unittest.mock import patch
+        from vllm.platforms import current_platform
+
+        attempted = []
+
+        class UnavailableNativeBackend:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split('.')[0] in ('deep_ep', 'nixl_ep', 'mori', 'moonep'):
+                    attempted.append(fullname)
+                    raise ImportError('incompatible optional native extension')
+
+        assert 'vllm.model_executor.layers.fused_moe.all2all_utils' not in sys.modules
+        sys.meta_path.insert(0, UnavailableNativeBackend())
+        with patch.object(current_platform, 'is_cuda_alike', return_value=True):
+            from vllm.model_executor.layers.fused_moe import all2all_utils
+        assert not attempted, attempted
+        """)
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=90
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 class TestHasModule:

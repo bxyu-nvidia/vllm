@@ -1866,9 +1866,9 @@ class MambaManager(SingleTypeKVCacheManager):
             has_partial_hit = partial_hit is not None
             live_source = None
             if self._copy_flashinfer_replayssm_live_state:
-                # Capture the live state owner before align-mode allocation
-                # relocates/nulls table entries. The eventual destination is
-                # the last new block, where the next forward writes state.
+                # Preserve the canonical cache-hit source before allocation
+                # mutates the table. Continuing requests instead migrate from
+                # the worker's live column once they actually cross a boundary.
                 if partial_hit is not None:
                     live_source = partial_hit[1]
                 elif prev_block_len > 0:
@@ -1967,7 +1967,15 @@ class MambaManager(SingleTypeKVCacheManager):
                         self._apply_cow(request_id, block_idx, source_block, cow_block)
                         returned_blocks = [cow_block] + returned_blocks
                 req_blocks.extend(new_blocks)
-                if self._copy_flashinfer_replayssm_live_state and new_blocks:
+                if (
+                    self._copy_flashinfer_replayssm_live_state
+                    and new_blocks
+                    and not blocks_allocated
+                ):
+                    # Bootstrap cache hits before the first forward. Continuing
+                    # requests migrate in the worker at the actual transition:
+                    # async draft rejection can leave them in the old block
+                    # after the scheduler has already allocated this one.
                     self._queue_replayssm_live_copy(live_source, req_blocks[-1])
                 self._allocated_block_reqs.add(request_id)
                 self._partial_hit_reqs.pop(request_id, None)

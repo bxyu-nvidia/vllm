@@ -1166,7 +1166,7 @@ async fn chat_stream_parses_tool_calls_automatically() {
     while let Some(event) = stream.next().await {
         match event.unwrap() {
             ChatEvent::Start { .. } => {}
-            ChatEvent::LogprobsDelta { .. } => {}
+            ChatEvent::LogprobsDelta { .. } | ChatEvent::RoutedExperts { .. } => {}
             ChatEvent::ToolCallStart { name, .. } => {
                 saw_tool_start = true;
                 assert_eq!(name, "get_weather");

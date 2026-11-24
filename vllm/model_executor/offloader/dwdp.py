@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Independent peer-weight pulls for distributed weight data parallelism.
 
-The store is used only to publish immutable weights during initialization and
-to release them during coordinated shutdown. Inference uses copy engines and
-local CUDA events; a peer need not execute a forward to serve its weights.
+The store coordinates initialization, paused weight updates, and shutdown.
+Inference uses copy engines and local CUDA events; a peer need not execute a
+forward to serve its weights.
 """
 
 import gc
@@ -87,7 +87,8 @@ class DWDPWeightManager:
     All ranks must register the same layers in execution order, with weights
     whose leading dimension is the rank's owned expert count. The remaining
     dimensions may contain any expert-major packed layout, including BlockMajorK.
-    Sources must remain immutable until every consumer has closed the manager.
+    Sources remain immutable during inference; coordinated refits preserve
+    their addresses.
     Forwards must execute in model order without concurrent consumption.
     Ordered stream handoffs and optional CUDA graph capture are supported.
 
@@ -142,6 +143,9 @@ class DWDPWeightManager:
         self._closed = False
         self._initialized = False
         self._failed = False
+        self._refitting = False
+        self._refit_epoch = 0
+        self._refit_layers: set[str] = set()
         self._compute_stream: int | None = None
         self._weight_views: list[tuple[torch.Tensor, ...]] = []
         self._copy_plans: list[tuple[torch.Tensor, ...]] = []
@@ -173,6 +177,8 @@ class DWDPWeightManager:
         once during initialization. Returned buffers are filled before profiling
         or inference; other tensors remain sharded throughout execution.
         """
+        if self._refitting:
+            return self._update_layer(name, num_experts, weights, replicated_indices)
         if self._store is not None or self._closed:
             raise RuntimeError("Cannot register weights after DWDP initialization")
         if name in self._indices or not weights:
@@ -412,6 +418,102 @@ class DWDPWeightManager:
             )
             self.check_peer_health()
 
+    @property
+    def refitting(self) -> bool:
+        """Whether all owners are inside a coordinated weight update."""
+        return self._refitting
+
+    def local_weights(self, name: str) -> tuple[torch.Tensor, ...]:
+        """Return the resident tensors whose storage is exported to peers."""
+        return self.layers[self._indices[name]].weights
+
+    def _update_layer(
+        self,
+        name: str,
+        num_experts: int,
+        weights: Sequence[torch.Tensor],
+        replicated_indices: Sequence[int],
+    ) -> dict[int, torch.Tensor]:
+        if self._failed or name not in self._indices or name in self._refit_layers:
+            raise RuntimeError(f"Invalid or duplicate DWDP refit layer: {name}")
+        layer = self.layers[self._indices[name]]
+        if (
+            num_experts != layer.num_experts
+            or len(weights) != len(layer.weights)
+            or set(replicated_indices) != set(layer.replicated)
+            or any(
+                src.shape != dest.shape
+                or src.dtype != dest.dtype
+                or src.device != dest.device
+                or not src.is_contiguous()
+                or src.requires_grad
+                for src, dest in zip(weights, layer.weights)
+            )
+        ):
+            raise ValueError(f"DWDP refit must preserve the storage layout of {name}")
+        for dest, src in zip(layer.weights, weights):
+            dest.copy_(src)
+        self._refit_layers.add(name)
+        return layer.replicated
+
+    def _refit_barrier(self, phase: str) -> None:
+        assert self._store is not None
+        self.check_peer_health()
+        prefix = f"refit/{self._refit_epoch}/{phase}"
+        self._store.set(f"{prefix}/{self.rank}", b"1")
+        self._store.wait([f"{prefix}/{rank}" for rank in range(self.world_size)])
+        self.check_peer_health()
+
+    @contextmanager
+    def refit(self) -> Iterator[None]:
+        """Update all owners in place after the caller pauses every scheduler.
+
+        All ranks must enter once per update. The drain barrier fences remote
+        reads before any owner overwrites IPC-exported storage. An exception
+        poisons this manager; the caller must shut down the serving fleet.
+        """
+        if not self.initialized or self._active or self._refitting or self._failed:
+            raise RuntimeError("DWDP refit requires an idle, healthy manager")
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("DWDP cannot refit during CUDA graph capture")
+        self._refit_epoch += 1
+        self._refit_layers.clear()
+        self._refitting = True
+        try:
+            torch.accelerator.synchronize(self.device)
+            self._refit_barrier("drained")
+            yield
+            missing = self._indices.keys() - self._refit_layers
+            if missing:
+                raise RuntimeError(
+                    f"DWDP refit did not update layers: {sorted(missing)}"
+                )
+            torch.accelerator.synchronize(self.device)
+            self._refit_barrier("written")
+            for index, layer in enumerate(self.layers):
+                for projection, dest in layer.replicated.items():
+                    for rank in range(self.world_size):
+                        start, end = expert_range(
+                            layer.num_experts, rank, self.world_size
+                        )
+                        dest[start:end].copy_(self._peers[index][rank][projection])
+            torch.accelerator.synchronize(self.device)
+            self._refit_barrier("replicated")
+            for slot in self._slots:
+                slot.layer = -1
+                slot.has_consumer = False
+                slot.ready_capture_id = None
+            for timing in self._timings:
+                timing.recorded = False
+            self._capture_id = None
+            self._compute_stream = None
+            self._has_compute_fence = False
+        except BaseException:
+            self._failed = True
+            raise
+        finally:
+            self._refitting = False
+
     def check_peer_health(self) -> None:
         if self._monitor is not None:
             self._monitor.check()
@@ -516,7 +618,7 @@ class DWDPWeightManager:
     ) -> Iterator[tuple[torch.Tensor, ...]]:
         """Wait for this layer, prefetch the next, then mark weights consumed."""
         self.check_peer_health()
-        if not self.initialized or self._failed:
+        if not self.initialized or self._failed or self._refitting:
             raise RuntimeError("DWDP manager is not initialized")
         if self._active:
             raise RuntimeError("DWDP does not support concurrent layer consumption")

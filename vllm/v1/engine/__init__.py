@@ -16,6 +16,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.v1.engine.capture import CaptureContext, get_capture_context
 from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.metrics.stats import (
     PrefillStats,
@@ -161,6 +162,12 @@ class EngineCoreRequest(
     kv_hints: KvHintsEnvelope | None = None
 
     @property
+    def capture_context(self) -> CaptureContext | None:
+        """Return validated coordination metadata for the training adapter."""
+        extra_args = self.sampling_params.extra_args if self.sampling_params else None
+        return get_capture_context(extra_args, self.prompt_token_ids)
+
+    @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
         if self.sampling_params is not None:
@@ -238,6 +245,10 @@ class EngineCoreOutput(
 
     # [num_scored_rows, num_token_ids]; appended last for array_like compatibility.
     prompt_token_id_logprobs: torch.Tensor | None = None
+
+    # (max_model_len, prompt_len) for post-alignment validation failures.
+    # Append-only: older frontends can still decode the ERROR finish reason.
+    prompt_length_error: tuple[int, int] | None = None
 
     @property
     def finished(self) -> bool:

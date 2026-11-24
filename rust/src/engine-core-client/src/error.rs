@@ -83,6 +83,11 @@ pub enum Error {
     ClientClosed { message: String },
     #[error("request output stream for `{request_id}` closed unexpectedly")]
     RequestStreamClosed { request_id: String },
+    #[error(
+        "this model's maximum context length is {max_model_len} tokens, \
+         but the prompt contains {prompt_len} input tokens"
+    )]
+    PromptTooLong { max_model_len: u32, prompt_len: u32 },
     #[error("profiling session is already active")]
     ProfileAlreadyActive,
     #[error("utility call `{method}` failed (call_id={call_id}): {message}")]

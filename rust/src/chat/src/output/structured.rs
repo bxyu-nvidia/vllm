@@ -300,6 +300,16 @@ pub(crate) async fn structured_chat_event_stream(
                     y.yield_ok(next).await;
                 }
             }
+            AssistantEvent::RoutedExperts {
+                chunks,
+                dropped_tokens,
+            } => {
+                y.yield_ok(ChatEvent::RoutedExperts {
+                    chunks,
+                    dropped_tokens,
+                })
+                .await;
+            }
             AssistantEvent::ToolCallStart { id, name } => {
                 for next in state.start_tool_call(id, name)? {
                     y.yield_ok(next).await;

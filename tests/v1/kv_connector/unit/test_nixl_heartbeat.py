@@ -29,6 +29,7 @@ def _worker_stub():
 
     w = object.__new__(NixlConnectorWorker)
     w._reqs_to_send = {}
+    w._transfer_pause_started = None
     w._lease_extension = 20
     w._reqs_to_process = set()
     w.consumer_notification_counts_by_req = {}
@@ -251,3 +252,79 @@ def test_reaper_reclaims_shorter_lease_behind_later_deadline(monkeypatch):
     assert done == {"Y"}
     assert list(w._reqs_to_send) == ["X"]
     assert w._reqs_to_process == {"X"}
+
+
+def test_transfer_pause_retains_live_leases_and_restores_expiration(monkeypatch):
+    """A long refit must not free pending KV or resurrect completed transfers."""
+    now = [100.0]
+    monkeypatch.setattr(time, "perf_counter", lambda: now[0])
+    worker = _worker_stub()
+    worker._reqs_to_send = {"live": 130.0, "completed": 120.0, "expired": 90.0}
+    worker._reqs_to_process = set(worker._reqs_to_send)
+    worker.set_transfer_paused(True)
+    now[0] = 1100.0
+    worker.set_transfer_paused(True)  # Idempotent retries cannot restart the clock.
+    done: set[str] = set()
+    worker._reap_expired_send_leases(done)
+    assert done == set()
+    del worker._reqs_to_send["completed"]
+    worker._reqs_to_process.remove("completed")
+    # A heartbeat arriving while paused uses frozen time, not wall time.
+    worker._handle_heartbeat("live")
+    assert worker._reqs_to_send["live"] == 130.0
+    worker.set_transfer_paused(False)
+    worker.set_transfer_paused(False)
+    worker._reap_expired_send_leases(done)
+    assert done == {"expired"}
+    assert worker._reqs_to_send == {"live": 1130.0}
+    now[0] = 1130.0
+    worker._reap_expired_send_leases(done)
+    assert done == {"expired", "live"}
+    assert not worker._reqs_to_process
+
+
+def test_transfer_pause_rebases_new_metadata_across_process_clocks(monkeypatch):
+    """A handoff produced while pausing retains its full TTL on another rank."""
+    now = [100.0]
+    monkeypatch.setattr(time, "perf_counter", lambda: now[0])
+    scheduler = _sched()
+    scheduler.set_transfer_paused(True)
+    now[0] = 1100.0
+    scheduler._reqs_need_send["late"] = scheduler._lease_time() + 30
+    meta = scheduler.build_connector_meta(MagicMock())
+    assert meta.reqs_to_send == {"late": 130.0}
+    assert meta.scheduler_clock == 100.0
+
+    worker = _worker_stub()
+    import queue
+
+    worker._send_heartbeats = MagicMock()
+    worker._ready_requests = queue.Queue()
+    worker.pcp_rank = 0
+    now[0] = 5100.0  # Different worker clock epoch.
+    worker.set_transfer_paused(True)
+    now[0] = 6100.0
+    meta.reqs_in_batch = {"late"}
+    worker.start_load_kv(meta)
+    assert worker._reqs_to_send == {"late": 5130.0}
+    worker.set_transfer_paused(False)
+    assert worker._reqs_to_send == {"late": 6130.0}
+    # Repeated pauses extend only time spent paused, without losing the budget.
+    now[0] = 6110.0
+    worker.set_transfer_paused(True)
+    now[0] = 8110.0
+    worker.set_transfer_paused(False)
+    assert worker._reqs_to_send == {"late": 8130.0}
+
+
+def test_scheduler_pause_extends_unsent_leases_without_resurrecting_expired(
+    monkeypatch,
+):
+    now = [100.0]
+    monkeypatch.setattr(time, "perf_counter", lambda: now[0])
+    scheduler = _sched()
+    scheduler._reqs_need_send = {"live": 130.0, "expired": 90.0}
+    scheduler.set_transfer_paused(True)
+    now[0] = 1100.0
+    scheduler.set_transfer_paused(False)
+    assert scheduler._reqs_need_send == {"live": 1130.0, "expired": 90.0}

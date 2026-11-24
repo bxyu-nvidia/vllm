@@ -555,6 +555,7 @@ def make_nixl_scheduler(
     )
 
     sched = object.__new__(NixlConnectorScheduler)
+    sched._transfer_pause_started = None
     sched._has_mamba = has_mamba
     sched._bounded_replay = bounded_replay
     sched._is_hma_required = is_hma_required
@@ -608,6 +609,7 @@ def make_nixl_push_scheduler(
     )
 
     sched = object.__new__(NixlPushConnectorScheduler)
+    sched._transfer_pause_started = None
 
     # Base scheduler fields (shared with pull / heartbeat path).
     sched._reqs_need_recv = {}

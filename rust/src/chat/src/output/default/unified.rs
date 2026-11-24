@@ -269,6 +269,13 @@ pub(crate) async fn unified_event_stream(
                     .await;
                 }
                 if let Some(finished) = finished {
+                    if !finished.routed_experts.is_empty() {
+                        y.yield_ok(AssistantEvent::RoutedExperts {
+                            chunks: finished.routed_experts,
+                            dropped_tokens: finished.dropped_tokens,
+                        })
+                        .await;
+                    }
                     for next in state.finish()? {
                         y.yield_ok(next).await;
                     }
@@ -414,6 +421,8 @@ mod tests {
             decoded: DecodedText::unattributed(delta),
             sampled: vllm_text::SampledDelta::default(),
             finished: Some(Box::new(vllm_text::output::Finished {
+                routed_experts: Vec::new(),
+                dropped_tokens: 0,
                 usage: vllm_llm::TokenUsage::default(),
                 finish_reason: crate::FinishReason::Stop(None),
                 kv_transfer_params: None,

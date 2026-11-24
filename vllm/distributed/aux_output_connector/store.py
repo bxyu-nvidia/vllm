@@ -81,9 +81,18 @@ class BackgroundBlockObjectStore:
         self._queue.put((objects, retains, releases))
         self._raise_if_failed()
 
-    def get_concatenated(self, keys: list[str]) -> bytes:
+    def drain(self) -> None:
+        """Finish publication before refit or shared-cache invalidation."""
         self._queue.join()
         self._raise_if_failed()
+
+    def clear(self) -> None:
+        """Invalidate payloads after the caller has stopped all producers."""
+        self.drain()
+        self._store.clear()
+
+    def get_concatenated(self, keys: list[str]) -> bytes:
+        self.drain()
         return self._store.get_concatenated(keys)
 
     def close(self) -> None:
@@ -226,6 +235,12 @@ class BlockObjectStore:
         for key in keys:
             self._lru.move_to_end(key)
         return payload
+
+    def clear(self) -> None:
+        """Invalidate payloads while preserving outstanding release bookkeeping."""
+        self._lru.clear()
+        self._free_slots.clear()
+        self._next_slot = 0
 
     def close(self) -> None:
         arena = self._arena

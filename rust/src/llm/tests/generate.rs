@@ -532,6 +532,7 @@ async fn collect_output_aggregates_raw_tokens_logprobs_and_terminal_metadata() {
 #[tokio::test]
 async fn collect_output_rejects_partial_sampling_mask() {
     let output = vllm_llm::GenerateOutput {
+        routed_experts: Vec::new(),
         request_id: "req-partial-mask".to_string(),
         prompt_info: Some(Box::new(GeneratePromptInfo {
             prompt_token_ids: Arc::from([11_u32, 22]),

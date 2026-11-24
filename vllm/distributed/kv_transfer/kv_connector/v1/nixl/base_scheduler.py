@@ -134,6 +134,7 @@ class NixlBaseConnectorScheduler:
         # Reverse lookup: local req_id -> (engine_id, remote_req_id) for O(1) removal
         self._heartbeat_req_engine: dict[ReqId, tuple[EngineId, ReqId]] = {}
         self._last_heartbeat_time: float = 0.0
+        self._transfer_pause_started: float | None = None
 
         # Gather Sliding Window sizes for each kv cache group (if any) in number of
         # blocks per KV cache group. This is used to clip the local attention window.
@@ -376,6 +377,26 @@ class NixlBaseConnectorScheduler:
                     (identity, b"", encoded_data[(target_pp_rank, target_tp_rank)], ts)
                 )
 
+    def _lease_time(self) -> float:
+        if self._transfer_pause_started is not None:
+            return self._transfer_pause_started
+        return time.perf_counter()
+
+    def set_transfer_paused(self, paused: bool) -> None:
+        if paused:
+            if self._transfer_pause_started is None:
+                self._transfer_pause_started = time.perf_counter()
+        elif self._transfer_pause_started is not None:
+            start = self._transfer_pause_started
+            self._extend_transfer_deadlines(start, time.perf_counter() - start)
+            self._transfer_pause_started = None
+            self._last_heartbeat_time = 0.0
+
+    def _extend_transfer_deadlines(self, start: float, duration: float) -> None:
+        for req_id, deadline in self._reqs_need_send.items():
+            if deadline > start:
+                self._reqs_need_send[req_id] = deadline + duration
+
     def _prefill_backoff(self) -> int:
         """Trailing prompt tokens the prefiller must not compute; the decoder
         recomputes them locally.
@@ -423,7 +444,9 @@ class NixlBaseConnectorScheduler:
             and not request.get_skip_reading_prefix_cache()
         ):
             if request.prompt_token_ids is not None:
-                del request.prompt_token_ids[-backoff:]
+                # Capture retains the full aligned prompt for the RL handoff.
+                # Scheduler truncation must not mutate that shared input list.
+                request.prompt_token_ids = request.prompt_token_ids[:-backoff]
             elif request.prompt_embeds is not None:
                 request.prompt_embeds = request.prompt_embeds[:-backoff]
             else:
@@ -500,7 +523,7 @@ class NixlBaseConnectorScheduler:
         # Clock reference for reqs_to_send: deadlines above are in this
         # process's perf_counter domain; workers (possibly on other nodes,
         # where perf_counter has a different epoch) rebase against this.
-        meta.scheduler_clock = time.perf_counter()
+        meta.scheduler_clock = self._lease_time()
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
 
