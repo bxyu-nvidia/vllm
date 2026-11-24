@@ -7,7 +7,9 @@ from typing import Any, ClassVar, TypeVar
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
@@ -24,6 +26,46 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import MambaSpec
 
 M = TypeVar("M", bound="BaseMambaAttentionMetadata")
+
+
+@triton.jit(do_not_specialize=["num_decodes", "num_rows"])
+def _decode_state_indices_kernel(
+    block_table_ptr,  # [num_reqs, max_num_blocks]
+    block_table_stride,
+    seq_lens_ptr,  # [num_reqs]
+    out_ptr,  # [max_bs, OUT_WIDTH]
+    out_stride,
+    replay_out_ptr,  # [max_bs], first column of out (if WRITE_REPLAY)
+    num_decodes,
+    num_rows,
+    block_size,
+    SRC_WIDTH: tl.constexpr,
+    OUT_WIDTH: tl.constexpr,
+    OUT_WIDTH_POW2: tl.constexpr,
+    NULL_ID: tl.constexpr,
+    WRITE_REPLAY: tl.constexpr,
+):
+    # Fused form of mamba_get_block_table_tensor ("align" mode) followed by the
+    # CUDA graph buffer copies and padding in
+    # _update_metadata_for_cudagraph_capture: row r gets the blocks starting at
+    # (seq_lens[r] - 1) // block_size, clamped at 0. A one-column source is
+    # broadcast across the output row, as copy_ does.
+    row = tl.program_id(0)
+    if row >= num_rows:
+        return
+    cols = tl.arange(0, OUT_WIDTH_POW2)
+    mask = cols < OUT_WIDTH
+    if row < num_decodes:
+        seq_len = tl.load(seq_lens_ptr + row)
+        start = tl.maximum(seq_len - 1, 0) // block_size
+        src_cols = cols * 0 if SRC_WIDTH == 1 else cols
+        row_ptr = block_table_ptr + row.to(tl.int64) * block_table_stride
+        ids = tl.load(row_ptr + start + src_cols, mask=mask)
+    else:
+        ids = tl.full((OUT_WIDTH_POW2,), NULL_ID, tl.int32)
+    tl.store(out_ptr + row.to(tl.int64) * out_stride + cols, ids, mask=mask)
+    if WRITE_REPLAY:
+        tl.store(replay_out_ptr + row, tl.sum(tl.where(cols == 0, ids, 0)))
 
 
 @dataclass
@@ -119,6 +161,18 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             (self.decode_cudagraph_max_bs, 1 + self.num_spec_tokens),
             dtype=torch.int32,
             device=device,
+        )
+        # Columns of mamba_get_block_table_tensor's output kept for decode; the
+        # buffer copy in _update_metadata_for_cudagraph_capture needs it to
+        # match the buffer width or be 1 (broadcast).
+        self.decode_state_src_width = 1 + min(
+            kv_cache_spec.num_speculative_blocks, self.num_spec_tokens
+        )
+        self.fuse_decode_state_indices = (
+            envs.VLLM_MAMBA_FUSED_DECODE_STATE_INDICES
+            and vllm_config.cache_config.mamba_cache_mode == "align"
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            and self.decode_state_src_width in (1, 1 + self.num_spec_tokens)
         )
 
         # For speculative decoding, we need to store the following buffers
@@ -463,23 +517,42 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         is_flush_d = None
         replayssm_scratch = None
 
-        state_indices_tensor = mamba_get_block_table_tensor(
-            common_attn_metadata.block_table_tensor,
-            common_attn_metadata.seq_lens,
-            self.kv_cache_spec,
-            self.vllm_config.cache_config.mamba_cache_mode,
+        state_indices_in_buffers = (
+            self.fuse_decode_state_indices
+            and num_prefills == 0
+            and 0 < num_decodes <= self.decode_cudagraph_max_bs
+            and num_reqs <= self.decode_cudagraph_max_bs
+            and common_attn_metadata.block_table_tensor.stride(1) == 1
         )
+        if state_indices_in_buffers:
+            self._write_decode_state_indices(
+                common_attn_metadata.block_table_tensor,
+                common_attn_metadata.seq_lens,
+                num_decodes,
+                num_reqs,
+            )
+            state_indices_tensor_d = self.state_indices_tensor_d[:num_decodes]
+            state_indices_tensor_p = self.state_indices_tensor_d[:0, 0]
+        else:
+            state_indices_tensor = mamba_get_block_table_tensor(
+                common_attn_metadata.block_table_tensor,
+                common_attn_metadata.seq_lens,
+                self.kv_cache_spec,
+                self.vllm_config.cache_config.mamba_cache_mode,
+            )
 
-        if state_indices_tensor.dim() == 1:
-            state_indices_tensor = state_indices_tensor.unsqueeze(-1)
+            if state_indices_tensor.dim() == 1:
+                state_indices_tensor = state_indices_tensor.unsqueeze(-1)
 
-        state_indices_tensor_d, state_indices_tensor_p = torch.split(
-            state_indices_tensor,
-            [num_decodes, num_prefills],
-            dim=0,
-        )
-        state_indices_tensor_d = state_indices_tensor_d[:, : 1 + self.num_spec_tokens]
-        state_indices_tensor_p = state_indices_tensor_p[:, 0]
+            state_indices_tensor_d, state_indices_tensor_p = torch.split(
+                state_indices_tensor,
+                [num_decodes, num_prefills],
+                dim=0,
+            )
+            state_indices_tensor_d = state_indices_tensor_d[
+                :, : 1 + self.num_spec_tokens
+            ]
+            state_indices_tensor_p = state_indices_tensor_p[:, 0]
 
         if num_decodes > 0 and self.use_spec_decode:
             query_start_loc_d = common_attn_metadata.query_start_loc[: num_decodes + 1]
@@ -623,14 +696,50 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
 
-        return self._update_metadata_for_cudagraph_capture(metadata)
+        return self._update_metadata_for_cudagraph_capture(
+            metadata, state_indices_in_buffers=state_indices_in_buffers
+        )
+
+    def _write_decode_state_indices(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_decodes: int,
+        num_rows: int,
+    ) -> None:
+        """Write rows [0, num_rows) of the decode state-index CUDA graph buffers
+        (and the ReplaySSM first-column buffer) in one kernel launch."""
+        out_width = self.state_indices_tensor_d.shape[1]
+        write_replay = self.decode_replayssm_state_indices_d is not None
+        _decode_state_indices_kernel[(num_rows,)](
+            block_table,
+            block_table.stride(0),
+            seq_lens,
+            self.state_indices_tensor_d,
+            self.state_indices_tensor_d.stride(0),
+            self.decode_replayssm_state_indices_d
+            if write_replay
+            else self.state_indices_tensor_d,
+            num_decodes,
+            num_rows,
+            self.kv_cache_spec.block_size,
+            SRC_WIDTH=self.decode_state_src_width,
+            OUT_WIDTH=out_width,
+            OUT_WIDTH_POW2=triton.next_power_of_2(out_width),
+            NULL_ID=NULL_BLOCK_ID,
+            WRITE_REPLAY=write_replay,
+        )
 
     def _update_metadata_for_cudagraph_capture(
         self,
         metadata: M,
+        *,
+        state_indices_in_buffers: bool = False,
     ) -> M:
         """Update the metadata for cudagraph capture.
         Currently, only decode is supported for full cudagraphs with Mamba.
+        With state_indices_in_buffers, _write_decode_state_indices has already
+        filled the state-index buffers, so only views of them are taken here.
         """
         state_indices_tensor_d = metadata.state_indices_tensor_d
         query_start_loc_d = metadata.query_start_loc_d
@@ -646,11 +755,13 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
             padded_bs = metadata.num_reqs
-            self.state_indices_tensor_d[: metadata.num_decodes].copy_(
-                state_indices_tensor_d, non_blocking=True
-            )
+            if not state_indices_in_buffers:
+                self.state_indices_tensor_d[: metadata.num_decodes].copy_(
+                    state_indices_tensor_d, non_blocking=True
+                )
             state_indices_tensor_d = self.state_indices_tensor_d[:padded_bs]
-            state_indices_tensor_d[metadata.num_decodes :] = NULL_BLOCK_ID
+            if not state_indices_in_buffers:
+                state_indices_tensor_d[metadata.num_decodes :] = NULL_BLOCK_ID
 
             if self.use_spec_decode and num_accepted_tokens is not None:
                 assert query_start_loc_d is not None
@@ -691,9 +802,10 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     cb_old[:padded_bs],
                 )
                 assert self.decode_replayssm_state_indices_d is not None
-                self.decode_replayssm_state_indices_d[:padded_bs].copy_(
-                    state_indices_tensor_d[:, 0], non_blocking=True
-                )
+                if not state_indices_in_buffers:
+                    self.decode_replayssm_state_indices_d[:padded_bs].copy_(
+                        state_indices_tensor_d[:, 0], non_blocking=True
+                    )
                 replayssm_state_indices_d = self.decode_replayssm_state_indices_d[
                     :padded_bs
                 ]

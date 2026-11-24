@@ -312,6 +312,7 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_SKIP_COMPUTED_PROMPT_TOKENS: bool = False
+    VLLM_MAMBA_FUSED_DECODE_STATE_INDICES: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2173,6 +2174,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # still send their whole prompt.
     "VLLM_SKIP_COMPUTED_PROMPT_TOKENS": lambda: bool(
         int(os.getenv("VLLM_SKIP_COMPUTED_PROMPT_TOKENS", "0"))
+    ),
+    # For full-CUDA-graph decode batches in Mamba "align" cache mode, compute
+    # each request's state block index with one Triton kernel per KV cache
+    # group, written straight into the CUDA graph input buffers, instead of
+    # ~9 small PyTorch ops and copies per group.
+    "VLLM_MAMBA_FUSED_DECODE_STATE_INDICES": lambda: bool(
+        int(os.getenv("VLLM_MAMBA_FUSED_DECODE_STATE_INDICES", "0"))
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
