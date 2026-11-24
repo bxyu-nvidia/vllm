@@ -775,6 +775,17 @@ class KVConnectorBase_V1(ABC):
         """
         return None
 
+    @property
+    def supports_transfer_pause(self) -> bool:
+        """Whether request-owned transfers can survive a scheduler suspension."""
+        return False
+
+    def set_transfer_paused(self, paused: bool) -> None:
+        """Suspend expiration, retaining transfer progress and completion handling."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support transfer suspension"
+        )
+
     def reset_cache(self) -> bool | None:
         """Reset the connector's internal cache.
 

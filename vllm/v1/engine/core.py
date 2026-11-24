@@ -918,6 +918,22 @@ class EngineCore:
         self.reset_mm_cache()
         self.reset_encoder_cache()
 
+    def set_kv_transfer_paused(self, paused: bool, check_only: bool = False) -> bool:
+        """Fence lease expiration on scheduler and every worker for managed refit."""
+        connector = self.scheduler.get_kv_connector()
+        if connector is not None and not connector.supports_transfer_pause:
+            raise NotImplementedError(
+                "The scheduler KV connector does not support keep-refit transfers"
+            )
+        results = self.model_executor.collective_rpc(
+            "set_kv_transfer_paused", args=(paused, check_only)
+        )
+        if not results or any(result is not True for result in results):
+            raise RuntimeError("A worker failed the KV transfer pause barrier")
+        if connector is not None and not check_only:
+            connector.set_transfer_paused(paused)
+        return True
+
     def _finish_pause(self, clear_cache: bool) -> None:
         # A completed pause promises an idle device: nothing else waits on
         # the last dummy batch an idle DP rank launches.

@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Pull-specific scheduler-side logic for the NIXL connector."""
 
-import time
 from typing import TYPE_CHECKING, Any
 
 from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
@@ -262,7 +261,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                 request_kv_blocks_ttl,
             )
             self._reqs_need_send[request.request_id] = (
-                time.perf_counter() + request_kv_blocks_ttl
+                self._lease_time() + request_kv_blocks_ttl
             )
             if is_d_node:
                 # D blocks expiry time exported for the turn-2 readback.

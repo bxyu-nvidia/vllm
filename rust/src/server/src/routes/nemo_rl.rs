@@ -231,6 +231,9 @@ enum RefitRequest {
         #[serde(default)]
         pause_mode: RefitPauseMode,
     },
+    CheckTransfers {},
+    PauseTransfers {},
+    ResumeTransfers {},
     Resume {},
     Reset {},
 }
@@ -316,6 +319,22 @@ async fn refit(
         .await?
         .workers_per_engine;
     match request {
+        operation @ (RefitRequest::CheckTransfers {}
+        | RefitRequest::PauseTransfers {}
+        | RefitRequest::ResumeTransfers {}) => {
+            let paused = matches!(&operation, RefitRequest::PauseTransfers {});
+            let check_only = matches!(&operation, RefitRequest::CheckTransfers {});
+            time_refit_phase(
+                &mut timings,
+                "set_kv_transfer_paused",
+                capture_barrier(
+                    client,
+                    "set_kv_transfer_paused",
+                    json!([paused, check_only]),
+                ),
+            )
+            .await?;
+        }
         RefitRequest::Prepare {
             entries,
             mtp_from_refit,

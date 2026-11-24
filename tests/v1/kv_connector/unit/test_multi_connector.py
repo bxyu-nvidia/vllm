@@ -1277,3 +1277,25 @@ def test_multi_connector_mixed_hma_disables_hybrid_kv_cache(monkeypatch):
             assert mc._all_support_hma is False
         finally:
             llm.llm_engine.engine_core.shutdown()
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_multi_connector_transfer_pause_requires_all_children(supported):
+    connector = object.__new__(MultiConnector)
+    children = [MagicMock(), MagicMock()]
+    connector._connectors = children
+    children[0].supports_transfer_pause = True
+    children[1].supports_transfer_pause = supported
+    assert connector.supports_transfer_pause is supported
+    if not supported:
+        with pytest.raises(NotImplementedError, match="child connector"):
+            connector.set_transfer_paused(True)
+        for child in children:
+            child.set_transfer_paused.assert_not_called()
+    else:
+        connector.set_transfer_paused(True)
+        for child in children:
+            child.set_transfer_paused.assert_called_once_with(True)
+        connector.set_transfer_paused(False)
+        for child in children:
+            assert child.set_transfer_paused.call_args.args == (False,)

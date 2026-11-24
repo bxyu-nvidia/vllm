@@ -530,6 +530,7 @@ class NixlBaseConnectorWorker:
         )
         # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.
         self._lease_extension = kv_lease_duration * 2 // 3
+        self._transfer_pause_started: float | None = None
 
         self._bidirectional_kv_xfer_enabled: bool = (
             vllm_config.kv_transfer_config.get_from_extra_config(
@@ -3011,6 +3012,23 @@ class NixlBaseConnectorWorker:
         """
         raise NotImplementedError
 
+    def _lease_time(self) -> float:
+        if self._transfer_pause_started is not None:
+            return self._transfer_pause_started
+        return time.perf_counter()
+
+    def set_transfer_paused(self, paused: bool) -> None:
+        if paused:
+            if self._transfer_pause_started is None:
+                self._transfer_pause_started = time.perf_counter()
+        elif self._transfer_pause_started is not None:
+            start = self._transfer_pause_started
+            duration = time.perf_counter() - start
+            for req_id, deadline in self._reqs_to_send.items():
+                if deadline > start:
+                    self._reqs_to_send[req_id] = deadline + duration
+            self._transfer_pause_started = None
+
     def _reap_expired_send_leases(self, done_sending: set[str]) -> None:
         """Reclaim expired send-side KV leases into ``done_sending``.
 
@@ -3019,7 +3037,7 @@ class NixlBaseConnectorWorker:
         entry can sit in front of already-expired ones. Scan every entry
         rather than stopping at the first still-live request.
         """
-        if not self._reqs_to_send:
+        if self._transfer_pause_started is not None or not self._reqs_to_send:
             return
         now = time.perf_counter()
         expired = [
@@ -3047,7 +3065,7 @@ class NixlBaseConnectorWorker:
                      "req_abc,req_def".
 
         """
-        new_expiry = time.perf_counter() + self._lease_extension
+        new_expiry = self._lease_time() + self._lease_extension
         for req_id in payload.split(","):
             if req_id in self._reqs_to_send:
                 old = self._reqs_to_send[req_id]

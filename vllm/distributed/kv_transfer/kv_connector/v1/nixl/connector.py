@@ -164,6 +164,16 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     # Scheduler Side Methods
     ############################################################
 
+    @property
+    def supports_transfer_pause(self) -> bool:
+        return True
+
+    def set_transfer_paused(self, paused: bool) -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.set_transfer_paused(paused)
+        if self.connector_worker is not None:
+            self.connector_worker.set_transfer_paused(paused)
+
     def get_finished_count(self) -> int | None:
         return None
 

@@ -734,6 +734,18 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             prom_metrics,
         )
 
+    @property
+    def supports_transfer_pause(self) -> bool:
+        return all(c.supports_transfer_pause for c in self._connectors)
+
+    def set_transfer_paused(self, paused: bool) -> None:
+        if not self.supports_transfer_pause:
+            raise NotImplementedError(
+                "A child connector cannot retain paused transfers"
+            )
+        for connector in self._connectors:
+            connector.set_transfer_paused(paused)
+
     def reset_cache(self) -> bool:
         results = [c.reset_cache() is not False for c in self._connectors]
         return all(results)

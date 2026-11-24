@@ -200,6 +200,24 @@ async fn pd_refit_forwards_the_training_protocol_and_rejects_partial_updates() {
         ),
     ];
     let mut cases = cases;
+    for (operation, args) in [
+        ("check_transfers", json!([false, true])),
+        ("pause_transfers", json!([true, false])),
+        ("resume_transfers", json!([false, false])),
+    ] {
+        for (result, status) in [
+            (true, StatusCode::OK),
+            (false, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            cases.push((
+                json!({"operation": operation}),
+                "set_kv_transfer_paused",
+                args.clone(),
+                json!(result),
+                status,
+            ));
+        }
+    }
     cases.extend([
         (
             json!({"operation": "pause", "pause_mode": "keep"}),
@@ -298,6 +316,9 @@ async fn pd_refit_forwards_the_training_protocol_and_rejects_partial_updates() {
             assert_eq!(result["ok"], json!(true));
             let timings = result["timings_s"].as_object().unwrap();
             let phases: &[&str] = match body["operation"].as_str().unwrap() {
+                "check_transfers" | "pause_transfers" | "resume_transfers" => {
+                    &["pd_capture_metadata", "set_kv_transfer_paused"]
+                }
                 "prepare" => &["pd_capture_metadata", "pd_prepare_refit"],
                 "init" => &["init_collective", "pd_capture_metadata"],
                 "drain_caches" if body["pause_mode"] == "keep" => {
