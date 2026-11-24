@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from collections import deque
 from concurrent.futures import Future
+from contextlib import nullcontext
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -8162,14 +8165,17 @@ def test_prefill_outcomes_preempted_request_counted_once(monkeypatch) -> None:
     assert stats.underfilled_outcome_steps == 0
 
 
-@pytest.mark.parametrize("in_flight", [False, True])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("queued_batches", [0, 1, 2])
 @pytest.mark.parametrize("transfer", ["send", "receive", "push"])
 def test_keep_pause_preserves_transfer_blocks_and_processes_completion_on_resume(
-    transfer, in_flight
+    transfer, queued_batches, async_scheduling
 ):
     from vllm.v1.engine.core import EngineCoreProc
 
-    scheduler = create_scheduler(use_kv_connector=True)
+    scheduler = create_scheduler(
+        use_kv_connector=True, async_scheduling=async_scheduling
+    )
     request = create_requests(num_requests=1, num_tokens=32)[0]
     scheduler.add_request(request)
     scheduler.kv_cache_manager.allocate_slots(request, 32)
@@ -8186,15 +8192,32 @@ def test_keep_pause_preserves_transfer_blocks_and_processes_completion_on_resume
     core = object.__new__(EngineCoreProc)
     core.scheduler = scheduler
     core.model_executor = Mock()
-    core.batch_queue = [object()] if in_flight else None
+    scheduler_output = scheduler.schedule()
+    assert scheduler_output.total_num_scheduled_tokens == 0
+    future: Future[ModelRunnerOutput] = Future()
+    future.set_result(make_empty_encoder_model_runner_output(scheduler_output))
+    core.model_executor.execute_model.return_value = future
+    core.batch_queue = deque([(future, scheduler_output, future)] * queued_batches)
+    core.batch_queue_size = max(2, queued_batches + 1)
+    core.is_mm_encoder_only = core.is_pooling_model = False
+    core.aborts_queue = Queue()
+    core._weight_version = 0
+    core.log_error_detail = lambda _: nullcontext()
+    core.capture_iteration_details = lambda _: nullcontext()
     core.engines_running = False
     core._idle_state_callbacks = []
     paused = core.pause_scheduler(mode="keep", clear_cache=False)
-    if in_flight:
+    if queued_batches:
         assert isinstance(paused, Future) and not paused.done()
         assert core.has_work()  # Retiring GPU batches cannot be skipped.
         core.model_executor.collective_rpc.assert_not_called()
-        core.batch_queue.clear()
+        # Retire real queued outputs: cleanup must not enqueue replacement
+        # batches while the paused scheduler retains transfer-owned blocks.
+        for remaining in reversed(range(queued_batches)):
+            core.step_with_batch_queue()
+            assert len(core.batch_queue) == remaining
+        core.model_executor.execute_model.assert_not_called()
+        assert not core.has_work()
         core._notify_idle_state_callbacks()
         assert paused.result(0) is None
     else:

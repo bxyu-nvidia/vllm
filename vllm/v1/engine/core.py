@@ -726,7 +726,13 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        # Transfer cleanup can keep has_requests() true during a keep pause.
+        # Retire queued batches without replacing them with empty cleanup work,
+        # so the queue can become idle and acknowledge the pause.
+        if (
+            self.scheduler.pause_state != PauseState.PAUSED_ALL
+            and self.scheduler.has_requests()
+        ):
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
