@@ -10,11 +10,13 @@ import queue
 import sys
 import threading
 import types
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from tests.v1.attention.utils import dense_kv_cache_views
 from vllm.distributed import mooncake_store
@@ -44,6 +46,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.data import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.metrics import (
     MooncakeStoreConnectorStats,
+    MooncakeStorePromMetrics,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.scheduler import (  # noqa: E501
     _partial_tail_non_mamba_puts,
@@ -336,6 +339,7 @@ def _make_vllm_config(
         ),
         kv_events_config=SimpleNamespace(enable_kv_cache_events=False),
         speculative_config=None,
+        observability_config=SimpleNamespace(enable_prefill_batching_metrics=False),
     )
 
 
@@ -758,6 +762,42 @@ def test_store_sending_thread_records_mooncake_metrics():
     assert len(stats.data["save_put"]) == 1
     assert stats.data["save_put"][0]["num_bytes"] == 512
     assert stats.data["save_put"][0]["status"] == "ok"
+
+
+@pytest.mark.parametrize("boundary", [False, True])
+@pytest.mark.parametrize("raises", [False, True])
+def test_save_failure_metrics_count_each_key_by_return_code(boundary, raises):
+    store = MagicMock()
+    store.batch_is_exist.side_effect = lambda keys: [0] * len(keys)
+    codes = [-200, -200, -705] if boundary else [256, -200, -200, -705]
+    store.batch_put_from_multi_buffers.return_value = codes
+    if raises:
+        store.batch_put_from_multi_buffers.side_effect = RuntimeError(
+            "store unavailable"
+        )
+    thread = (
+        _make_partial_tail_send_thread(store)
+        if boundary
+        else _make_store_sending_thread(store)
+    )
+    stats = MooncakeStoreConnectorStats()
+    thread._record_operation_cb = stats.record_operation
+    if boundary:
+        request = _resolve_partial_tail(thread, _make_partial_tail_req([0, 2, 3]))
+        assert not thread._maybe_offload_boundary_states(request)
+    else:
+        request = _make_store_req("req", [b"a0", b"a1", b"a2", b"a3"])
+        request.token_len_chunk = 64
+        request.block_ids = ([1, 2, 3, 4],)
+        _run_store_req(thread, request)
+
+    assert store.batch_put_from_multi_buffers.call_count == 1
+    assert len(store.batch_put_from_multi_buffers.call_args.args[0]) == len(codes)
+    (record,) = stats.data["save_put"]
+    expected = {"exception": len(codes)} if raises else {"-200": 2, "-705": 1}
+    assert record["failed_keys_by_code"] == expected
+    assert record["num_failed_keys"] == sum(expected.values())
+    assert record["status"] == ("error" if raises else "partial_failure")
 
 
 def test_process_tokens_uses_mask_num_as_start_chunk():
@@ -2538,7 +2578,10 @@ def test_worker_is_hma_required_from_kv_cache_groups(
     assert store_worker._is_hma_required is expected_is_hma_required
 
 
-def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("lookup_config", [{}, {"lookup_newest_state": True}])
+def test_requester_worker_init_uses_positional_setup(
+    tmp_path, monkeypatch, lookup_config
+):
     store = MagicMock()
     store.setup.return_value = 0
     _install_fake_mooncake(monkeypatch, store)
@@ -2558,7 +2601,9 @@ def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
             },
         ),
     )
-    w = worker.MooncakeStoreWorker(_make_vllm_config(), _make_kv_cache_config())
+    w = worker.MooncakeStoreWorker(
+        _make_vllm_config(extra_config=lookup_config), _make_kv_cache_config()
+    )
 
     assert not hasattr(w, "_isolate_offload_resources")
     assert store.setup.call_args.args == (
@@ -2571,6 +2616,8 @@ def test_requester_worker_init_uses_positional_setup(tmp_path, monkeypatch):
         "10.0.0.7:50051",
     )
     assert w.coord.retention_interval == 0
+
+    assert w.lookup_newest_state is lookup_config.get("lookup_newest_state", False)
 
 
 def test_requester_worker_init_prefers_local_hostname_override(
@@ -3711,6 +3758,7 @@ def _make_bare_worker(
     worker.kv_role = kv_role
     worker.can_put = kv_role in ("kv_producer", "kv_both") or save_decode_cache
     worker._capacity_only = False
+    worker.lookup_newest_state = False
     worker.block_size = block_size
     worker._is_hma_required = False
     worker.tp_rank = 0
@@ -3813,6 +3861,7 @@ def test_mooncake_lookup_reuses_resolved_hash_checkpoint(
     ]
     config = SimpleNamespace(
         speculative_config=None,
+        observability_config=SimpleNamespace(enable_prefill_batching_metrics=False),
         kv_transfer_config=SimpleNamespace(
             kv_role="kv_both", kv_connector_extra_config={}
         ),
@@ -3886,6 +3935,7 @@ def test_scheduler_follows_core_hit_alignment(alignment, expected):
     ]
     config = SimpleNamespace(
         speculative_config=None,
+        observability_config=SimpleNamespace(enable_prefill_batching_metrics=False),
         kv_transfer_config=SimpleNamespace(
             kv_role="kv_both", kv_connector_extra_config={}
         ),
@@ -4247,7 +4297,8 @@ def test_lookup_full_hit_with_eagle_pops_once_not_twice():
     assert worker.store.batch_is_exist.call_count == 1
 
 
-def test_lookup_plan_resolves_group_tail_keys_from_existing_hashes():
+@pytest.mark.parametrize("newest", [False, True])
+def test_lookup_plan_resolves_group_tail_keys_from_existing_hashes(newest):
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         KVCacheGroupSpec,
@@ -4255,6 +4306,7 @@ def test_lookup_plan_resolves_group_tail_keys_from_existing_hashes():
     )
 
     worker = _make_bare_worker(block_size=16)
+    worker.lookup_newest_state = newest
     full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
     mamba = MambaSpec(
         block_size=16,
@@ -4318,7 +4370,8 @@ def test_lookup_plan_resolves_group_tail_keys_from_existing_hashes():
     )
 
 
-def test_lookup_plan_recovers_tail_key_after_multi_chunk_convergence():
+@pytest.mark.parametrize("newest", [False, True])
+def test_lookup_plan_recovers_tail_key_after_multi_chunk_convergence(newest):
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
         KVCacheGroupSpec,
@@ -4326,6 +4379,7 @@ def test_lookup_plan_recovers_tail_key_after_multi_chunk_convergence():
     )
 
     worker = _make_bare_worker(block_size=16)
+    worker.lookup_newest_state = newest
     full = FullAttentionSpec(block_size=16, num_kv_heads=8, head_size=64, dtype=None)
     mamba = MambaSpec(
         block_size=16,
@@ -5104,6 +5158,86 @@ def test_mooncake_store_stats_aggregate_reduce():
     assert reduced["save_put_error_count"] == 1
 
 
+def test_mooncake_failure_codes_round_trip_aggregate_and_export():
+    worker = _make_bare_worker()
+    worker._record_kv_connector_operation(
+        "save_put",
+        0.01,
+        4,
+        status="partial_failure",
+        num_failed_keys=3,
+        failed_keys_by_code={"-200": 2, "-705": 1},
+    )
+    stats = worker.get_kv_connector_stats()
+    assert worker.get_kv_connector_stats() is None
+    # Worker telemetry crosses the process boundary as plain serializable data.
+    stats = MooncakeStoreConnectorStats(data=json.loads(json.dumps(stats.to_dict())))
+    other = MooncakeStoreConnectorStats()
+    other.record_operation(
+        "save_put",
+        0.02,
+        2,
+        status="error",
+        num_failed_keys=2,
+    )
+    stats.aggregate(other)
+    reduced = stats.reduce()
+    assert reduced["save_put_failed_keys"] == 5
+    assert reduced["save_put_failed_keys_code_-200"] == 2
+    assert reduced["save_put_failed_keys_code_-705"] == 1
+    assert reduced["save_put_failed_keys_code_exception"] == 2
+
+    registry = CollectorRegistry()
+    metrics = MooncakeStorePromMetrics(
+        SimpleNamespace(kv_transfer_config=None),
+        {cls: partial(cls, registry=registry) for cls in (Counter, Gauge, Histogram)},
+        ["model_name", "engine"],
+        {2: ["model", "2"]},
+    )
+    metrics.observe(stats.to_dict(), engine_idx=2)
+    name = "vllm:mooncake_store_operation_failed_keys_by_code_total"
+    for code, count in (("-200", 2), ("-705", 1), ("exception", 2)):
+        assert (
+            registry.get_sample_value(
+                name,
+                {
+                    "model_name": "model",
+                    "engine": "2",
+                    "operation": "save_put",
+                    "code": code,
+                },
+            )
+            == count
+        )
+    # An older producer's record has no map and must not fabricate code samples.
+    metrics.observe(
+        {
+            "save_put": [
+                {
+                    "duration_seconds": 0.01,
+                    "num_keys": 1,
+                    "num_bytes": 0,
+                    "status": "ok",
+                    "num_failed_keys": 0,
+                }
+            ]
+        },
+        engine_idx=2,
+    )
+    assert (
+        registry.get_sample_value(
+            name,
+            {
+                "model_name": "model",
+                "engine": "2",
+                "operation": "save_put",
+                "code": "-200",
+            },
+        )
+        == 2
+    )
+
+
 def test_worker_get_kv_connector_stats_resets_after_read():
     worker = _make_bare_worker()
     worker._record_kv_connector_operation(
@@ -5192,3 +5326,163 @@ def test_blob_block_hashes_empty():
     view = BlobBlockHashes(memoryview(b""), 0)
     assert len(view) == 0
     assert list(view) == []
+
+
+def _make_newest_lookup_worker(*, use_eagle=False, fine_grained=True):
+    worker = _make_bare_worker(block_size=16)
+    worker.tp_size = 2
+    worker.num_kv_head = 2
+    worker.hash_block_size = 4
+    specs = [
+        FullAttentionSpec(block_size=16, num_kv_heads=2, head_size=1, dtype=None),
+        MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        ),
+        MambaSpec(
+            block_size=32,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        ),
+    ]
+    worker._kv_cache_groups = [
+        KVCacheGroupSpec([f"layer{gid}"], spec) for gid, spec in enumerate(specs)
+    ]
+    worker.token_dbs = [
+        ChunkedTokenDatabase(
+            KeyMetadata("test-model", 0, 0, 0, 0, group_id=gid),
+            block_size=spec.block_size,
+            hash_block_size=4,
+        )
+        for gid, spec in enumerate(specs)
+    ]
+    worker.coord = mooncake_store_worker.MooncakeStoreCoordinator(
+        worker._kv_cache_groups,
+        scheduler_block_size=32,
+        hash_block_size=4,
+        use_eagle=use_eagle,
+        enable_partial_hash_hits=fine_grained,
+    )
+    _refresh_group_tp_replication_factors(worker)
+    return worker
+
+
+def test_newest_lookup_skips_older_state_keys_and_records_batches():
+    worker = _make_newest_lookup_worker()
+    hashes = [BlockHash(f"h{i}".encode()) for i in range(64)]
+    worker.store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+    baseline = worker.lookup(257, hashes)
+    worker.store.batch_is_exist.reset_mock()
+    worker.get_kv_connector_stats()
+    worker.lookup_newest_state = True
+
+    assert worker.lookup(257, hashes) == baseline
+    batches = [call.args[0] for call in worker.store.batch_is_exist.call_args_list]
+    assert len(batches) == 2
+    assert len(batches[0]) == 64 * 2  # Attention across both ranks.
+    assert len(batches[1]) == 8 * 2 * 2  # Eight checkpoints, two groups/ranks.
+    assert all("@group:0@" in key for key in batches[0])
+    assert all(
+        bytes.fromhex(key.rsplit("@", 1)[1]) in hashes[-8:] for key in batches[1]
+    )
+    stats = worker.get_kv_connector_stats()
+    assert [entry["num_keys"] for entry in stats.data["lookup_exists"]] == [128, 32]
+
+
+@pytest.mark.parametrize("use_eagle", [False, True])
+@pytest.mark.parametrize("num_tokens", [256, 257])
+def test_newest_lookup_matches_bulk_with_sparse_states_and_missing_shards(
+    use_eagle,
+    num_tokens,
+):
+    # Compare full load plans, not just hit lengths, over independent missing
+    # rank shards, mismatched checkpoint groups, and attention holes.
+    import random
+
+    rng = random.Random(534)
+    worker = _make_newest_lookup_worker(use_eagle=use_eagle)
+    hashes = [BlockHash(f"h{i}".encode()) for i in range(64)]
+    keys = [
+        PoolKey.build_key_string(prefix, h.hex())
+        for prefixes in worker._lookup_key_prefixes
+        for prefix in prefixes
+        for h in hashes
+    ]
+    for trial in range(40):
+        present = {
+            key for key in keys if rng.random() < (0.95 if "@group:0@" in key else 0.35)
+        }
+        worker.store.batch_is_exist.side_effect = lambda batch, present=present: [
+            int(key in present) for key in batch
+        ]
+        worker.lookup_newest_state = False
+        expected = worker.lookup(num_tokens, hashes)
+        worker.lookup_newest_state = True
+        assert worker.lookup(num_tokens, hashes) == expected, trial
+
+
+def test_newest_lookup_full_hit_searches_earlier_checkpoint_for_sampling():
+    worker = _make_newest_lookup_worker()
+    hashes = [BlockHash(f"h{i}".encode()) for i in range(64)]
+    worker.store.batch_is_exist.side_effect = lambda keys: [
+        int(
+            "@group:0@" in key
+            or key.rsplit("@", 1)[1] in (hashes[63].hex(), hashes[7].hex())
+        )
+        for key in keys
+    ]
+    expected = worker.lookup(256, hashes)
+    assert expected.hit_length == 32
+    worker.lookup_newest_state = True
+    worker.store.batch_is_exist.reset_mock()
+    assert worker.lookup(256, hashes) == expected
+    assert worker.store.batch_is_exist.call_count > 2
+
+
+@pytest.mark.parametrize("failure", ["exception", "short_reply", "missing"])
+def test_newest_lookup_state_probe_failure_returns_miss(failure):
+    worker = _make_newest_lookup_worker()
+    worker.lookup_newest_state = True
+    hashes = [BlockHash(f"h{i}".encode()) for i in range(16)]
+
+    def exists(keys):
+        if all("@group:0@" in key for key in keys):
+            return [1] * len(keys)
+        if failure == "exception":
+            raise RuntimeError("store unavailable")
+        return [] if failure == "short_reply" else [0] * len(keys)
+
+    worker.store.batch_is_exist.side_effect = exists
+    assert worker.lookup(65, hashes) == MooncakeLookupResult(0)
+    stats = worker.get_kv_connector_stats()
+    if failure != "missing":
+        assert stats.data["lookup_exists"][-1]["status"] == "error"
+
+
+def test_newest_lookup_keeps_block_aligned_lookup_in_one_batch():
+    worker = _make_newest_lookup_worker(fine_grained=False)
+    hashes = [BlockHash(f"h{i}".encode()) for i in range(16)]
+    worker.store.batch_is_exist.side_effect = lambda keys: [1] * len(keys)
+    expected = worker.lookup(65, hashes)
+    worker.lookup_newest_state = True
+    worker.store.batch_is_exist.reset_mock()
+    assert worker.lookup(65, hashes) == expected
+    assert worker.store.batch_is_exist.call_count == 1
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, None])
+def test_newest_lookup_rejects_non_boolean_config_before_store_setup(
+    monkeypatch, value
+):
+    store = MagicMock()
+    _install_fake_mooncake(monkeypatch, store)
+    _patch_worker_runtime(monkeypatch)
+    with pytest.raises(ValueError, match="lookup_newest_state must be a bool"):
+        worker.MooncakeStoreWorker(
+            _make_vllm_config(extra_config={"lookup_newest_state": value}),
+            _make_kv_cache_config(),
+        )
+    store.setup.assert_not_called()

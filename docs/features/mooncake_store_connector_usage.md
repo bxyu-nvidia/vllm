@@ -275,6 +275,7 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread so it never blocks the scheduler step. The request is held until the in-flight lookup completes, then resumed on a later step. Default: `false`.
+- `lookup_newest_state` (bool): With fine-grained hybrid prefix matching, probe Mamba checkpoint keys from newest to oldest in growing batches, stopping at the longest usable hit. All required rank shards and attention keys are still checked. This avoids renewing leases on many older checkpoints and can reduce state-key probes. Sparse hits or misses can require more RPCs than the default bulk lookup; compare lookup latency and cache reuse before enabling broadly. Uses the existing Mooncake `batch_is_exist` API; no Mooncake rebuild or server configuration change is needed. Default: `false`; block-aligned lookup is unchanged.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `cache_prefix` (str): Namespace prepended to every store key. Lets separate deployments share one Mooncake master without polluting each other — instances configured with different prefixes never see each other's cached blocks, even for identical prompts. All instances that should share a prefix cache must use the same value. Default: `""` (no prefix; keys are byte-identical to the unprefixed format).
 - `save_decode_cache` (bool): Enable offloading decode tokens' KV cache. A `kv_consumer` does not save during prefill; when decode starts, it fills any missing block-aligned prompt prefix before appending completed decode blocks. Default: `false`.
@@ -312,3 +313,23 @@ To use a custom shared seed, set the same `PYTHONHASHSEED` on every instance tha
 ```bash
 PYTHONHASHSEED=<shared-value> vllm serve ...
 ```
+
+## Lookup and save diagnostics
+
+With `--enable-prefill-batching-metrics`, prefill lookups report cumulative
+`vllm:prefill_kv_lookup_{queue,execution,observation}_duration_ns_total` and
+`vllm:prefill_kv_lookup_timed_{completed,failed}_total` counters. Queue time is
+submission to executor start; execution includes the lookup IPC round trip and
+worker processing; observation is completion to the scheduler consuming the
+result. All three use the same completed-attempt cohort, including observed
+failures. Discarded attempts and cached no-load decisions are excluded. Divide
+each interval's duration delta by its timed-completed delta to get a mean; these
+are not latency percentiles or per-key RPC times.
+
+`vllm:mooncake_store_operation_failed_keys_by_code_total` labels failures by
+`operation` and `code`, in addition to model and engine. For `save_put`, each
+negative return code counts the keys that received it, including both regular
+blocks and boundary-state saves. `code="exception"` counts keys in an RPC that
+raised without returning per-key codes. Existing aggregate failure metrics and
+store-pressure behavior are unchanged. Both Python and Rust frontends export
+these metrics; rebuild the Rust frontend when updating vLLM.

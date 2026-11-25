@@ -45,6 +45,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics.batching import PrefillLookupStats
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -213,6 +214,11 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
     # Scheduler-side methods
     # ============================================================
 
+    def take_prefill_lookup_stats(self) -> PrefillLookupStats | None:
+        if self.connector_scheduler is None:
+            return None
+        return self.connector_scheduler.client.take_prefill_lookup_stats()
+
     def get_num_new_matched_tokens(
         self,
         request: Request,
@@ -221,6 +227,18 @@ class MooncakeStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(
             request, num_computed_tokens
+        )
+
+    def get_num_new_matched_tokens_with_local_hit(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        *,
+        num_local_tokens: int,
+    ) -> tuple[int | None, bool]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_num_new_matched_tokens(
+            request, num_computed_tokens, num_local_tokens=num_local_tokens
         )
 
     def update_state_after_alloc(

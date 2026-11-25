@@ -84,6 +84,11 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
         stats.unexamined_requests = 2
         stats.kv_lookup_completed = 2
         stats.kv_lookup_duration_ns = 6_000_000
+        stats.kv_lookup_timed_completed = 2
+        stats.kv_lookup_timed_failed = 1
+        stats.kv_lookup_queue_duration_ns = 1000000
+        stats.kv_lookup_execution_duration_ns = 2000000
+        stats.kv_lookup_observation_duration_ns = 3000000
         stats.observe_delays(
             {"pending": "kv_lookup_pending"}, scheduled_tokens={}, has_prefill=False
         )
@@ -106,6 +111,13 @@ def test_python_logger_exports_prefill_counter_deltas(tmp_path: Path) -> None:
         assert samples["vllm:prefill_unexamined_requests_total"] == 2
         assert samples["vllm:prefill_kv_lookup_completed_total"] == 2
         assert samples["vllm:prefill_kv_lookup_duration_ns_total"] == 6_000_000
+        assert samples["vllm:prefill_kv_lookup_timed_completed_total"] == 2
+        assert samples["vllm:prefill_kv_lookup_timed_failed_total"] == 1
+        assert samples["vllm:prefill_kv_lookup_queue_duration_ns_total"] == 1000000
+        assert samples["vllm:prefill_kv_lookup_execution_duration_ns_total"] == 2000000
+        assert (
+            samples["vllm:prefill_kv_lookup_observation_duration_ns_total"] == 3000000
+        )
         assert samples["vllm:prefill_delay_steps_total"] == 1
         for field in ("delayed_requests", "blocked_requests"):
             assert (

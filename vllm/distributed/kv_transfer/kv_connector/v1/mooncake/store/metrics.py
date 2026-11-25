@@ -10,7 +10,7 @@ via ``MooncakeStorePromMetrics``.
 
 from dataclasses import dataclass
 from statistics import fmean
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -19,6 +19,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
+
+
+class _OperationRecord(TypedDict):
+    duration_seconds: float
+    num_keys: int
+    num_bytes: int
+    status: str
+    num_failed_keys: int
+    failed_keys_by_code: NotRequired[dict[str, int]]
 
 
 def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
@@ -40,7 +49,7 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
             self.reset()
 
     def reset(self):
-        self.data: dict[str, list[dict[str, int | float | str]]] = {}
+        self.data: dict[str, list[_OperationRecord]] = {}
 
     def is_empty(self) -> bool:
         return not self.data
@@ -75,6 +84,10 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
             reduced[f"{operation}_error_count"] = sum(
                 1 for record in records if record["status"] == "error"
             )
+            for record in records:
+                for code, count in record.get("failed_keys_by_code", {}).items():
+                    name = f"{operation}_failed_keys_code_{code}"
+                    reduced[name] = reduced.get(name, 0) + count
         return reduced
 
     def record_operation(
@@ -86,16 +99,21 @@ class MooncakeStoreConnectorStats(KVConnectorStats):
         num_bytes: int = 0,
         status: str = "ok",
         num_failed_keys: int = 0,
+        failed_keys_by_code: dict[str, int] | None = None,
     ) -> None:
-        self.data.setdefault(operation, []).append(
-            {
-                "duration_seconds": duration_seconds,
-                "num_keys": num_keys,
-                "num_bytes": num_bytes,
-                "status": status,
-                "num_failed_keys": num_failed_keys,
-            }
-        )
+        record: _OperationRecord = {
+            "duration_seconds": duration_seconds,
+            "num_keys": num_keys,
+            "num_bytes": num_bytes,
+            "status": status,
+            "num_failed_keys": num_failed_keys,
+        }
+        if failed_keys_by_code:
+            record["failed_keys_by_code"] = dict(failed_keys_by_code)
+        elif status == "error" and num_failed_keys:
+            # No per-key return codes are available when the RPC raises.
+            record["failed_keys_by_code"] = {"exception": num_failed_keys}
+        self.data.setdefault(operation, []).append(record)
 
 
 class MooncakeStorePromMetrics(KVConnectorPromMetrics):
@@ -155,6 +173,12 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
             labelnames=metric_labelnames,
         )
 
+        self._counter_failed_keys_by_code = self._counter_cls(
+            name="vllm:mooncake_store_operation_failed_keys_by_code_total",
+            documentation="Number of failed Mooncake store keys by return code.",
+            labelnames=labelnames + ["operation", "code"],
+        )
+
     def _get_metrics(
         self,
         engine_idx: int,
@@ -187,3 +211,6 @@ class MooncakeStorePromMetrics(KVConnectorPromMetrics):
                 metrics["keys"].inc(int(record["num_keys"]))
                 metrics["bytes"].inc(int(record["num_bytes"]))
                 metrics["failed_keys"].inc(int(record["num_failed_keys"]))
+                for code, count in record.get("failed_keys_by_code", {}).items():
+                    labels = self.per_engine_labelvalues[engine_idx] + [operation, code]
+                    self._counter_failed_keys_by_code.labels(*labels).inc(count)

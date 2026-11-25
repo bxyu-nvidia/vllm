@@ -31,6 +31,7 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
     resolve_kv_cache_block_sizes,
 )
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
@@ -145,6 +146,10 @@ class MooncakeStoreScheduler:
         kvc_extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self.load_async = kvc_extra_config.get("load_async", True)
         self.lookup_async = kvc_extra_config.get("lookup_async", False)
+        self._prefill_lookup_metrics = (
+            vllm_config.observability_config.enable_prefill_batching_metrics
+            and vllm_config.kv_transfer_config.kv_role != "kv_consumer"
+        )
         # Skips lookup CPU cost on instances that never load KV from the store.
         self.enable_lookup = kvc_extra_config.get("enable_lookup", True)
         self.save_decode_cache = kvc_extra_config.get("save_decode_cache", False)
@@ -190,6 +195,8 @@ class MooncakeStoreScheduler:
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
+        # Completed lookups that required no remote load, retained until admission.
+        self._deferred_lookups: dict[str, tuple[int, tuple[BlockHash, ...], int]] = {}
         self._request_trackers: dict[str, RequestTracker] = {}  # scheduled new requests
         self._unfinished_requests: dict[str, tuple[Request, tuple[list[int], ...]]] = {}
         self._unfinished_request_ids: set[str] = set()
@@ -202,6 +209,8 @@ class MooncakeStoreScheduler:
         self,
         request: Request,
         num_computed_tokens: int,
+        *,
+        num_local_tokens: int | None = None,
     ) -> tuple[int | None, bool]:
         """Check for external KV cache hit.
 
@@ -210,6 +219,9 @@ class MooncakeStoreScheduler:
         """
         if not self.enable_lookup:
             return 0, False
+        if num_local_tokens is None:
+            num_local_tokens = num_computed_tokens
+        assert num_local_tokens >= num_computed_tokens
 
         # Fine-grained hits may land on a hash boundary inside a block; without
         # partial hits, prefixes shorter than one physical block are skipped.
@@ -217,20 +229,41 @@ class MooncakeStoreScheduler:
             self._hash_block_size if self.enable_partial_hash_hits else self._block_size
         )
         if request.num_tokens < align:
+            self._deferred_lookups.pop(request.request_id, None)
             return 0, False
+
+        cached = self._deferred_lookups.get(request.request_id)
+        if cached is not None:
+            num_tokens, block_hashes, local_tokens = cached
+            if (
+                num_tokens == request.num_tokens
+                and block_hashes == tuple(request.block_hashes)
+                and local_tokens <= num_local_tokens
+            ):
+                # Admission may have failed on Mamba alignment or token budget.
+                # Reuse only the no-load decision while local coverage holds.
+                # After local eviction, query again instead of relying on old
+                # remote keys or missing a newly available remote prefix.
+                return 0, False
+            del self._deferred_lookups[request.request_id]
 
         lookup_result = self.client.lookup(
             request.request_id,
             request.num_tokens,
             request.block_hashes,
             non_block=self.lookup_async,
+            record_timing=(
+                self._prefill_lookup_metrics
+                and request.prefill_stats is not None
+                and request.num_output_tokens == 0
+            ),
         )
         if lookup_result is None:
             # Lookup not ready yet; scheduler will retry on a later step.
             return None, False
         num_external_hit_tokens = lookup_result.hit_length
 
-        if num_external_hit_tokens < num_computed_tokens:
+        if num_external_hit_tokens <= num_local_tokens:
             need_to_allocate = 0
         else:
             need_to_allocate = num_external_hit_tokens - num_computed_tokens
@@ -243,7 +276,16 @@ class MooncakeStoreScheduler:
             need_to_allocate,
         )
 
-        if need_to_allocate <= 0:
+        if need_to_allocate == 0:
+            # Core keeps a partial local block unless the remote hit exceeds
+            # the full local hit. Cache that no-load decision, but invalidate
+            # it if even the sub-block portion of the local hit shrinks.
+            self._deferred_lookups[request.request_id] = (
+                request.num_tokens,
+                tuple(request.block_hashes),
+                num_local_tokens,
+            )
+            self.load_specs.pop(request.request_id, None)
             return 0, False
 
         self.load_specs[request.request_id] = LoadSpec(
@@ -262,6 +304,7 @@ class MooncakeStoreScheduler:
         num_external_tokens: int,
     ):
         """Update state after block allocation."""
+        self._deferred_lookups.pop(request.request_id, None)
         local_block_ids: tuple[list[int], ...] = ()
         if num_external_tokens > 0:
             local_block_ids = blocks.get_block_ids(
@@ -301,6 +344,7 @@ class MooncakeStoreScheduler:
 
         for finished_req_id in scheduler_output.finished_req_ids:
             self.client.discard(finished_req_id)
+            self._deferred_lookups.pop(finished_req_id, None)
             self.load_specs.pop(finished_req_id, None)
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
@@ -308,6 +352,7 @@ class MooncakeStoreScheduler:
 
         preempted_ids = scheduler_output.preempted_req_ids or set()
         for req_id in preempted_ids:
+            self._deferred_lookups.pop(req_id, None)
             self.load_specs.pop(req_id, None)
             if request_tracker := self._request_trackers.get(req_id):
                 request_tracker.reset()
@@ -764,6 +809,7 @@ class MooncakeStoreScheduler:
 
         Returns True on ACK from worker, False on NACK or RPC error.
         """
+        self._deferred_lookups.clear()
         try:
             ok = self.client.reset()
             if ok:

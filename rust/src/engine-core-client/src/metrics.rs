@@ -7,11 +7,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use vllm_metrics::{
     CacheHitSourceLabels, EngineLabels, EnginePositionLabels, F64Gauge, Family, HistogramMetric,
-    LoraAdapterNames, LoraInfoLabels, MooncakeOperationCounterFamily,
-    MooncakeOperationHistogramFamily, MooncakeOperationLabels, PREFILL_DELAY_REASONS,
-    PREFILL_QUEUE_STOP_REASONS, PREFILL_REQUEST_OUTCOMES, PREFILL_UNDERFILL_REASONS,
-    PrefillOutcomeLabels, PrefillStopLabels, RequestMetrics, SchedulerLogStatsAccumulator,
-    SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
+    LoraAdapterNames, LoraInfoLabels, MooncakeFailureCounterFamily, MooncakeFailureLabels,
+    MooncakeOperationCounterFamily, MooncakeOperationHistogramFamily, MooncakeOperationLabels,
+    PREFILL_DELAY_REASONS, PREFILL_QUEUE_STOP_REASONS, PREFILL_REQUEST_OUTCOMES,
+    PREFILL_UNDERFILL_REASONS, PrefillOutcomeLabels, PrefillStopLabels, RequestMetrics,
+    SchedulerLogStatsAccumulator, SchedulerMetrics, U64Counter, U64Gauge, WaitingReasonLabels,
 };
 
 use crate::protocol::stats::{
@@ -95,6 +95,7 @@ struct SchedulerStatsHandles {
     mooncake_operation_keys_total: MooncakeOperationCounterFamily,
     mooncake_operation_bytes_total: MooncakeOperationCounterFamily,
     mooncake_operation_failed_keys_total: MooncakeOperationCounterFamily,
+    mooncake_operation_failed_keys_by_code_total: MooncakeFailureCounterFamily,
 
     // NIXL connector telemetry, decoded from `kv_connector_stats`.
     nixl_xfer_time_seconds: HistogramMetric,
@@ -298,6 +299,9 @@ fn resolve_scheduler_stats_handles(
         mooncake_operation_keys_total: metrics.mooncake_operation_keys_total.clone(),
         mooncake_operation_bytes_total: metrics.mooncake_operation_bytes_total.clone(),
         mooncake_operation_failed_keys_total: metrics.mooncake_operation_failed_keys_total.clone(),
+        mooncake_operation_failed_keys_by_code_total: metrics
+            .mooncake_operation_failed_keys_by_code_total
+            .clone(),
         nixl_xfer_time_seconds: metrics.nixl_xfer_time_seconds.get_or_create_owned(&labels),
         nixl_post_time_seconds: metrics.nixl_post_time_seconds.get_or_create_owned(&labels),
         nixl_bytes_transferred: metrics.nixl_bytes_transferred.get_or_create_owned(&labels),
@@ -339,6 +343,23 @@ fn record_scheduler_stats_with_handles(handles: &SchedulerStatsHandles, stats: &
                 batching.kv_lookup_pending_duration_ns,
             ),
             ("kv_lookup_cancelled", batching.kv_lookup_cancelled),
+            (
+                "kv_lookup_timed_completed",
+                batching.kv_lookup_timed_completed,
+            ),
+            ("kv_lookup_timed_failed", batching.kv_lookup_timed_failed),
+            (
+                "kv_lookup_queue_duration_ns",
+                batching.kv_lookup_queue_duration_ns,
+            ),
+            (
+                "kv_lookup_execution_duration_ns",
+                batching.kv_lookup_execution_duration_ns,
+            ),
+            (
+                "kv_lookup_observation_duration_ns",
+                batching.kv_lookup_observation_duration_ns,
+            ),
             ("readiness_steps", batching.readiness_steps),
             ("ready_requests", batching.ready_requests),
             (
@@ -534,6 +555,18 @@ fn record_mooncake_stats(handles: &SchedulerStatsHandles, stats: &MooncakeStats)
                 .mooncake_operation_failed_keys_total
                 .get_or_create(&labels)
                 .inc_by(record.num_failed_keys);
+            for (code, count) in &record.failed_keys_by_code {
+                let failure_labels = MooncakeFailureLabels {
+                    model_name: handles.labels.model_name.clone(),
+                    engine: handles.labels.engine,
+                    operation: operation.as_str().to_owned(),
+                    code: code.clone(),
+                };
+                handles
+                    .mooncake_operation_failed_keys_by_code_total
+                    .get_or_create(&failure_labels)
+                    .inc_by(*count);
+            }
         }
     }
 }
@@ -611,6 +644,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use expect_test::expect;
+    use itertools::Itertools;
     use vllm_metrics::Metrics;
 
     use crate::metrics::LoraInfoExporter;
@@ -684,6 +718,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mooncake_failure_codes_decode_and_export() {
+        let metrics = Metrics::new();
+        let handles = super::resolve_scheduler_stats_handles(&metrics.scheduler, "model", 2);
+        let payload = r#"{"save_put":[
+            {"duration_seconds":0.01,"num_keys":4,"num_bytes":1024,
+             "status":"partial_failure","num_failed_keys":3,
+             "failed_keys_by_code":{"-200":2,"-705":1}},
+            {"duration_seconds":0.02,"num_keys":2,"num_bytes":512,
+             "status":"error","num_failed_keys":2,
+             "failed_keys_by_code":{"exception":2}}
+        ]}"#;
+        let stats: MooncakeStats = serde_json::from_str(payload).unwrap();
+        let round_trip: MooncakeStats =
+            serde_json::from_str(&serde_json::to_string(&stats).unwrap()).unwrap();
+        assert_eq!(stats, round_trip);
+        super::record_mooncake_stats(&handles, &stats);
+        let rendered = metrics.render().unwrap();
+        let failures = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("vllm:mooncake_store_operation_failed_keys_by_code_total{")
+            })
+            .sorted()
+            .join("\n");
+        expect![[r#"vllm:mooncake_store_operation_failed_keys_by_code_total{model_name="model",engine="2",operation="save_put",code="-200"} 2
+vllm:mooncake_store_operation_failed_keys_by_code_total{model_name="model",engine="2",operation="save_put",code="-705"} 1
+vllm:mooncake_store_operation_failed_keys_by_code_total{model_name="model",engine="2",operation="save_put",code="exception"} 2"#]].assert_eq(&failures);
+
+        // Older workers omit the map; they must still deserialize unchanged.
+        let old: MooncakeRecord = serde_json::from_str(
+            r#"{"duration_seconds":0.01,"num_keys":1,"num_bytes":256,"status":"ok","num_failed_keys":0}"#
+        ).unwrap();
+        assert!(old.failed_keys_by_code.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("failed_keys_by_code"));
+    }
+
     fn mooncake_stats() -> MooncakeStats {
         MooncakeStats(BTreeMap::from([(
             MooncakeOperation::LoadGet,
@@ -693,6 +764,7 @@ mod tests {
                 num_bytes: 1024,
                 status: MooncakeStatus::Ok,
                 num_failed_keys: 0,
+                failed_keys_by_code: BTreeMap::new(),
             }],
         )]))
     }
@@ -774,6 +846,11 @@ mod prefill_batching_tests {
                 unexamined_requests: 2,
                 kv_lookup_completed: 2,
                 kv_lookup_duration_ns: 6000000,
+                kv_lookup_timed_completed: 2,
+                kv_lookup_timed_failed: 1,
+                kv_lookup_queue_duration_ns: 1000000,
+                kv_lookup_execution_duration_ns: 2000000,
+                kv_lookup_observation_duration_ns: 3000000,
                 delayed_requests: [("kv_lookup_pending".to_owned(), 3)].into(),
                 blocked_requests: [("kv_lookup_pending".to_owned(), 3)].into(),
                 underfilled_reasons: PREFILL_UNDERFILL_REASONS
@@ -833,6 +910,11 @@ mod prefill_batching_tests {
             vllm:prefill_kv_lookup_pending_completed_total{model_name="model",engine="0"} 0
             vllm:prefill_kv_lookup_pending_duration_ns_total{model_name="model",engine="0"} 0
             vllm:prefill_kv_lookup_cancelled_total{model_name="model",engine="0"} 0
+            vllm:prefill_kv_lookup_timed_completed_total{model_name="model",engine="0"} 2
+            vllm:prefill_kv_lookup_timed_failed_total{model_name="model",engine="0"} 1
+            vllm:prefill_kv_lookup_queue_duration_ns_total{model_name="model",engine="0"} 1000000
+            vllm:prefill_kv_lookup_execution_duration_ns_total{model_name="model",engine="0"} 2000000
+            vllm:prefill_kv_lookup_observation_duration_ns_total{model_name="model",engine="0"} 3000000
             vllm:prefill_readiness_steps_total{model_name="model",engine="0"} 4
             vllm:prefill_ready_requests_total{model_name="model",engine="0"} 7
             vllm:prefill_ready_unscheduled_requests_total{model_name="model",engine="0"} 1

@@ -12,7 +12,7 @@ use prometheus_client::registry::Registry;
 use crate::{F64Gauge, Histogram, HistogramFamily, U64Counter, U64Gauge};
 
 // Keep fields and reasons in sync with vllm/v1/metrics/batching.py.
-pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 21] = [
+pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 26] = [
     "completed_requests",
     "request_forwards",
     "request_tokens",
@@ -28,6 +28,11 @@ pub const PREFILL_BATCH_COUNTER_FIELDS: [&str; 21] = [
     "kv_lookup_pending_completed",
     "kv_lookup_pending_duration_ns",
     "kv_lookup_cancelled",
+    "kv_lookup_timed_completed",
+    "kv_lookup_timed_failed",
+    "kv_lookup_queue_duration_ns",
+    "kv_lookup_execution_duration_ns",
+    "kv_lookup_observation_duration_ns",
     "readiness_steps",
     "ready_requests",
     "ready_unscheduled_requests",
@@ -233,6 +238,17 @@ pub type MooncakeOperationHistogramFamily =
     Family<MooncakeOperationLabels, Histogram, fn() -> Histogram>;
 pub type MooncakeOperationCounterFamily = Family<MooncakeOperationLabels, U64Counter>;
 
+/// Per-key store failures, labeled by numeric return code or `exception`.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct MooncakeFailureLabels {
+    pub model_name: String,
+    pub engine: u32,
+    pub operation: String,
+    pub code: String,
+}
+
+pub type MooncakeFailureCounterFamily = Family<MooncakeFailureLabels, U64Counter>;
+
 /// Adapter names encoded as a deterministic comma-joined Prometheus label value.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct LoraAdapterNames(pub BTreeSet<String>);
@@ -380,6 +396,7 @@ pub struct SchedulerMetrics {
     pub mooncake_operation_keys_total: MooncakeOperationCounterFamily,
     pub mooncake_operation_bytes_total: MooncakeOperationCounterFamily,
     pub mooncake_operation_failed_keys_total: MooncakeOperationCounterFamily,
+    pub mooncake_operation_failed_keys_by_code_total: MooncakeFailureCounterFamily,
 
     // NIXL connector telemetry. Mirrors `NixlPromMetrics`.
     pub nixl_xfer_time_seconds: HistogramFamily,
@@ -641,6 +658,13 @@ impl SchedulerMetrics {
             mooncake_operation_bytes_total.clone(),
         );
 
+        let mooncake_operation_failed_keys_by_code_total = Family::default();
+        registry.register(
+            "vllm:mooncake_store_operation_failed_keys_by_code",
+            "Number of failed Mooncake store keys by return code.",
+            mooncake_operation_failed_keys_by_code_total.clone(),
+        );
+
         let mooncake_operation_failed_keys_total = Family::default();
         registry.register(
             "vllm:mooncake_store_operation_failed_keys",
@@ -734,6 +758,7 @@ impl SchedulerMetrics {
             mooncake_operation_keys_total,
             mooncake_operation_bytes_total,
             mooncake_operation_failed_keys_total,
+            mooncake_operation_failed_keys_by_code_total,
             nixl_xfer_time_seconds,
             nixl_post_time_seconds,
             nixl_bytes_transferred,

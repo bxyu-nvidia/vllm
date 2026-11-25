@@ -264,6 +264,8 @@ pub mod kv_connector {
         pub num_bytes: u64,
         pub status: MooncakeStatus,
         pub num_failed_keys: u64,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub failed_keys_by_code: BTreeMap<String, u64>,
     }
 
     /// Mooncake store telemetry grouped by operation.
@@ -321,6 +323,11 @@ pub struct PrefillBatchingStats {
     pub kv_lookup_pending_completed: u64,
     pub kv_lookup_pending_duration_ns: u64,
     pub kv_lookup_cancelled: u64,
+    pub kv_lookup_timed_completed: u64,
+    pub kv_lookup_timed_failed: u64,
+    pub kv_lookup_queue_duration_ns: u64,
+    pub kv_lookup_execution_duration_ns: u64,
+    pub kv_lookup_observation_duration_ns: u64,
     pub readiness_steps: u64,
     pub ready_requests: u64,
     pub ready_unscheduled_requests: u64,

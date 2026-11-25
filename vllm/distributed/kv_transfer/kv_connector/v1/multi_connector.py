@@ -31,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.metrics.batching import PrefillLookupStats
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -431,16 +432,44 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         connector = self._connectors[self._requests_to_connector[request.request_id]]
         return connector.get_loaded_kv_cache_group_ids(request)
 
+    def get_num_new_matched_tokens_with_local_hit(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+        *,
+        num_local_tokens: int,
+    ) -> tuple[int | None, bool]:
+        return self.get_num_new_matched_tokens(
+            request, num_computed_tokens, num_local_tokens=num_local_tokens
+        )
+
+    def take_prefill_lookup_stats(self) -> PrefillLookupStats | None:
+        combined = None
+        for connector in self._connectors:
+            stats = connector.take_prefill_lookup_stats()
+            if stats is not None:
+                if combined is None:
+                    combined = PrefillLookupStats()
+                combined.aggregate(stats)
+        return combined
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
         num_computed_tokens: int,
+        *,
+        num_local_tokens: int | None = None,
     ) -> tuple[int | None, bool]:
         to_return = (0, False)
         for i, c in enumerate(self._connectors):
-            toks, load_async = c.get_num_new_matched_tokens(
-                request, num_computed_tokens
-            )
+            if num_local_tokens is None:
+                toks, load_async = c.get_num_new_matched_tokens(
+                    request, num_computed_tokens
+                )
+            else:
+                toks, load_async = c.get_num_new_matched_tokens_with_local_hit(
+                    request, num_computed_tokens, num_local_tokens=num_local_tokens
+                )
             # If there is a connector still looking up the matches,
             # we return None to indicate that we are not done yet.
             if toks is None:
