@@ -137,6 +137,7 @@ from vllm.v1.worker.gpu.lora_utils import (
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.batch_shard import (
@@ -523,6 +524,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mask_stride=self.decode_query_len,
                 num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             )
+
+        # VLLM_SKIP_COMPUTED_PROMPT_TOKENS leaves already-computed prompt tokens
+        # out of the requests sent here; reject features that read them.
+        if envs.VLLM_SKIP_COMPUTED_PROMPT_TOKENS:
+            from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+                MambaHybridModelState,
+            )
+
+            # Model states that read only token counts, not earlier token ids.
+            computed_tokens_unread = (DefaultModelState, MambaHybridModelState)
+            token_history_readers = [
+                name
+                for name, used in (
+                    (
+                        "n-gram speculation",
+                        self.speculative_config is not None
+                        and self.speculative_config.use_ngram(),
+                    ),
+                    ("watermarking", self.vllm_config.watermark_config is not None),
+                    ("logits processors", bool(self.model_config.logits_processors)),
+                    (
+                        type(self.model_state).__name__,
+                        type(self.model_state) not in computed_tokens_unread,
+                    ),
+                )
+                if used
+            ]
+            if token_history_readers:
+                raise ValueError(
+                    "VLLM_SKIP_COMPUTED_PROMPT_TOKENS=1 is not supported with "
+                    + ", ".join(token_history_readers)
+                )
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model, self.vllm_config)
@@ -1203,6 +1236,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                all_token_ids_start=new_req_data.prefill_token_ids_start,
             )
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
